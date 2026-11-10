@@ -35,7 +35,7 @@ $zipUrl = "$baseUrl/packages/ffmpeg-$version-essentials_build.zip"
 $expectedHash = (Invoke-RestMethod "$zipUrl.sha256").Trim().Split()[0].ToLower()
 Write-Host "Downloading FFmpeg $version essentials build..."
 
-$work = Join-Path ([System.IO.Path]::GetTempPath()) ("batchviproc-ffmpeg-" + [guid]::NewGuid())
+$work = Join-Path ([System.IO.Path]::GetTempPath()) ("mediaopti-ffmpeg-" + [guid]::NewGuid())
 New-Item -ItemType Directory -Force $work | Out-Null
 try {
     $zip = Join-Path $work 'ffmpeg.zip'

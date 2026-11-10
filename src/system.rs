@@ -164,7 +164,7 @@ pub fn memory_status() -> Option<MemoryStatus> {
     None
 }
 
-/// Holds a named mutex so only one batchviproc runs at a time (two instances would
+/// Holds a named mutex so only one mediaopti runs at a time (two instances would
 /// append to the same history file and fight over the same folders).
 pub struct SingleInstance {
     #[cfg(windows)]
@@ -443,7 +443,7 @@ mod tests {
 
     #[test]
     fn single_instance_lock_is_exclusive() {
-        let name = format!("Local\\batchviproc-test-{}", std::process::id());
+        let name = format!("Local\\mediaopti-test-{}", std::process::id());
         let first = SingleInstance::acquire(&name);
         assert!(first.is_some());
         assert!(SingleInstance::acquire(&name).is_none());

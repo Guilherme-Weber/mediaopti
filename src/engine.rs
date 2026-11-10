@@ -2,7 +2,7 @@
 //! and fallbacks, GPU telemetry and state broadcasting to the UI.
 
 use crate::args::{self, Mode, Options, RawOptions};
-use crate::history::History;
+use crate::history::{self, ContentHash, History};
 use crate::progress::{self, Diagnostics, WorkerProgress};
 use crate::system::{self, OriginalAttributes, PowerGuard};
 
@@ -175,12 +175,15 @@ fn is_generated_name(path: &Path) -> bool {
         .file_name()
         .map(|n| n.to_string_lossy().to_lowercase())
         .unwrap_or_default();
-    name.contains(".batchviproc.") || name.contains(".tmp.") || name.contains("-h264.")
+    is_orphan_temp(path) || name.contains(".tmp.") || name.contains("-h264.")
 }
 
+/// Temp outputs of this app, including ones left by batchviproc (which this app replaces).
 fn is_orphan_temp(path: &Path) -> bool {
-    path.file_name()
-        .is_some_and(|n| n.to_string_lossy().to_lowercase().contains(".batchviproc."))
+    path.file_name().is_some_and(|n| {
+        let n = n.to_string_lossy().to_lowercase();
+        n.contains(".mediaopti.") || n.contains(".batchviproc.")
+    })
 }
 
 /// Finds the ffmpeg binary: next to the executable (release zip), in the project's `bin/`
@@ -438,6 +441,58 @@ impl Engine {
         }
     }
 
+    /// Remembers a finished file: `file` by location, `content_of` (the file now on disk)
+    /// by content hash, so it is still recognised after being moved or renamed.
+    async fn remember(self: &Arc<Self>, file: &Path, content_of: &Path) {
+        self.add_processed(file);
+        let path = content_of.to_path_buf();
+        let hashed = self
+            .blocking(move || -> std::io::Result<(ContentHash, u64)> {
+                let size = std::fs::metadata(&path)?.len();
+                Ok((history::hash_file(&path)?, size))
+            })
+            .await;
+        if let Ok((hash, size)) = hashed {
+            self.lock().history.add_content(hash, size, history::VIDEO_MODE);
+            self.schedule_history_save();
+        }
+    }
+
+    /// Finds files that are new to the location history but whose content was processed
+    /// before (moved, renamed or copied), and adds them to the location history.
+    /// Only files whose size matches a remembered size are hashed.
+    async fn recognise_by_content(self: &Arc<Self>, files: &[PathBuf], sizes: &[u64]) -> usize {
+        let candidates: Vec<PathBuf> = {
+            let inner = self.lock();
+            files
+                .iter()
+                .zip(sizes)
+                .filter(|(f, s)| inner.history.has_size(**s) && !is_generated_name(f) && !inner.history.contains(f))
+                .map(|(f, _)| f.clone())
+                .collect()
+        };
+        if candidates.is_empty() {
+            return 0;
+        }
+        self.log(format!("Checking {} videos by content (same size as a processed one)", candidates.len()));
+        let hashed = self.blocking(move || hash_files_parallel(&candidates)).await;
+        let hits = {
+            let mut inner = self.lock();
+            let mut hits = 0;
+            for (file, hash) in hashed {
+                if hash.is_some_and(|h| inner.history.contains_content(&h)) {
+                    inner.history.add(&file);
+                    hits += 1;
+                }
+            }
+            hits
+        };
+        if hits > 0 {
+            self.schedule_history_save();
+        }
+        hits
+    }
+
     // ---------------------------------------------------------------- folder selection
 
     pub fn is_working(&self) -> bool {
@@ -482,6 +537,12 @@ impl Engine {
                         result.unreadable
                     ));
                 }
+                let recognised = self.recognise_by_content(&result.files, &result.sizes).await;
+                if recognised > 0 {
+                    self.log(format!(
+                        "{recognised} moved, renamed or copied videos recognised as already processed"
+                    ));
+                }
                 let (known, generated) = {
                     let mut inner = self.lock();
                     inner.files = result.files;
@@ -498,7 +559,7 @@ impl Engine {
                 ));
                 if result.cleaned_orphans > 0 {
                     self.log(format!(
-                        "Removed {} leftover temporary (.batchviproc) file(s)",
+                        "Removed {} leftover temporary (.mediaopti) file(s)",
                         result.cleaned_orphans
                     ));
                 }
@@ -862,7 +923,7 @@ impl Engine {
                 .await;
             if !valid {
                 self.lock().in_progress.remove(&input);
-                self.add_processed(&input);
+                self.remember(&input, &input).await;
                 {
                     let mut inner = self.lock();
                     inner.run.completed += 1;
@@ -895,7 +956,7 @@ impl Engine {
         if attempt.diag.no_video_stream {
             self.release_tracking(worker_id, &input);
             self.log_remove(&tmp);
-            self.add_processed(&input);
+            self.remember(&input, &input).await;
             {
                 let mut inner = self.lock();
                 inner.run.completed += 1;
@@ -912,7 +973,7 @@ impl Engine {
         if attempt.diag.corrupt_input {
             self.release_tracking(worker_id, &input);
             self.log_remove(&tmp);
-            self.add_processed(&input);
+            self.remember(&input, &input).await;
             {
                 let mut inner = self.lock();
                 inner.run.completed += 1;
@@ -1011,7 +1072,7 @@ impl Engine {
 
         if code != 0 {
             self.lock().failed.insert(input.clone());
-            self.add_processed(&input); // Remember unrecoverable files so future runs skip them
+            self.remember(&input, &input).await; // Remember unrecoverable files so future runs skip them
             self.lock().run.failed += 1;
             self.log_remove(&tmp);
             for line in &attempt.diag.error_lines {
@@ -1055,7 +1116,7 @@ impl Engine {
         };
 
         if saved_mb <= 0.0 {
-            self.add_processed(&input);
+            self.remember(&input, &input).await;
             self.lock().run.skipped_larger += 1;
             self.log_remove(&tmp);
             self.log(format!(
@@ -1082,7 +1143,7 @@ impl Engine {
         };
 
         if final_target != input && final_target.exists() {
-            self.add_processed(&input);
+            self.remember(&input, &input).await;
             self.lock().run.skipped_larger += 1;
             self.log_remove(&tmp);
             self.log(format!(
@@ -1113,7 +1174,8 @@ impl Engine {
             return Outcome::Failed;
         }
 
-        self.add_processed(&input);
+        // By content, remember the new file: that is what will be found on disk next time.
+        self.remember(&input, &final_target).await;
         {
             let mut inner = self.lock();
             if final_target != input {
@@ -1351,8 +1413,29 @@ impl Engine {
     }
 }
 
+/// Content-hashes files on a few threads (disk-bound; more threads would only seek more).
+fn hash_files_parallel(files: &[PathBuf]) -> Vec<(PathBuf, Option<ContentHash>)> {
+    let threads = std::thread::available_parallelism().map_or(2, |n| n.get().min(4));
+    let chunk = files.len().div_ceil(threads).max(1);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = files
+            .chunks(chunk)
+            .map(|part| {
+                scope.spawn(move || {
+                    part.iter()
+                        .map(|f| (f.clone(), history::hash_file(f).ok()))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
+    })
+}
+
 struct ScanResult {
     files: Vec<PathBuf>,
+    /// Size of each entry of `files`, same order.
+    sizes: Vec<u64>,
     cleaned_orphans: usize,
     unreadable: usize,
     messages: Vec<String>,
@@ -1398,8 +1481,10 @@ fn scan_folder(dir: &Path) -> ScanResult {
     }
 
     with_sizes.sort_by_key(|&(_, size)| std::cmp::Reverse(size));
+    let (files, sizes) = with_sizes.into_iter().unzip();
     ScanResult {
-        files: with_sizes.into_iter().map(|(p, _)| p).collect(),
+        files,
+        sizes,
         cleaned_orphans,
         unreadable,
         messages,
@@ -1432,7 +1517,7 @@ mod tests {
 
     #[test]
     fn generated_and_orphan_names() {
-        assert!(is_generated_name(Path::new(r"C:\v\a.batchviproc.w1.mp4")));
+        assert!(is_generated_name(Path::new(r"C:\v\a.mediaopti.w1.mp4")));
         assert!(is_generated_name(Path::new(r"C:\v\clip.TMP.mp4")));
         assert!(is_generated_name(Path::new(r"C:\v\clip-H264.mkv")));
         assert!(!is_generated_name(Path::new(r"C:\v\clip.mp4")));

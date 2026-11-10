@@ -38,7 +38,7 @@ fn make(ffmpeg: &Path, args: &[&str], out: &Path) {
 }
 
 fn test_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("batchviproc-test-{name}-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("mediaopti-test-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -99,7 +99,7 @@ fn full_batch_handles_every_file_kind() {
     make(&ff, &["-f", "lavfi", "-i", "color=red:size=64x64:duration=0.04", "-frames:v", "1"], &videos.join("static.gif"));
     make(&ff, &["-f", "lavfi", "-i", "testsrc2=size=160x120:rate=10:duration=2"], &videos.join("anim.gif"));
     lossless_video(&ff, 1, "320x240", &videos.join(".hidden").join("secret.mp4"));
-    std::fs::write(videos.join("old.batchviproc.w1.mp4"), b"leftover").unwrap();
+    std::fs::write(videos.join("old.mediaopti.w1.mp4"), b"leftover").unwrap();
     std::fs::copy(&big, videos.join("export.tmp.mp4")).unwrap();
 
     // Old timestamp + read-only, like files copied from a phone backup.
@@ -119,7 +119,7 @@ fn full_batch_handles_every_file_kind() {
         assert_eq!(s.total_files, 7, "logs: {:#?}", rec.logs.lock().unwrap());
         assert_eq!(s.skipped_generated, 1);
         assert_eq!(s.pending_files, 6);
-        assert!(!videos.join("old.batchviproc.w1.mp4").exists(), "orphan temp not removed");
+        assert!(!videos.join("old.mediaopti.w1.mp4").exists(), "orphan temp not removed");
 
         engine.clone().run_batch(opts("av1_nvenc", 2.0)).await;
     });
@@ -142,15 +142,32 @@ fn full_batch_handles_every_file_kind() {
     assert!(videos.join("static.gif").exists() && videos.join("voice.mp4").exists());
     assert!(videos.join(".hidden").join("secret.mp4").exists());
     let leftovers: Vec<_> = walkdir::WalkDir::new(&videos).into_iter().filter_map(Result::ok)
-        .filter(|e| e.file_name().to_string_lossy().contains(".batchviproc.")).collect();
+        .filter(|e| e.file_name().to_string_lossy().contains(".mediaopti.")).collect();
     assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
 
     // History persisted: a fresh engine on the same folder finds nothing new.
     let history = std::fs::read_to_string(root.join("appdata").join("processedFiles.txt")).unwrap();
     assert!(history.lines().count() >= 6);
-    let (engine2, _) = new_engine(&rt, &root, ff);
-    rt.block_on(engine2.load_dir(videos));
+    let (engine2, _) = new_engine(&rt, &root, ff.clone());
+    rt.block_on(engine2.load_dir(videos.clone()));
     assert_eq!(engine2.snapshot().pending_files, 0);
+
+    // Content history: processed videos moved, renamed or copied elsewhere are still
+    // recognised; a genuinely new video is not.
+    let content = std::fs::read_to_string(root.join("appdata").join("processed-content.tsv")).unwrap();
+    assert!(content.lines().count() >= 6, "{content}");
+    let elsewhere = root.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::rename(&big, elsewhere.join("renamed.mp4")).unwrap();
+    std::fs::copy(videos.join("sub").join("clip.mp4"), elsewhere.join("copy of clip.mp4")).unwrap();
+    lossless_video(&ff, 1, "320x240", &elsewhere.join("new.mp4"));
+    let (engine3, rec3) = new_engine(&rt, &root, ff);
+    rt.block_on(engine3.load_dir(elsewhere));
+    let s3 = engine3.snapshot();
+    let logs3 = rec3.logs.lock().unwrap().join("\n");
+    assert_eq!(s3.total_files, 3, "{logs3}");
+    assert_eq!(s3.pending_files, 1, "only new.mp4 should be queued: {logs3}");
+    assert!(logs3.contains("2 moved, renamed or copied videos recognised"), "{logs3}");
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -185,7 +202,7 @@ fn stop_kills_ffmpeg_and_keeps_originals() {
     let s = engine.snapshot();
     assert_eq!(s.status, Status::Ready, "{logs}");
     assert_eq!(std::fs::metadata(&long).unwrap().len(), size_before, "original changed");
-    assert!(!videos.join("long.batchviproc.w1.mp4").exists(), "temp file left behind");
+    assert!(!videos.join("long.mediaopti.w1.mp4").exists(), "temp file left behind");
     assert!(logs.contains("Stopped while processing long.mp4"), "{logs}");
 
     let _ = std::fs::remove_dir_all(&root);
@@ -224,7 +241,7 @@ fn pause_suspends_ffmpeg_and_resume_finishes() {
     std::fs::create_dir_all(&videos).unwrap();
     lossless_video(&ff, 12, "1280x720", &videos.join("a.mp4"));
     lossless_video(&ff, 4, "640x360", &videos.join("b.mp4"));
-    let temp = videos.join("a.batchviproc.w1.mp4");
+    let temp = videos.join("a.mediaopti.w1.mp4");
 
     let rt = runtime();
     let (engine, rec) = new_engine(&rt, &root, ff);
@@ -299,7 +316,7 @@ fn stop_while_paused_keeps_originals() {
     assert_eq!(engine.snapshot().status, Status::Ready, "{logs}");
     assert!(!engine.is_paused());
     assert_eq!(std::fs::metadata(&long).unwrap().len(), size_before, "original changed");
-    assert!(!videos.join("long.batchviproc.w1.mp4").exists(), "temp file left behind");
+    assert!(!videos.join("long.mediaopti.w1.mp4").exists(), "temp file left behind");
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -380,7 +397,7 @@ fn historical_problem_files_are_handled() {
     assert!(logs.contains("Target dup.mp4 already exists"), "{logs}");
     // No temp files left anywhere.
     let leftovers: Vec<_> = walkdir::WalkDir::new(&videos).into_iter().filter_map(Result::ok)
-        .filter(|e| e.file_name().to_string_lossy().contains(".batchviproc.")).collect();
+        .filter(|e| e.file_name().to_string_lossy().contains(".mediaopti.")).collect();
     assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
 
     // Everything is remembered: a second scan finds nothing new.

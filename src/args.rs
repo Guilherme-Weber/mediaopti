@@ -99,7 +99,7 @@ pub fn is_video_file(path: &Path) -> bool {
     VIDEO_EXTENSIONS.contains(&ext_lower(path).as_str())
 }
 
-/// `<dir>/<stem>.batchviproc.w<id><ext>`, switching legacy containers to `.mp4`.
+/// `<dir>/<stem>.mediaopti.w<id><ext>`, switching legacy containers to `.mp4`.
 pub fn temp_name(input: &Path, worker_id: u32) -> std::path::PathBuf {
     let stem = input
         .file_stem()
@@ -113,7 +113,7 @@ pub fn temp_name(input: &Path, worker_id: u32) -> std::path::PathBuf {
             .map(|e| format!(".{}", e.to_string_lossy()))
             .unwrap_or_default()
     };
-    input.with_file_name(format!("{stem}.batchviproc.w{worker_id}{out_ext}"))
+    input.with_file_name(format!("{stem}.mediaopti.w{worker_id}{out_ext}"))
 }
 
 fn map_nvenc_preset(ui_preset: &str) -> &'static str {
@@ -247,9 +247,9 @@ mod tests {
     #[test]
     fn temp_name_remuxes_legacy_containers() {
         let p = PathBuf::from(r"C:\v\clip.MOV");
-        assert_eq!(temp_name(&p, 2), PathBuf::from(r"C:\v\clip.batchviproc.w2.mp4"));
+        assert_eq!(temp_name(&p, 2), PathBuf::from(r"C:\v\clip.mediaopti.w2.mp4"));
         let p = PathBuf::from(r"C:\v\clip.mkv");
-        assert_eq!(temp_name(&p, 1), PathBuf::from(r"C:\v\clip.batchviproc.w1.mkv"));
+        assert_eq!(temp_name(&p, 1), PathBuf::from(r"C:\v\clip.mediaopti.w1.mkv"));
     }
 
     #[test]

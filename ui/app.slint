@@ -1,4 +1,4 @@
-// batchviproc interface: Windows 11 Fluent design (dark), rendered by Slint's software renderer.
+// mediaopti interface: Windows 11 Fluent design (dark), rendered by Slint's software renderer.
 
 import { Button, ComboBox, ListView, ScrollView } from "std-widgets.slint";
 
@@ -229,7 +229,7 @@ export component AppWindow inherits Window {
     // ---- state pushed from Rust
     in property <string> status: "idle";
     in property <string> status-label: "Idle";
-    in property <string> window-title: "batchviproc";
+    in property <string> window-title: "mediaopti";
     in property <bool> has-folder;
     in property <bool> empty-folder;
     in property <string> folder-title: "No folder selected";
@@ -307,8 +307,8 @@ export component AppWindow inherits Window {
             }
             VerticalLayout {
                 alignment: center;
-                Text { text: "batchviproc"; font-size: 22px; font-weight: 600; color: Theme.text; }
-                Text { text: "Batch video compression"; font-size: 12px; color: Theme.text-secondary; }
+                Text { text: "mediaopti"; font-size: 22px; font-weight: 600; color: Theme.text; }
+                Text { text: "Batch media optimizer"; font-size: 12px; color: Theme.text-secondary; }
             }
             Rectangle { horizontal-stretch: 1; }
             if root.status != "idle": VerticalLayout {

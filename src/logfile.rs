@@ -1,5 +1,5 @@
-//! Persistent diagnostics in %APPDATA%\batchviproc\logs:
-//! - `batchviproc.log`: the activity log, rotated to `batchviproc.1.log` at 5 MB;
+//! Persistent diagnostics in %APPDATA%\mediaopti\logs:
+//! - `mediaopti.log`: the activity log, rotated to `mediaopti.1.log` at 5 MB;
 //! - `crash-<timestamp>.txt`: written by the panic hook before the process aborts
 //!   (release builds have no console, so this is the only trace of a crash).
 
@@ -20,8 +20,8 @@ pub struct FileLog {
 impl FileLog {
     pub fn open(dir: &Path) -> Self {
         let _ = fs::create_dir_all(dir);
-        let path = dir.join("batchviproc.log");
-        let rotated = dir.join("batchviproc.1.log");
+        let path = dir.join("mediaopti.log");
+        let rotated = dir.join("mediaopti.1.log");
         let state = Self::open_file(&path);
         Self {
             path,
@@ -62,7 +62,7 @@ pub fn install_panic_hook(dir: PathBuf) {
         let path = dir.join(format!("crash-{}.txt", system::local_timestamp_compact()));
         let thread = std::thread::current();
         let report = format!(
-            "batchviproc {} crashed at {}\r\nthread: {}\r\n{info}\r\n\r\nbacktrace:\r\n{}\r\n",
+            "mediaopti {} crashed at {}\r\nthread: {}\r\n{info}\r\n\r\nbacktrace:\r\n{}\r\n",
             env!("CARGO_PKG_VERSION"),
             system::local_datetime(),
             thread.name().unwrap_or("unnamed"),
@@ -83,13 +83,13 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         let log = FileLog::open(&dir);
         log.write_line("first line");
-        assert!(fs::read_to_string(dir.join("batchviproc.log")).unwrap().contains("first line"));
+        assert!(fs::read_to_string(dir.join("mediaopti.log")).unwrap().contains("first line"));
 
         // Force a rotation by pretending the file is already full.
         log.state.lock().unwrap().as_mut().unwrap().1 = MAX_LOG_BYTES;
         log.write_line("after rotation");
-        assert!(fs::read_to_string(dir.join("batchviproc.1.log")).unwrap().contains("first line"));
-        let current = fs::read_to_string(dir.join("batchviproc.log")).unwrap();
+        assert!(fs::read_to_string(dir.join("mediaopti.1.log")).unwrap().contains("first line"));
+        let current = fs::read_to_string(dir.join("mediaopti.log")).unwrap();
         assert!(current.contains("after rotation") && !current.contains("first line"));
         let _ = fs::remove_dir_all(&dir);
     }

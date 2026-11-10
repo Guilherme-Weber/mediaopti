@@ -369,9 +369,9 @@ impl Controller {
         // The taskbar thumbnail and Alt+Tab show progress while a batch runs.
         let pct = (fraction * 100.0).round();
         w.set_window_title(match s.status {
-            Status::Running => format!("{pct}% · batchviproc"),
-            Status::Paused => format!("Paused {pct}% · batchviproc"),
-            _ => "batchviproc".to_string(),
+            Status::Running => format!("{pct}% · mediaopti"),
+            Status::Paused => format!("Paused {pct}% · mediaopti"),
+            _ => "mediaopti".to_string(),
         }
         .into());
         let workers = if processing {
@@ -438,7 +438,7 @@ fn hwnd(w: &AppWindow) -> Option<isize> {
 
 // ------------------------------------------------------------------- run
 
-/// Command-line options: `batchviproc.exe [--start] [folder]`.
+/// Command-line options: `mediaopti.exe [--start] [folder]`.
 #[derive(Default)]
 pub struct Launch {
     pub folder: Option<PathBuf>,
@@ -465,7 +465,7 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
-        .thread_name("batchviproc-worker")
+        .thread_name("mediaopti-worker")
         .build()
         .expect("failed to start the async runtime");
 

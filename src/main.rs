@@ -13,19 +13,19 @@ mod system;
 mod taskbar;
 
 fn main() -> Result<(), slint::PlatformError> {
-    // Same folder earlier versions used (%APPDATA%\batchviproc), so processed history carries over.
-    let data_dir = std::env::var_os("APPDATA")
-        .map_or_else(std::env::temp_dir, std::path::PathBuf::from)
-        .join("batchviproc");
+    let appdata = std::env::var_os("APPDATA").map_or_else(std::env::temp_dir, std::path::PathBuf::from);
+    let data_dir = appdata.join("mediaopti");
     let _ = std::fs::create_dir_all(&data_dir);
     logfile::install_panic_hook(data_dir.join("logs"));
+    // mediaopti replaces batchviproc: carry its processed history and settings over once.
+    history::import_batchviproc(&appdata.join("batchviproc"), &data_dir);
 
     // Two instances would append to the same history and fight over the same files.
-    let Some(_instance) = system::SingleInstance::acquire(r"Local\batchviproc-single-instance") else {
+    let Some(_instance) = system::SingleInstance::acquire(r"Local\mediaopti-single-instance") else {
         rfd::MessageDialog::new()
             .set_level(rfd::MessageLevel::Info)
-            .set_title("batchviproc")
-            .set_description("batchviproc is already running.")
+            .set_title("mediaopti")
+            .set_description("mediaopti is already running.")
             .show();
         return Ok(());
     };
