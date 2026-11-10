@@ -1007,8 +1007,10 @@ impl Engine {
             Mode::Primary
         };
         let mut attempt = self
-            .run_attempt(worker_id, &input, &tmp, &display, initial_mode)
+            .run_attempt(worker_id, &input, &tmp, &display, initial_mode, 0)
             .await;
+        // The settings the final output was made with; the quality retry reuses them.
+        let mut used_mode = initial_mode;
 
         // Audio-only file (e.g. a voice note in .mp4): skip and remember.
         if attempt.diag.no_video_stream {
@@ -1064,8 +1066,9 @@ impl Engine {
             ));
             self.reset_worker(worker_id, format!("{display} (CPU fallback)"));
             attempt = self
-                .run_attempt(worker_id, &input, &tmp, &display, Mode::CpuFallback)
+                .run_attempt(worker_id, &input, &tmp, &display, Mode::CpuFallback, 0)
                 .await;
+            used_mode = Mode::CpuFallback;
         }
 
         // Audio stream copy rejected by the muxer -> transcode audio to AAC.
@@ -1080,8 +1083,9 @@ impl Engine {
             ));
             self.reset_worker(worker_id, format!("{display} (AAC fallback)"));
             attempt = self
-                .run_attempt(worker_id, &input, &tmp, &display, Mode::TranscodeAudio)
+                .run_attempt(worker_id, &input, &tmp, &display, Mode::TranscodeAudio, 0)
                 .await;
+            used_mode = Mode::TranscodeAudio;
         }
 
         // Final safety net: CPU fallback for NVENC encoders.
@@ -1092,8 +1096,9 @@ impl Engine {
             ));
             self.reset_worker(worker_id, format!("{display} (CPU fallback)"));
             attempt = self
-                .run_attempt(worker_id, &input, &tmp, &display, Mode::CpuFallback)
+                .run_attempt(worker_id, &input, &tmp, &display, Mode::CpuFallback, 0)
                 .await;
+            used_mode = Mode::CpuFallback;
         }
 
         self.release_tracking(worker_id, &input);
@@ -1165,24 +1170,50 @@ impl Engine {
         };
 
         let in_size = in_meta.len() as f64;
-        let out_size = out_meta.len() as f64;
-        let saved_mb = (in_size - out_size) / (1024.0 * 1024.0);
-        let saved_pct = if in_size > 0.0 {
-            ((in_size - out_size) / in_size * 100.0).round() as i64
-        } else {
-            0
-        };
+        let mut out_size = out_meta.len() as f64;
 
-        if saved_mb <= 0.0 {
-            self.remember(&input, &input).await;
-            self.lock().run.skipped_larger += 1;
-            self.log_remove(&tmp);
-            self.log(format!(
-                "[Worker {worker_id}] Output was not smaller for {display}; kept the original file"
-            ));
-            self.send_state(false);
-            return Outcome::Skipped;
+        if out_size >= in_size {
+            // The preset could not shrink it (typically a source that is already
+            // compressed): retry stronger settings, keeping the measured quality.
+            let floor = self.lock().options.vmaf_floor;
+            let retry = match floor {
+                Some(floor) if in_size > 0.0 => {
+                    let r = self
+                        .quality_retry(worker_id, &input, &tmp, &display, used_mode, in_size, out_size, attempt.diag.duration_sec, floor)
+                        .await;
+                    self.lock().workers.remove(&worker_id);
+                    r
+                }
+                _ => Retry::Rejected("quality check off".into()),
+            };
+            match retry {
+                Retry::Stopped => {
+                    self.log_remove(&tmp);
+                    self.log(format!("[Worker {worker_id}] Stopped while processing {display}"));
+                    self.send_state(true);
+                    return Outcome::Stopped;
+                }
+                Retry::Accepted { boost, vmaf, worst } => {
+                    out_size = std::fs::metadata(&tmp).map_or(in_size, |m| m.len() as f64);
+                    self.log(format!(
+                        "[Worker {worker_id}] Quality retry for {display}: +{boost} CQ, {:.0}% of the original, VMAF {vmaf:.1} (worst 5%: {worst:.1})",
+                        out_size / in_size * 100.0
+                    ));
+                }
+                Retry::Rejected(reason) => {
+                    self.remember(&input, &input).await;
+                    self.lock().run.skipped_larger += 1;
+                    self.log_remove(&tmp);
+                    self.log(format!(
+                        "[Worker {worker_id}] Output was not smaller for {display}; kept the original file ({reason})"
+                    ));
+                    self.send_state(false);
+                    return Outcome::Skipped;
+                }
+            }
         }
+        let saved_mb = (in_size - out_size) / (1024.0 * 1024.0);
+        let saved_pct = ((in_size - out_size) / in_size * 100.0).round() as i64;
 
         let in_ext = args::ext_lower(&input);
         let tmp_ext = args::ext_lower(&tmp);
@@ -1278,6 +1309,217 @@ impl Engine {
         Outcome::Processed
     }
 
+    /// Re-encodes with stronger settings (higher CQ/CRF) when the preset output was not
+    /// smaller. A step is accepted only if its output is smaller and its VMAF against the
+    /// original stays at or above `floor` (worst 5% of frames: `floor - 5`). It keeps
+    /// climbing while that holds, and the strongest passing step wins.
+    ///
+    /// On the author's library each +4 CQ made AV1 output about 28% smaller, so the first
+    /// step is the one predicted to get under the original size. If its quality fails, one
+    /// gentler step is tried once.
+    #[allow(clippy::too_many_arguments)]
+    async fn quality_retry(
+        self: &Arc<Self>,
+        worker_id: u32,
+        input: &Path,
+        tmp: &Path,
+        display: &str,
+        mode: Mode,
+        in_size: f64,
+        out_size: f64,
+        duration_sec: f64,
+        floor: f64,
+    ) -> Retry {
+        const STEPS: [u32; 4] = [4, 8, 12, 16];
+        const SHRINK_PER_STEP: f64 = 0.72;
+        // Climb further only with some quality to spare: each step costs an encode.
+        const CLIMB_MARGIN: f64 = 1.0;
+        let ratio = out_size / in_size;
+        let mut k = 0;
+        while k + 1 < STEPS.len() && ratio * SHRINK_PER_STEP.powi(k as i32 + 1) > 0.95 {
+            k += 1;
+        }
+        self.log(format!(
+            "[Worker {worker_id}] {display} was {:.0}% of the original at the preset; retrying stronger settings with a VMAF {floor:.0} check",
+            ratio * 100.0
+        ));
+        // The best passing output is parked under another temp name while stronger steps run.
+        let keep = args::temp_name(input, worker_id + 1000);
+        let mut best: Option<(u32, f64, f64)> = None;
+        let mut tried = [false; STEPS.len()];
+        let mut stepped_back = false;
+        let mut notes: Vec<String> = Vec::new();
+        let finish = |engine: &Self, best: Option<(u32, f64, f64)>, notes: &[String]| -> Retry {
+            match best {
+                Some((boost, vmaf, worst)) => match std::fs::rename(&keep, tmp) {
+                    Ok(()) => Retry::Accepted { boost, vmaf, worst },
+                    Err(err) => {
+                        engine.log_remove(&keep);
+                        Retry::Rejected(format!("could not keep the retry output: {err}"))
+                    }
+                },
+                None => Retry::Rejected(notes.join("; ")),
+            }
+        };
+        loop {
+            let boost = STEPS[k];
+            tried[k] = true;
+            self.log_remove(tmp);
+            self.reset_worker(worker_id, format!("{display} (quality retry +{boost})"));
+            let attempt = self.run_attempt(worker_id, input, tmp, display, mode, boost).await;
+            match attempt.status {
+                AttemptStatus::Stopped => {
+                    self.log_remove(&keep);
+                    return Retry::Stopped;
+                }
+                AttemptStatus::Exited(0) => {}
+                _ => {
+                    notes.push(format!("the +{boost} encode failed"));
+                    self.log_remove(tmp);
+                    return finish(self, best, &notes);
+                }
+            }
+            let size = std::fs::metadata(tmp).map_or(f64::MAX, |m| m.len() as f64);
+            if size >= in_size * 0.99 {
+                notes.push(format!("+{boost}: still {:.0}% of the original", size / in_size * 100.0));
+                self.log_remove(tmp);
+                if best.is_none() && !stepped_back && k + 1 < STEPS.len() && !tried[k + 1] {
+                    k += 1;
+                    continue;
+                }
+                return finish(self, best, &notes);
+            }
+            self.reset_worker(worker_id, format!("{display} (measuring quality at +{boost})"));
+            self.send_state(false);
+            let measured = match self.measure_vmaf(input, tmp, duration_sec).await {
+                Err(Stopped) => {
+                    self.log_remove(&keep);
+                    return Retry::Stopped;
+                }
+                Ok(m) => m,
+            };
+            match measured {
+                Ok((vmaf, worst)) if vmaf >= floor && worst >= floor - 5.0 => {
+                    if let Err(err) = system::remove_file_if_exists(&keep).and_then(|()| std::fs::rename(tmp, &keep)) {
+                        notes.push(format!("could not keep the +{boost} output: {err}"));
+                        self.log_remove(tmp);
+                        return finish(self, best, &notes);
+                    }
+                    best = Some((boost, vmaf, worst));
+                    self.log(format!(
+                        "[Worker {worker_id}] {display}: +{boost} CQ gives {:.0}% of the original at VMAF {vmaf:.1} (worst 5%: {worst:.1})",
+                        size / in_size * 100.0
+                    ));
+                    if !stepped_back && vmaf >= floor + CLIMB_MARGIN && k + 1 < STEPS.len() {
+                        k += 1;
+                        continue;
+                    }
+                    return finish(self, best, &notes);
+                }
+                Ok((vmaf, worst)) => {
+                    notes.push(format!("+{boost}: VMAF {vmaf:.1} (worst 5%: {worst:.1}) is below {floor:.0}"));
+                    self.log_remove(tmp);
+                    if best.is_none() && k > 0 && !tried[k - 1] && !stepped_back {
+                        stepped_back = true;
+                        k -= 1;
+                        continue;
+                    }
+                    return finish(self, best, &notes);
+                }
+                Err(why) => {
+                    notes.push(format!("the quality could not be measured: {why}"));
+                    self.log_remove(tmp);
+                    return finish(self, best, &notes);
+                }
+            }
+        }
+    }
+
+    /// VMAF of `encoded` against `original`: mean and 5th percentile over the frames of
+    /// three 8-second windows (20%, 50%, 80% of the video), or of the whole video when it
+    /// is short. The original gets the same even-size scaling the encode used, so frames
+    /// line up. `Ok(Err(reason))` if it could not be measured; `Err` if Stop was pressed.
+    async fn measure_vmaf(
+        &self,
+        original: &Path,
+        encoded: &Path,
+        duration_sec: f64,
+    ) -> Result<Result<(f64, f64), String>, Stopped> {
+        let cancel = self.lock().cancel.clone();
+        let windows: Vec<(f64, f64)> = if duration_sec > 30.0 {
+            [0.2, 0.5, 0.8].iter().map(|f| ((duration_sec * f - 4.0).max(0.0), 8.0)).collect()
+        } else {
+            vec![(0.0, 0.0)] // whole video
+        };
+        let threads = std::thread::available_parallelism().map_or(4, |n| (n.get() / 2).max(1));
+        let log_dir = std::env::temp_dir();
+        // Unique per measurement; only [A-Za-z0-9-.] so it is safe inside the filter graph.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let log_name = format!("mediaopti-vmaf-{}-{n}.json", std::process::id());
+        let mut scores = Vec::new();
+        for (start, length) in windows {
+            if !self.wait_while_paused(&cancel).await {
+                return Err(Stopped);
+            }
+            let cut = |args: &mut Vec<String>| {
+                if length > 0.0 {
+                    args.extend(["-ss".into(), format!("{start:.2}"), "-t".into(), format!("{length:.2}")]);
+                }
+            };
+            let mut a: Vec<String> = vec!["-hide_banner".into(), "-v".into(), "error".into()];
+            cut(&mut a);
+            a.extend(["-i".into(), encoded.to_string_lossy().into_owned()]);
+            cut(&mut a);
+            a.extend(["-i".into(), original.to_string_lossy().into_owned()]);
+            a.extend([
+                "-lavfi".into(),
+                format!(
+                    "[0:v:0]setpts=PTS-STARTPTS,format=yuv420p10le[d];\
+                     [1:v:0]scale=max(2\\,trunc(iw/2)*2):max(2\\,trunc(ih/2)*2),setpts=PTS-STARTPTS,format=yuv420p10le[r];\
+                     [d][r]libvmaf=shortest=1:n_subsample=2:n_threads={threads}:log_fmt=json:log_path={log_name}"
+                ),
+                "-f".into(),
+                "null".into(),
+                "-".into(),
+            ]);
+            let mut cmd = tokio::process::Command::new(&self.ffmpeg_path);
+            cmd.args(&a)
+                .current_dir(&log_dir)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+            system::configure_background_command(&mut cmd, true);
+            let child = match cmd.spawn() {
+                Ok(child) => child,
+                Err(err) => return Ok(Err(format!("could not start ffmpeg: {err}"))),
+            };
+            system::assign_to_kill_on_exit_job(&child);
+            // Dropping the future on Stop drops the child, which kills it (kill_on_drop).
+            let output = tokio::select! {
+                o = child.wait_with_output() => o,
+                _ = cancel.cancelled() => {
+                    let _ = system::remove_file_if_exists(&log_dir.join(&log_name));
+                    return Err(Stopped);
+                }
+            };
+            let log_path = log_dir.join(&log_name);
+            let parsed = std::fs::read_to_string(&log_path).ok().and_then(|t| vmaf_frame_scores(&t));
+            let _ = system::remove_file_if_exists(&log_path);
+            match (output, parsed) {
+                (Ok(o), Some(frames)) if o.status.success() && !frames.is_empty() => scores.extend(frames),
+                (Ok(o), _) => {
+                    let err = String::from_utf8_lossy(&o.stderr);
+                    let line = err.lines().find(|l| !l.trim().is_empty()).unwrap_or("no frames scored");
+                    return Ok(Err(line.trim().to_string()));
+                }
+                (Err(err), _) => return Ok(Err(err.to_string())),
+            }
+        }
+        Ok(summarize_vmaf(scores).ok_or_else(|| "no frames scored".to_string()))
+    }
+
     /// Waits until another encoder fits in memory. Returns false if Stop was pressed.
     async fn wait_for_memory(&self, worker_id: u32, display: &str, cancel: &CancellationToken) -> bool {
         let mut announced = false;
@@ -1315,12 +1557,14 @@ impl Engine {
         tmp: &Path,
         display: &str,
         mode: Mode,
+        cq_boost: u32,
     ) -> Attempt {
         let mut diag = Diagnostics::default();
-        let (options, cancel) = {
+        let (mut options, cancel) = {
             let inner = self.lock();
             (inner.options.clone(), inner.cancel.clone())
         };
+        options.cq_boost = cq_boost;
         let ffmpeg_args = args::build_ffmpeg_args(input, tmp, &options, mode);
 
         let mut cmd = tokio::process::Command::new(&self.ffmpeg_path);
@@ -1486,8 +1730,40 @@ impl Engine {
                 Err(err) => AttemptStatus::SpawnError(err.to_string()),
             }
         };
+        diag.duration_sec = self.lock().workers.get(&worker_id).map_or(0.0, |w| w.duration_sec);
         Attempt { status, diag }
     }
+}
+
+/// Outcome of the quality-checked retry.
+enum Retry {
+    Accepted { boost: u32, vmaf: f64, worst: f64 },
+    Rejected(String),
+    Stopped,
+}
+
+/// Stop was pressed during a measurement.
+struct Stopped;
+
+/// Per-frame VMAF scores from a libvmaf JSON log.
+fn vmaf_frame_scores(json: &str) -> Option<Vec<f64>> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    v.get("frames")?
+        .as_array()?
+        .iter()
+        .map(|f| f.get("metrics")?.get("vmaf")?.as_f64())
+        .collect()
+}
+
+/// Mean and 5th-percentile (worst 5% of frames) VMAF.
+fn summarize_vmaf(mut scores: Vec<f64>) -> Option<(f64, f64)> {
+    if scores.is_empty() {
+        return None;
+    }
+    scores.sort_by(f64::total_cmp);
+    let mean = scores.iter().sum::<f64>() / scores.len() as f64;
+    let p5 = scores[(scores.len() / 20).saturating_sub(1).min(scores.len() - 1)];
+    Some((mean, p5))
 }
 
 /// Size and modification time, to detect a file that changed during processing.
@@ -1595,6 +1871,18 @@ mod tests {
         assert!(!may_start_encoder(1, mem(10, 1)));
         assert!(may_start_encoder(1, mem(10, 4)));
         assert!(may_start_encoder(3, None));
+    }
+
+    #[test]
+    fn vmaf_log_parsing_and_summary() {
+        let json = r#"{"frames":[{"frameNum":0,"metrics":{"vmaf":90.0}},{"frameNum":1,"metrics":{"vmaf":100.0}}],"pooled_metrics":{}}"#;
+        assert_eq!(vmaf_frame_scores(json), Some(vec![90.0, 100.0]));
+        assert_eq!(vmaf_frame_scores("not json"), None);
+        assert_eq!(vmaf_frame_scores(r#"{"frames":[{"metrics":{}}]}"#), None);
+        let (mean, worst) = summarize_vmaf((1..=100).map(f64::from).collect()).unwrap();
+        assert!((mean - 50.5).abs() < 1e-9);
+        assert!((worst - 5.0).abs() < 1e-9, "5th percentile of 1..=100 is 5, got {worst}");
+        assert_eq!(summarize_vmaf(vec![]), None);
     }
 
     #[test]

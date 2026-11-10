@@ -29,6 +29,8 @@ pub struct Diagnostics {
     pub nvenc_unsupported: bool,
     pub corrupt_input: bool,
     pub error_lines: Vec<String>,
+    /// Input duration in seconds as reported by ffmpeg (0 if unknown).
+    pub duration_sec: f64,
     /// Trailing partial line carried over to the next stderr chunk.
     carry: String,
 }

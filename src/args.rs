@@ -46,6 +46,8 @@ pub struct Options {
     /// When the preset output is not smaller, retry with stronger settings and accept the
     /// result only if its VMAF stays at or above this floor. `None`: no retry.
     pub vmaf_floor: Option<f64>,
+    /// Added to the CQ/CRF for the quality-checked retry (0 for the normal encode).
+    pub cq_boost: u32,
 }
 
 impl Default for Options {
@@ -58,6 +60,7 @@ impl Default for Options {
             recycle: true,
             gif_min_bytes: 1024 * 1024,
             vmaf_floor: Some(93.0),
+            cq_boost: 0,
         }
     }
 }
@@ -103,6 +106,7 @@ impl Options {
             recycle: raw.recycle.unwrap_or(d.recycle),
             gif_min_bytes,
             vmaf_floor,
+            cq_boost: 0,
         }
     }
 }
@@ -165,7 +169,11 @@ fn s(items: &[&str]) -> Vec<String> {
 pub fn build_ffmpeg_args(input: &Path, tmp: &Path, options: &Options, mode: Mode) -> Vec<String> {
     let input = input.to_string_lossy().into_owned();
     let tmp = tmp.to_string_lossy().into_owned();
+    // x264 CRF and NVENC CQ both top out at 51 (AV1 NVENC at 63); the boost only applies to
+    // the quality-checked retry.
+    let boost = options.cq_boost;
     let crf = options.crf;
+    let x264_crf = (crf + boost).min(51);
     let preset = options.preset.as_str();
     let nvenc_preset = map_nvenc_preset(preset);
     let gif = is_gif(Path::new(&input));
@@ -188,7 +196,7 @@ pub fn build_ffmpeg_args(input: &Path, tmp: &Path, options: &Options, mode: Mode
     if mode == Mode::CpuFallback {
         args.extend(s(&["-i", &input, "-map", "0:V:0", "-map_metadata", "0", "-map_chapters", "-1"]));
         args.extend(even_scale);
-        args.extend(s(&["-c:v", "libx264", "-preset", "slow", "-crf", &crf.to_string(), "-pix_fmt", "yuv420p"]));
+        args.extend(s(&["-c:v", "libx264", "-preset", "slow", "-crf", &x264_crf.to_string(), "-pix_fmt", "yuv420p"]));
         if gif {
             args.extend(s(&["-an"]));
         } else {
@@ -234,21 +242,21 @@ pub fn build_ffmpeg_args(input: &Path, tmp: &Path, options: &Options, mode: Mode
 
     match options.encoder.as_str() {
         "av1_nvenc" => {
-            let cq = match crf { 20 => 32, 26 => 40, _ => 36 };
+            let cq = (match crf { 20 => 32, 26 => 40, _ => 36 } + boost).min(63);
             args.extend(nvenc("av1_nvenc", cq, "5", "4", true));
         }
         "hevc_nvenc" => {
-            let cq = match crf { 20 => 26, 26 => 34, _ => 30 };
+            let cq = (match crf { 20 => 26, 26 => 34, _ => 30 } + boost).min(51);
             args.extend(nvenc("hevc_nvenc", cq, "6", "4", true));
         }
         "h264_nvenc" => {
-            let cq = match crf { 20 => 22, 26 => 28, _ => 25 };
+            let cq = (match crf { 20 => 22, 26 => 28, _ => 25 } + boost).min(51);
             args.extend(nvenc("h264_nvenc", cq, "7", "3", false));
         }
         _ => {
             args.extend(s(&["-i", &input, "-map", "0:V:0"]));
             args.extend(even_scale);
-            args.extend(s(&["-vcodec", "libx264", "-preset", preset, "-crf", &crf.to_string()]));
+            args.extend(s(&["-vcodec", "libx264", "-preset", preset, "-crf", &x264_crf.to_string()]));
             args.extend(s(&["-map_metadata", "0"]));
             args.extend(x264_audio);
             args.extend(s(&["-y", &tmp]));
@@ -262,6 +270,21 @@ pub fn build_ffmpeg_args(input: &Path, tmp: &Path, options: &Options, mode: Mode
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn cq_boost_raises_cq_and_crf_with_caps() {
+        let p = Path::new(r"C:.mp4");
+        let tmp = temp_name(p, 1);
+        let mut o = Options { crf: 20, ..Options::default() };
+        o.cq_boost = 8;
+        assert!(build_ffmpeg_args(p, &tmp, &o, Mode::Primary).join(" ").contains("-cq 40"));
+        o.cq_boost = 60;
+        assert!(build_ffmpeg_args(p, &tmp, &o, Mode::Primary).join(" ").contains("-cq 63"));
+        o.encoder = "libx264".into();
+        o.cq_boost = 8;
+        assert!(build_ffmpeg_args(p, &tmp, &o, Mode::Primary).join(" ").contains("-crf 28"));
+        assert!(build_ffmpeg_args(p, &tmp, &o, Mode::CpuFallback).join(" ").contains("-crf 28"));
+    }
 
     #[test]
     fn normalizes_invalid_options_to_defaults() {

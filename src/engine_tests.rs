@@ -451,3 +451,62 @@ fn hard_links_are_left_alone_and_small_gifs_stay_gifs() {
     assert!(videos.join("small.gif").exists(), "small GIF must stay a GIF");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// An already-compressed H.264 that AV1 at the preset cannot shrink.
+fn compressed_h264(ffmpeg: &Path, noise: u32, crf: u32, out: &Path) {
+    let src = format!("testsrc2=size=1280x720:rate=30:duration=8,noise=alls={noise}:allf=t");
+    let crf = crf.to_string();
+    make(
+        ffmpeg,
+        &["-f", "lavfi", "-i", &src, "-c:v", "libx264", "-preset", "slow", "-crf", &crf, "-pix_fmt", "yuv420p"],
+        out,
+    );
+}
+
+#[test]
+fn quality_retry_accepts_only_above_the_vmaf_floor() {
+    let Some(ff) = ffmpeg() else {
+        eprintln!("skipping: bundled ffmpeg not found");
+        return;
+    };
+    let root = test_dir("vmaf");
+    let (good, bad) = (root.join("good"), root.join("bad"));
+    std::fs::create_dir_all(&good).unwrap();
+    std::fs::create_dir_all(&bad).unwrap();
+    // Light noise: AV1 at CQ 32 is bigger, at CQ 40 ~68% with VMAF ~96 -> accepted.
+    let g = good.join("light.mp4");
+    compressed_h264(&ff, 4, 24, &g);
+    // Heavy noise: only CQ 44 gets smaller, at VMAF ~92 -> rejected, original kept.
+    let b = bad.join("noisy.mp4");
+    compressed_h264(&ff, 12, 30, &b);
+    let (g_before, b_before) = (std::fs::metadata(&g).unwrap().len(), std::fs::metadata(&b).unwrap().len());
+
+    let rt = runtime();
+    let run = |dir: &Path, crf: f64| {
+        let (engine, rec) = new_engine(&rt, &root.join(dir.file_name().unwrap()), ff.clone());
+        let raw = || RawOptions { crf: Some(crf), vmaf_floor: Some(93), ..opts("av1_nvenc", 1.0) };
+        rt.block_on(async {
+            engine.apply_options(raw());
+            engine.load_dir(dir.to_path_buf()).await;
+            engine.clone().run_batch(raw()).await;
+        });
+        let logs = rec.logs.lock().unwrap().join("\n");
+        println!("{logs}");
+        (engine.snapshot(), logs)
+    };
+
+    let (s, logs) = run(&good, 20.0);
+    assert_eq!(s.compressed_this_run, 1, "{logs}");
+    assert!(logs.contains("Quality retry for light.mp4"), "{logs}");
+    let after = std::fs::metadata(&g).unwrap().len();
+    assert!(after < g_before, "not smaller: {after} vs {g_before}");
+
+    let (s, logs) = run(&bad, 23.0);
+    assert_eq!(s.compressed_this_run, 0, "{logs}");
+    assert!(logs.contains("is below 93"), "{logs}");
+    assert_eq!(std::fs::metadata(&b).unwrap().len(), b_before, "original changed");
+    let leftovers: Vec<_> = walkdir::WalkDir::new(&root).into_iter().filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().contains(".mediaopti.")).collect();
+    assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
