@@ -219,17 +219,108 @@ pub fn remove_file_if_exists(path: &Path) -> std::io::Result<()> {
     fs::remove_file(path)
 }
 
-/// Replaces `final_target` with `tmp`, coping with read-only originals (common on phone
-/// backups) and Explorer or antivirus briefly holding a handle. Removes `original` if the
-/// name changed. Blocking: sleeps between retries.
-pub fn replace_file_with_retry(tmp: &Path, final_target: &Path, original: &Path) -> std::io::Result<()> {
+/// Moves a file to the Recycle Bin (restorable from there). Succeeds only if the file is
+/// really gone from its folder. If Windows cannot recycle it (Recycle Bin disabled or full,
+/// file too big for it), it asks the user instead of silently deleting it for good; if the
+/// user declines, the error kind is `Interrupted`.
+pub fn recycle(path: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use std::sync::Mutex;
+        use windows_sys::Win32::UI::Shell::{
+            SHFileOperationW, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT,
+            FOF_WANTNUKEWARNING, FO_DELETE, SHFILEOPSTRUCTW,
+        };
+        // The shell API is not meant to be driven from several threads at once.
+        static LOCK: Mutex<()> = Mutex::new(());
+        let full = std::path::absolute(path)?;
+        // A list with a single entry: the path, then two NULs.
+        let from: Vec<u16> = full.as_os_str().encode_wide().chain([0, 0]).collect();
+        let mut op = SHFILEOPSTRUCTW {
+            hwnd: std::ptr::null_mut(),
+            wFunc: FO_DELETE,
+            pFrom: from.as_ptr(),
+            pTo: std::ptr::null(),
+            fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI | FOF_WANTNUKEWARNING) as u16,
+            fAnyOperationsAborted: 0,
+            hNameMappings: std::ptr::null_mut(),
+            lpszProgressTitle: std::ptr::null(),
+        };
+        let rc = {
+            let _guard = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            // SAFETY: `op` and the buffers it points to are valid for the whole call.
+            unsafe { SHFileOperationW(&mut op) }
+        };
+        if op.fAnyOperationsAborted != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                format!("moving {} to the Recycle Bin was cancelled", path.display()),
+            ));
+        }
+        if rc != 0 || path.exists() {
+            return Err(std::io::Error::other(format!(
+                "could not move {} to the Recycle Bin (code {rc})",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Err(std::io::Error::other("the Recycle Bin is only available on Windows"))
+    }
+}
+
+/// Number of hard links to a file (1 for a normal file). Replacing a hard-linked file
+/// would silently split it from its other names, so such files are left alone.
+pub fn hard_link_count(path: &Path) -> std::io::Result<u32> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        };
+        let file = File::open(path)?;
+        // SAFETY: all-zero is a valid value for this plain C struct.
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: the handle stays open for the call; `info` is writable.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(info.nNumberOfLinks)
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(fs::metadata(path)?.nlink() as u32)
+    }
+}
+
+/// Puts `tmp` in place of `original` (named `final_target`, which differs when the container
+/// changes), coping with read-only originals (common on phone backups) and Explorer or
+/// antivirus briefly holding a handle. With `use_recycle_bin` the original is moved to the
+/// Recycle Bin first, and if that fails nothing is changed; otherwise it is deleted.
+/// Blocking: sleeps between retries.
+pub fn replace_file_with_retry(
+    tmp: &Path,
+    final_target: &Path,
+    original: &Path,
+    use_recycle_bin: bool,
+) -> std::io::Result<()> {
     const MAX_ATTEMPTS: u64 = 6;
     let mut attempt = 1;
+    let mut recycled = false;
     loop {
         let result = (|| -> std::io::Result<()> {
             clear_readonly(original);
             if final_target != original {
                 clear_readonly(final_target);
+            }
+            if use_recycle_bin && !recycled {
+                recycle(original)?;
+                recycled = true;
             }
             if let Err(err) = fs::rename(tmp, final_target) {
                 if err.kind() == std::io::ErrorKind::PermissionDenied {
@@ -239,7 +330,7 @@ pub fn replace_file_with_retry(tmp: &Path, final_target: &Path, original: &Path)
                     return Err(err);
                 }
             }
-            if final_target != original {
+            if final_target != original && !use_recycle_bin {
                 let _ = remove_file_if_exists(original);
             }
             Ok(())
@@ -247,7 +338,10 @@ pub fn replace_file_with_retry(tmp: &Path, final_target: &Path, original: &Path)
 
         match result {
             Ok(()) => return Ok(()),
-            Err(err) if attempt >= MAX_ATTEMPTS => return Err(err),
+            // The user declined deleting a file that could not be recycled: don't ask again.
+            Err(err) if attempt >= MAX_ATTEMPTS || err.kind() == std::io::ErrorKind::Interrupted => {
+                return Err(err)
+            }
             Err(_) => {
                 std::thread::sleep(Duration::from_millis(250 * attempt));
                 attempt += 1;
@@ -439,6 +533,21 @@ mod tests {
         assert!(meta.permissions().readonly());
         remove_file_if_exists(&path).unwrap();
         assert!(!path.exists());
+    }
+
+    #[test]
+    #[ignore = "moves a temp file into the user's Recycle Bin"]
+    fn recycles_and_replaces() {
+        let dir = std::env::temp_dir().join(format!("mo-recycle-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (orig, tmp) = (dir.join("clip.mp4"), dir.join("clip.mediaopti.w1.mp4"));
+        fs::write(&orig, b"original").unwrap();
+        fs::write(&tmp, b"new").unwrap();
+        replace_file_with_retry(&tmp, &orig, &orig, true).unwrap();
+        assert_eq!(fs::read(&orig).unwrap(), b"new");
+        assert!(!tmp.exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

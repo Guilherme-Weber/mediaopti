@@ -76,6 +76,11 @@ fn opts(encoder: &str, concurrency: f64) -> RawOptions {
         preset: Some("slow".into()),
         encoder: Some(encoder.into()),
         concurrency: Some(concurrency),
+        // Tests must not fill the user's Recycle Bin; GIF limit and VMAF retry off so the
+        // older tests keep checking what they were written for.
+        recycle: Some(false),
+        gif_min_mb: Some(0),
+        vmaf_floor: Some(0),
     }
 }
 
@@ -114,6 +119,8 @@ fn full_batch_handles_every_file_kind() {
     let rt = runtime();
     let (engine, rec) = new_engine(&rt, &root, ff.clone());
     rt.block_on(async {
+        // Like the app at startup: saved settings are applied before the folder is scanned.
+        engine.apply_options(opts("av1_nvenc", 2.0));
         engine.load_dir(videos.clone()).await;
         let s = engine.snapshot();
         assert_eq!(s.total_files, 7, "logs: {:#?}", rec.logs.lock().unwrap());
@@ -405,5 +412,42 @@ fn historical_problem_files_are_handled() {
     rt.block_on(engine2.load_dir(videos));
     assert_eq!(engine2.snapshot().pending_files, 0, "{logs}");
 
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn hard_links_are_left_alone_and_small_gifs_stay_gifs() {
+    let Some(ff) = ffmpeg() else {
+        eprintln!("skipping: bundled ffmpeg not found");
+        return;
+    };
+    let root = test_dir("links");
+    let videos = root.join("videos");
+    std::fs::create_dir_all(&videos).unwrap();
+    let a = videos.join("a.mp4");
+    lossless_video(&ff, 2, "640x360", &a);
+    std::fs::hard_link(&a, videos.join("a-link.mp4")).unwrap();
+    assert_eq!(crate::system::hard_link_count(&a).unwrap(), 2);
+    let size_before = std::fs::metadata(&a).unwrap().len();
+    make(&ff, &["-f", "lavfi", "-i", "testsrc2=size=160x120:rate=10:duration=2"], &videos.join("small.gif"));
+
+    let rt = runtime();
+    let (engine, rec) = new_engine(&rt, &root, ff);
+    // Default GIF limit (1 MB): the small animated GIF must not be queued.
+    let raw = RawOptions { gif_min_mb: None, ..opts("av1_nvenc", 1.0) };
+    rt.block_on(async {
+        engine.apply_options(raw);
+        engine.load_dir(videos.clone()).await;
+        let s = engine.snapshot();
+        assert_eq!(s.skipped_small_gifs, 1);
+        assert_eq!(s.pending_files, 2);
+        engine.clone().run_batch(RawOptions { gif_min_mb: None, ..opts("av1_nvenc", 1.0) }).await;
+    });
+    let logs = rec.logs.lock().unwrap().join("\n");
+    println!("{logs}");
+    assert_eq!(engine.snapshot().compressed_this_run, 0, "{logs}");
+    assert_eq!(logs.matches("it is a hard link").count(), 2, "{logs}");
+    assert_eq!(std::fs::metadata(&a).unwrap().len(), size_before, "hard-linked file was changed");
+    assert!(videos.join("small.gif").exists(), "small GIF must stay a GIF");
     let _ = std::fs::remove_dir_all(&root);
 }

@@ -3,7 +3,7 @@
 //! The engine runs on tokio threads and reports through the [`Ui`] trait; updates are
 //! collected in an inbox and applied on the UI thread in one batch per event-loop turn.
 
-use crate::args::RawOptions;
+use crate::args::{RawOptions, NO_GIFS};
 use crate::engine::{Engine, StateDto, Status, Ui};
 use crate::system;
 use crate::taskbar::{Taskbar, TaskbarProgress};
@@ -42,15 +42,36 @@ const SPEEDS: &[(&str, &str)] = &[
     ("medium", "Medium (NVENC p7)"),
     ("veryfast", "Very fast (NVENC p5)"),
 ];
+const ORIGINALS: &[(bool, &str)] = &[
+    (true, "Move to the Recycle Bin"),
+    (false, "Delete permanently"),
+];
+const GIFS: &[(u32, &str)] = &[
+    (1, "Over 1 MB to video"),
+    (5, "Over 5 MB to video"),
+    (0, "All animated GIFs to video"),
+    (NO_GIFS, "Keep all GIFs as GIF"),
+];
+const QUALITY_CHECK: &[(u32, &str)] = &[
+    (93, "VMAF 93 (recommended)"),
+    (95, "VMAF 95 (stricter)"),
+    (0, "Off (preset only)"),
+];
 
 // ------------------------------------------------------------------- settings
 
+/// Saved settings. `serde(default)`: settings from batchviproc or older versions lack the
+/// newer fields, which then take their defaults.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 struct Prefs {
     encoder: String,
     concurrency: u32,
     crf: u32,
     preset: String,
+    recycle: bool,
+    gif_min_mb: u32,
+    vmaf_floor: u32,
 }
 
 impl Default for Prefs {
@@ -60,6 +81,9 @@ impl Default for Prefs {
             concurrency: 2,
             crf: 23,
             preset: "slow".into(),
+            recycle: true,
+            gif_min_mb: 1,
+            vmaf_floor: 93,
         }
     }
 }
@@ -92,6 +116,9 @@ impl Prefs {
             concurrency: JOBS[pick(w.get_jobs_index(), JOBS.len())].0,
             crf: QUALITY[pick(w.get_quality_index(), QUALITY.len())].0,
             preset: SPEEDS[pick(w.get_speed_index(), SPEEDS.len())].0.into(),
+            recycle: ORIGINALS[pick(w.get_originals_index(), ORIGINALS.len())].0,
+            gif_min_mb: GIFS[pick(w.get_gifs_index(), GIFS.len())].0,
+            vmaf_floor: QUALITY_CHECK[pick(w.get_check_index(), QUALITY_CHECK.len())].0,
         }
     }
 
@@ -103,6 +130,9 @@ impl Prefs {
         w.set_jobs_index(position(JOBS, &self.concurrency, &d.concurrency));
         w.set_quality_index(position(QUALITY, &self.crf, &d.crf));
         w.set_speed_index(position(SPEEDS, &self.preset.as_str(), &d.preset.as_str()));
+        w.set_originals_index(position(ORIGINALS, &self.recycle, &d.recycle));
+        w.set_gifs_index(position(GIFS, &self.gif_min_mb, &d.gif_min_mb));
+        w.set_check_index(position(QUALITY_CHECK, &self.vmaf_floor, &d.vmaf_floor));
     }
 
     fn to_raw(&self) -> RawOptions {
@@ -111,6 +141,9 @@ impl Prefs {
             preset: Some(self.preset.clone()),
             encoder: Some(self.encoder.clone()),
             concurrency: Some(self.concurrency as f64),
+            recycle: Some(self.recycle),
+            gif_min_mb: Some(self.gif_min_mb),
+            vmaf_floor: Some(self.vmaf_floor),
         }
     }
 }
@@ -489,8 +522,12 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
     window.set_jobs_options(labels(JOBS));
     window.set_quality_options(labels(QUALITY));
     window.set_speed_options(labels(SPEEDS));
+    window.set_originals_options(labels(ORIGINALS));
+    window.set_gifs_options(labels(GIFS));
+    window.set_check_options(labels(QUALITY_CHECK));
     let prefs = Prefs::load(&prefs_path);
     prefs.apply_to_window(&window);
+    engine.apply_options(prefs.to_raw());
 
     // Models
     let log_model = Rc::new(VecModel::<SharedString>::default());
@@ -582,6 +619,7 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
         });
     }
     {
+        let engine = engine.clone();
         let weak = window.as_weak();
         let prefs_path = prefs_path.clone();
         let last_encoder = RefCell::new(prefs.encoder.clone());
@@ -599,6 +637,7 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
                 last_encoder.borrow_mut().clone_from(&prefs.encoder);
             }
             prefs.save(&prefs_path);
+            engine.apply_options(prefs.to_raw());
         });
     }
 
@@ -696,6 +735,9 @@ fn file_count_text(s: &StateDto) -> String {
     ];
     if s.skipped_known > 0 {
         parts.push(format!("{} already processed", group_thousands(s.skipped_known)));
+    }
+    if s.skipped_small_gifs > 0 {
+        parts.push(format!("{} small GIFs kept as GIF", group_thousands(s.skipped_small_gifs)));
     }
     if s.skipped_generated > 0 {
         parts.push(format!("{} ignored", group_thousands(s.skipped_generated)));

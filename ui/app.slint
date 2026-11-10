@@ -265,6 +265,12 @@ export component AppWindow inherits Window {
     in-out property <int> jobs-index;
     in-out property <int> quality-index;
     in-out property <int> speed-index;
+    in property <[string]> check-options;
+    in property <[string]> gifs-options;
+    in property <[string]> originals-options;
+    in-out property <int> check-index;
+    in-out property <int> gifs-index;
+    in-out property <int> originals-index;
 
     callback choose-folder();
     callback start();
@@ -414,6 +420,34 @@ export component AppWindow inherits Window {
                         hint: "Slower presets compress better.";
                         model: root.speed-options;
                         current-index <=> root.speed-index;
+                        changed => { root.settings-changed(); }
+                    }
+                }
+                Row {
+                    SettingField {
+                        glyph: "\u{E73E}";
+                        label: "If not smaller";
+                        hint: "Retry stronger settings, keeping the measured quality (VMAF) at or above this.";
+                        model: root.check-options;
+                        current-index <=> root.check-index;
+                        changed => { root.settings-changed(); }
+                    }
+                    SettingField {
+                        glyph: "\u{E8B9}";
+                        label: "Animated GIFs";
+                        hint: "Smaller GIFs stay GIFs (optimized as images).";
+                        model: root.gifs-options;
+                        current-index <=> root.gifs-index;
+                        changed => { root.settings-changed(); }
+                    }
+                }
+                Row {
+                    SettingField {
+                        glyph: "\u{E74D}";
+                        label: "Replaced originals";
+                        hint: "The Recycle Bin lets you restore them.";
+                        model: root.originals-options;
+                        current-index <=> root.originals-index;
                         changed => { root.settings-changed(); }
                     }
                 }

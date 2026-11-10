@@ -92,6 +92,8 @@ pub struct StateDto {
     pub pending_files: usize,
     pub skipped_known: usize,
     pub skipped_generated: usize,
+    /// Animated GIFs under the size limit, kept as GIFs.
+    pub skipped_small_gifs: usize,
     pub history_count: usize,
     pub run_total: usize,
     pub completed_this_run: usize,
@@ -105,10 +107,13 @@ pub struct StateDto {
 struct Inner {
     dir: Option<PathBuf>,
     files: Vec<PathBuf>,
+    /// Size of each entry of `files` at scan time, same order.
+    file_sizes: Vec<u64>,
     pending_queue: Vec<PathBuf>,
     queue_cursor: usize,
     skipped_known: usize,
     skipped_generated: usize,
+    skipped_small_gifs: usize,
     history: History,
     history_save_pending: bool,
     failed: HashSet<PathBuf>,
@@ -205,12 +210,16 @@ impl Inner {
     /// Rebuilds the work queue from the scanned files, history and this run's failures.
     fn rebuild_queue(&mut self) {
         let mut queue = Vec::new();
-        let (mut known, mut generated) = (0, 0);
-        for file in &self.files {
+        let (mut known, mut generated, mut small_gifs) = (0, 0, 0);
+        for (i, file) in self.files.iter().enumerate() {
+            let size = self.file_sizes.get(i).copied().unwrap_or(u64::MAX);
             if is_generated_name(file) {
                 generated += 1;
             } else if self.history.contains(file) {
                 known += 1;
+            } else if args::is_gif(file) && size < self.options.gif_min_bytes {
+                // Not remembered: they stay GIFs and the image optimizer handles them.
+                small_gifs += 1;
             } else if !self.failed.contains(file) {
                 queue.push(file.clone());
             }
@@ -219,6 +228,7 @@ impl Inner {
         self.queue_cursor = 0;
         self.skipped_known = known;
         self.skipped_generated = generated;
+        self.skipped_small_gifs = small_gifs;
     }
 
     fn remaining_pending(&self) -> usize {
@@ -293,6 +303,7 @@ impl Inner {
             pending_files: self.remaining_pending(),
             skipped_known: self.skipped_known,
             skipped_generated: self.skipped_generated,
+            skipped_small_gifs: self.skipped_small_gifs,
             history_count: self.history.len(),
             run_total: self.run.total,
             completed_this_run: self.run.completed,
@@ -327,10 +338,12 @@ impl Engine {
             inner: Mutex::new(Inner {
                 dir: None,
                 files: Vec::new(),
+                file_sizes: Vec::new(),
                 pending_queue: Vec::new(),
                 queue_cursor: 0,
                 skipped_known: 0,
                 skipped_generated: 0,
+                skipped_small_gifs: 0,
                 history,
                 history_save_pending: false,
                 failed: HashSet::new(),
@@ -514,6 +527,7 @@ impl Engine {
             let mut inner = self.lock();
             inner.dir = Some(dir.clone());
             inner.files.clear();
+            inner.file_sizes.clear();
             inner.pending_queue.clear();
             inner.queue_cursor = 0;
             inner.reset_run_tracking();
@@ -546,6 +560,7 @@ impl Engine {
                 let (known, generated) = {
                     let mut inner = self.lock();
                     inner.files = result.files;
+                    inner.file_sizes = result.sizes;
                     inner.reset_run_tracking();
                     inner.rebuild_queue();
                     inner.run = RunStats::default();
@@ -565,6 +580,12 @@ impl Engine {
                 }
                 if known > 0 {
                     self.log(format!("{known} videos are already in the processed history"));
+                }
+                let small_gifs = self.lock().skipped_small_gifs;
+                if small_gifs > 0 {
+                    self.log(format!(
+                        "{small_gifs} animated GIFs are under the size limit and will stay GIFs"
+                    ));
                 }
                 if generated > 0 {
                     self.log(format!(
@@ -586,6 +607,22 @@ impl Engine {
     pub fn spawn_load_dir(self: &Arc<Self>, dir: PathBuf) {
         let engine = Arc::clone(self);
         self.rt.spawn(async move { engine.load_dir(dir).await });
+    }
+
+    /// Applies settings outside a run, so the queue shown before Start already reflects
+    /// them (e.g. which GIFs are queued).
+    pub fn apply_options(self: &Arc<Self>, raw: RawOptions) {
+        {
+            let mut inner = self.lock();
+            if inner.working {
+                return;
+            }
+            inner.options = Options::normalize(raw);
+            if inner.dir.is_some() {
+                inner.rebuild_queue();
+            }
+        }
+        self.send_state(true);
     }
 
     pub fn start(self: &Arc<Self>, raw: RawOptions) {
@@ -912,6 +949,27 @@ impl Engine {
             return Outcome::Empty;
         };
 
+        // Size and date now, to notice if the file changes while it is being encoded
+        // (still downloading, edited, synced). Also leave hard-linked files alone:
+        // replacing one would split it from its other names.
+        let path = input.clone();
+        let (source_state, links) = self
+            .blocking(move || (file_state(&path), system::hard_link_count(&path).unwrap_or(1)))
+            .await;
+        if links > 1 {
+            self.lock().in_progress.remove(&input);
+            {
+                let mut inner = self.lock();
+                inner.run.completed += 1;
+                inner.run.skipped_larger += 1;
+            }
+            self.log(format!(
+                "[Worker {worker_id}] Skipped {display}: it is a hard link ({links} names for one file)"
+            ));
+            self.send_state(false);
+            return Outcome::Skipped;
+        }
+
         // Skip static 1-frame GIFs and tiny spacer GIFs immediately.
         if args::is_gif(&input) {
             let path = input.clone();
@@ -1157,10 +1215,21 @@ impl Engine {
             return Outcome::Skipped;
         }
 
+        if file_state(&input) != source_state {
+            self.lock().run.skipped_larger += 1;
+            self.log_remove(&tmp);
+            self.log(format!(
+                "[Worker {worker_id}] {display} changed while it was being encoded; left unchanged (it will be processed next time)"
+            ));
+            self.send_state(false);
+            return Outcome::Skipped;
+        }
+
         let attrs = OriginalAttributes::from_metadata(&in_meta);
+        let use_recycle_bin = self.lock().options.recycle;
         let (tmp_c, target_c, input_c) = (tmp.clone(), final_target.clone(), input.clone());
         let replaced = self
-            .blocking(move || system::replace_file_with_retry(&tmp_c, &target_c, &input_c))
+            .blocking(move || system::replace_file_with_retry(&tmp_c, &target_c, &input_c, use_recycle_bin))
             .await;
         if let Err(err) = replaced {
             {
@@ -1168,8 +1237,16 @@ impl Engine {
                 inner.failed.insert(input.clone());
                 inner.run.failed += 1;
             }
-            self.log_remove(&tmp);
-            self.log(format!("Could not replace {display}: {err}"));
+            if input.exists() {
+                self.log_remove(&tmp);
+                self.log(format!("Could not replace {display}: {err}"));
+            } else {
+                // The original already went to the Recycle Bin: never delete the new version.
+                self.log(format!(
+                    "Could not finish replacing {display}: {err}. The original is in the Recycle Bin and the new version is kept as {}",
+                    tmp.display()
+                ));
+            }
             self.send_state(true);
             return Outcome::Failed;
         }
@@ -1411,6 +1488,11 @@ impl Engine {
         };
         Attempt { status, diag }
     }
+}
+
+/// Size and modification time, to detect a file that changed during processing.
+fn file_state(path: &Path) -> Option<(u64, Option<std::time::SystemTime>)> {
+    std::fs::metadata(path).ok().map(|m| (m.len(), m.modified().ok()))
 }
 
 /// Content-hashes files on a few threads (disk-bound; more threads would only seek more).

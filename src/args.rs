@@ -26,6 +26,12 @@ const ALLOWED_ENCODERS: &[&str] = &[
     "libx264",
 ];
 const ALLOWED_CONCURRENCY: &[u32] = &[1, 2, 3, 4];
+/// GIF size limits in MB: GIFs below the limit stay GIFs (the image engine optimizes them).
+/// `NO_GIFS` means GIFs are never converted to video.
+pub const NO_GIFS: u32 = u32::MAX;
+const ALLOWED_GIF_MIN_MB: &[u32] = &[0, 1, 5, NO_GIFS];
+/// VMAF floors for the quality-checked fallback; 0 turns it off.
+const ALLOWED_VMAF_FLOOR: &[u32] = &[0, 93, 95];
 
 #[derive(Clone, Debug)]
 pub struct Options {
@@ -33,6 +39,13 @@ pub struct Options {
     pub preset: String,
     pub encoder: String,
     pub concurrency: u32,
+    /// Move replaced originals to the Recycle Bin instead of deleting them.
+    pub recycle: bool,
+    /// Animated GIFs smaller than this stay GIFs (`u64::MAX`: no GIF is converted).
+    pub gif_min_bytes: u64,
+    /// When the preset output is not smaller, retry with stronger settings and accept the
+    /// result only if its VMAF stays at or above this floor. `None`: no retry.
+    pub vmaf_floor: Option<f64>,
 }
 
 impl Default for Options {
@@ -42,6 +55,9 @@ impl Default for Options {
             preset: "slow".into(),
             encoder: "av1_nvenc".into(),
             concurrency: 2,
+            recycle: true,
+            gif_min_bytes: 1024 * 1024,
+            vmaf_floor: Some(93.0),
         }
     }
 }
@@ -53,6 +69,9 @@ pub struct RawOptions {
     pub preset: Option<String>,
     pub encoder: Option<String>,
     pub concurrency: Option<f64>,
+    pub recycle: Option<bool>,
+    pub gif_min_mb: Option<u32>,
+    pub vmaf_floor: Option<u32>,
 }
 
 impl Options {
@@ -65,11 +84,25 @@ impl Options {
             .filter(|v| ALLOWED_CONCURRENCY.contains(v));
         let preset = raw.preset.filter(|p| ALLOWED_PRESETS.contains(&p.as_str()));
         let encoder = raw.encoder.filter(|e| ALLOWED_ENCODERS.contains(&e.as_str()));
+        let gif_min_bytes = raw
+            .gif_min_mb
+            .filter(|v| ALLOWED_GIF_MIN_MB.contains(v))
+            .map_or(d.gif_min_bytes, |mb| {
+                if mb == NO_GIFS { u64::MAX } else { u64::from(mb) * 1024 * 1024 }
+            });
+        let vmaf_floor = match raw.vmaf_floor.filter(|v| ALLOWED_VMAF_FLOOR.contains(v)) {
+            Some(0) => None,
+            Some(v) => Some(f64::from(v)),
+            None => d.vmaf_floor,
+        };
         Self {
             crf: crf.unwrap_or(d.crf),
             preset: preset.unwrap_or(d.preset),
             encoder: encoder.unwrap_or(d.encoder),
             concurrency: concurrency.unwrap_or(d.concurrency),
+            recycle: raw.recycle.unwrap_or(d.recycle),
+            gif_min_bytes,
+            vmaf_floor,
         }
     }
 }
@@ -237,11 +270,27 @@ mod tests {
             preset: Some("bogus".into()),
             encoder: Some("rm -rf".into()),
             concurrency: Some(9.0),
+            recycle: None,
+            gif_min_mb: Some(3),
+            vmaf_floor: Some(50),
         });
         assert_eq!(o.crf, 23);
         assert_eq!(o.preset, "slow");
         assert_eq!(o.encoder, "av1_nvenc");
         assert_eq!(o.concurrency, 2);
+        assert!(o.recycle, "originals go to the Recycle Bin by default");
+        assert_eq!(o.gif_min_bytes, 1024 * 1024);
+        assert_eq!(o.vmaf_floor, Some(93.0));
+
+        let o = Options::normalize(RawOptions {
+            recycle: Some(false),
+            gif_min_mb: Some(NO_GIFS),
+            vmaf_floor: Some(0),
+            ..RawOptions::default()
+        });
+        assert!(!o.recycle);
+        assert_eq!(o.gif_min_bytes, u64::MAX);
+        assert_eq!(o.vmaf_floor, None);
     }
 
     #[test]
@@ -283,6 +332,7 @@ mod tests {
                                 preset: preset.into(),
                                 encoder: encoder.to_string(),
                                 concurrency: 2,
+                                ..Options::default()
                             };
                             let tmp = temp_name(Path::new(input), 1);
                             rows.push(serde_json::json!({
