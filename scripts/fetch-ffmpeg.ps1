@@ -63,6 +63,11 @@ try {
             throw "Downloaded FFmpeg is missing the $name encoder"
         }
     }
+    # The quality-checked retry measures VMAF.
+    $filters = & $target -hide_banner -filters
+    if (-not ($filters | Select-String -Pattern '\slibvmaf\s' -Quiet)) {
+        throw 'Downloaded FFmpeg is missing the libvmaf filter'
+    }
 
     Write-Host "Installed FFmpeg $version to $target"
 }

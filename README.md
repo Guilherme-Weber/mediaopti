@@ -1,56 +1,74 @@
-# batchviproc
+# mediaopti
 
-Desktop tool for batch video compression on Windows. It scans a folder (including subfolders) for videos and recompresses them with FFmpeg, using NVIDIA NVENC (AV1, HEVC, H.264) or x264 on the CPU. Original files are replaced only when the new file is smaller, and their dates and attributes are preserved.
+Batch media optimizer for Windows. It scans a folder (including subfolders) and makes media smaller.
+The original is replaced only when the new file is smaller and passes its checks, and the original's
+dates and attributes are kept.
 
-[Releases](https://github.com/Guilherme-Weber/batchviproc/releases)
+mediaopti merges two tools:
+
+- [batchviproc](https://github.com/Guilherme-Weber/batchviproc) (videos and animated GIFs);
+- imageopti (images, audio cover art, PDFs, and Office/EPUB/comic files).
+
+The video part works today. The image, audio, and document parts are still being ported (see
+[Roadmap](#roadmap)); until then, imageopti covers them.
 
 ## Origin
 
-This project is a fork of [batchviproc](https://github.com/kachurovskiy/batchviproc) by **Maxim Kachurovskiy**, and it is strongly based on that program. The core workflow comes from the original application:
+mediaopti starts from batchviproc 2.0. batchviproc is a fork of
+[batchviproc](https://github.com/kachurovskiy/batchviproc) by **Maxim Kachurovskiy**, and the core
+workflow comes from that program:
 
-- recursive folder scanning;
-- a queue processed from the largest file first;
-- processed history in `processedFiles.txt`;
+- recursive scanning;
+- largest files first;
+- a processed-files history;
 - replacing the original only when the output is smaller;
 - preserving file dates.
 
-The quality and speed settings and the FFmpeg parameters also come from it.
+The quality and speed settings and the FFmpeg parameters also come from it. The original work is
+distributed under the MIT License (see [LICENSE](LICENSE)), which this project keeps.
 
-Version 2.0 rewrites the application in Rust and adds the features listed below. The processed history file remains compatible, so files already handled by the original version are not processed again.
+## Coming from batchviproc
 
-The original work is distributed under the MIT License (see [LICENSE](LICENSE)), which this fork keeps.
+- On first start, batchviproc's processed history and settings are imported from
+  `%APPDATA%\batchviproc`, so videos it already handled are not processed again.
+- Leftover `.batchviproc.` temporary files are still recognised and cleaned up.
 
-## What is new in version 2.0
+## Videos
 
-**Platform**
+Everything batchviproc 2.0 does:
 
-- Native Rust application with a [Slint](https://slint.dev) interface in the Windows 11 Fluent style, replacing Electron. It uses about 15–30 MB of memory.
-- Single executable plus `ffmpeg.exe`, with no installation and no runtime dependencies.
+- NVENC AV1/HEVC/H.264 or x264, with 1 to 4 parallel jobs and memory-aware start-up;
+- AAC and CPU fallbacks, and handling of real-world problem files;
+- Pause/Resume, live per-worker progress, and taskbar progress;
+- keep-awake, logs and crash reports, a single instance, and `--start` for scheduled runs.
 
-**Encoding**
+New in mediaopti:
 
-- GPU encoding with NVENC (AV1 10-bit, HEVC 10-bit, H.264), plus x264 for systems without an NVIDIA GPU.
-- Parallel encoding with 1 to 4 jobs. Before starting each additional encoder, the app checks free memory, so parallel 4K encodes wait instead of exhausting RAM.
-- Automatic fallbacks when a file is rejected: AAC audio transcoding, then CPU encoding.
-- More formats: `.mp4`, `.mkv`, `.mov`, `.webm`, `.avi`, `.wmv`, `.mts`, `.m2ts`, `.flv`, `.m4v`, `.ts`, `.3gp`, `.mpg`, `.mpeg` and animated `.gif`. Legacy containers are converted to `.mp4`.
-- Handling for real-world problem files. Each case is covered by regression tests in `src/engine_tests.rs`:
-  - WMV/AVI/FLV with WMA or PCM audio;
-  - videos that change resolution mid-stream;
-  - tiny sticker GIFs and static spacer GIFs;
-  - audio-only MP4 files;
-  - corrupt downloads.
-- A stall watchdog that ends FFmpeg processes that stop making progress.
-
-**Control and monitoring**
-
-- **Pause/Resume**: pausing suspends the running FFmpeg processes without losing progress. No new files start while paused, and the PC is allowed to sleep. Resume continues the same encodes.
-- Live progress for each worker: FPS, speed, NVENC load, VRAM, space saved and failures.
-- Progress shown on the Windows taskbar button.
-- Restores the read-only flag along with the creation, modification and access dates.
-- Keeps the PC awake while a batch runs.
-- A persistent activity log and crash reports, with a link to open the log folder.
-- Only one instance can run at a time.
-- Command-line options for scheduled runs.
+- **Quality-checked retry ("If not smaller" setting, default VMAF 93).** When the preset output is
+  not smaller than the original, mediaopti retries stronger settings (+4, +8, +12, +16 CQ):
+  - A result is accepted only if it is smaller and its [VMAF](https://github.com/Netflix/vmaf) score
+    against the original stays at or above the floor, with the worst 5% of frames at least 5 below
+    it.
+  - It keeps climbing while quality holds, and uses the strongest step that passes.
+  - Quality is measured on three 8-second windows, or the whole video if it is short.
+  - These are the videos batchviproc used to leave untouched. On a test of 30 of them, 21 shrank at
+    VMAF ≥ 93, to 66% of their size overall. At the preset, they scored VMAF 95–100 but came out
+    bigger than the original.
+- **Recycle Bin.** Replaced originals go to the Recycle Bin by default, so you can restore them.
+  - If Windows can't recycle a file, it asks instead of deleting it, and nothing is changed if
+    recycling fails.
+  - The other choice is *Delete permanently*.
+  - When the Recycle Bin is full, Windows silently drops its *oldest* items. On a very large run,
+    only the most recent originals stay restorable.
+- **Content-hash history.** Finished files are also remembered by a BLAKE2b hash of their content,
+  so a video that was moved, renamed, or copied is not encoded again. Only files whose size matches
+  a processed one are hashed, so the check is almost free.
+- **Animated GIFs** under a size limit (default 1 MB) stay GIFs, to be optimized as images. Bigger
+  ones become video, as before.
+- **Safety checks:**
+  - Hard-linked files are skipped, because replacing one would split it from its other names.
+  - A file that changes while it is being encoded (still downloading, synced, edited) is left
+    unchanged.
 
 ## Requirements
 
@@ -59,27 +77,41 @@ The original work is distributed under the MIT License (see [LICENSE](LICENSE)),
 
 ## Usage
 
-1. Extract the release zip and run `batchviproc.exe`.
+1. Extract the release zip and run `mediaopti.exe`.
 2. Choose a folder.
-3. Select the encoder, number of jobs, quality and speed.
+3. Pick the settings: encoder, jobs, quality, speed, the *If not smaller* check, GIF handling, and
+   what happens to replaced originals.
 4. Click **Start**. Use **Pause/Resume** or **Stop** at any time.
 
-### Command line
-
 ```powershell
-batchviproc.exe [--start] [folder]
+mediaopti.exe [--start] [folder]
 ```
 
-Opens `folder` directly. With `--start`, processing begins immediately with the last-used settings, which is useful with Windows Task Scheduler.
+This opens `folder` directly. With `--start`, processing begins immediately with the last-used
+settings, which is useful with Windows Task Scheduler.
 
 ## Data files
 
-All data is stored in `%APPDATA%\batchviproc`:
+All data is stored in `%APPDATA%\mediaopti`:
 
-- `processedFiles.txt`: the processed history. It uses the same format as the original version, and new entries are appended.
-- `ui-settings.json`: the last encoder settings.
-- `logs\batchviproc.log`: the activity log with timestamps. It is rotated to `batchviproc.1.log` at 5 MB.
+- `processedFiles.txt`: the processed history by location (SHA-256 of each path). It has the same
+  format as batchviproc.
+- `processed-content.tsv`: the processed history by content (`hash`, `size`, `mode` per line). It
+  has the same format as imageopti's `history-hashes.tsv`.
+- `ui-settings.json`: the last settings.
+- `logs\mediaopti.log`: the activity log, rotated at 5 MB.
 - `logs\crash-*.txt`: crash reports, written only if the application fails.
+
+## Roadmap
+
+1. Done: rename, the batchviproc import, content-hash history, the Recycle Bin, safety checks, the
+   GIF size limit, and the VMAF-checked retry.
+2. Images: PNG/JPEG/GIF with the imageopti chains (beeim, pingo, oxipng, ECT, jpegtran, jpegli,
+   gifsicle). Every step is verified, with optional lossy encoding at SSIMULACRA2 ≥ 93. This runs
+   in a separate CPU worker pool, so images and GPU video encodes don't block each other.
+3. Audio and documents: cover art in FLAC/MP3, FLAC/Ogg repacking, WAV → FLAC, PDF/Office/EPUB/CBZ,
+   and the BMP/TGA/CBR conversions.
+4. A one-time import of imageopti's history.
 
 ## Development
 
@@ -89,32 +121,30 @@ Requirements:
 - Visual Studio Build Tools with the C++ workload.
 
 ```powershell
-git clone https://github.com/Guilherme-Weber/batchviproc.git
-cd batchviproc
 powershell -ExecutionPolicy Bypass -File scripts/fetch-ffmpeg.ps1   # downloads FFmpeg into bin/
 cargo run
 ```
 
 Project layout:
 
-- `src/engine.rs`: queue, workers, fallbacks, pause and memory control.
+- `src/engine.rs`: queue, workers, fallbacks, the quality retry, pause, and memory control.
+- `src/history.rs`: the location and content histories, and the batchviproc import.
 - `src/args.rs`: FFmpeg arguments.
+- `src/system.rs`: Windows integration (Recycle Bin, hard links, job objects, attributes).
 - `src/app.rs`: the bridge between the engine and the interface.
 - `ui/app.slint`: the interface.
 
-`scripts/fetch-ffmpeg.ps1` downloads the pinned FFmpeg "essentials" build (currently 9.0.2) from gyan.dev. It verifies the checksum and checks that the required encoders are present. To evaluate another version:
-
-1. Run the script with `-Force -Version <x.y.z>` (or `-Version latest`).
-2. Run the tests.
-3. Update `$PinnedVersion` in the script.
+`scripts/fetch-ffmpeg.ps1` downloads the pinned FFmpeg "essentials" build (currently 9.0.2, which
+includes libvmaf) from gyan.dev. It verifies the checksum and checks that the required encoders are
+present.
 
 Tests:
 
 ```powershell
-cargo test
+cargo test                                   # end-to-end tests need bin/ffmpeg.exe and an NVIDIA GPU
+cargo test recycles -- --ignored             # moves a temp file into your Recycle Bin
+cargo clippy --all-targets --locked -- -D warnings
 ```
-
-The end-to-end tests encode real videos with `bin/ffmpeg.exe`, and the NVENC cases require an NVIDIA GPU.
 
 ## Building
 
@@ -122,7 +152,7 @@ The end-to-end tests encode real videos with `bin/ffmpeg.exe`, and the NVENC cas
 powershell -ExecutionPolicy Bypass -File scripts/package.ps1
 ```
 
-This produces `dist/batchviproc-<version>-win64.zip`, containing `batchviproc.exe` and `ffmpeg.exe`. The version is defined in `Cargo.toml`.
+This produces `dist/mediaopti-<version>-win64.zip`, containing `mediaopti.exe` and `ffmpeg.exe`.
 
 ## License
 
