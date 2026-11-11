@@ -56,18 +56,19 @@ impl Engine {
             if !self.wait_while_paused(&cancel).await {
                 break;
             }
-            let (path, lossy, recycle) = {
+            let (path, lossy, disposal) = {
                 let mut inner = self.lock();
                 if !inner.working || inner.stop_requested {
                     break;
                 }
                 let Some(path) = inner.claim_image() else { break };
                 inner.images_active += 1;
-                (path, inner.images_lossy(), inner.options.recycle)
+                let disposal = inner.disposal_for(&path);
+                (path, inner.images_lossy(), disposal)
             };
             self.send_state(false);
             let (ctx2, p2) = (Arc::clone(&ctx), path.clone());
-            let result = self.blocking(move || process_image(&ctx2, &p2, worker_id, recycle)).await;
+            let result = self.blocking(move || process_image(&ctx2, &p2, worker_id, &disposal)).await;
             self.finish_image(&path, lossy, result);
         }
     }
@@ -146,7 +147,7 @@ fn content_of(path: &Path) -> Option<(ContentHash, u64)> {
 }
 
 /// Optimizes one image and, if worthwhile, replaces the original. Blocking.
-pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, use_recycle_bin: bool) -> ImageResult {
+pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, disposal: &system::Disposal) -> ImageResult {
     static NEXT_JOB: AtomicU64 = AtomicU64::new(0);
     let Some(kind) = image::kind_of(path) else {
         return ImageResult::Skipped("not an image".into());
@@ -195,16 +196,8 @@ pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, use_r
         let _ = system::remove_file_if_exists(&sibling);
         return ImageResult::Failed(format!("could not write next to the original: {err}"));
     }
-    if let Err(err) = system::replace_file_with_retry(&sibling, path, path, use_recycle_bin) {
-        if path.exists() {
-            let _ = system::remove_file_if_exists(&sibling);
-            return ImageResult::Failed(format!("could not replace it: {err}"));
-        }
-        // The original already went to the Recycle Bin: never delete the new version.
-        return ImageResult::Failed(format!(
-            "could not finish replacing it: {err}. The original is in the Recycle Bin and the new version is kept as {}",
-            sibling.display()
-        ));
+    if let Err(err) = super::replace_original(&sibling, path, path, disposal) {
+        return ImageResult::Failed(err);
     }
     let _ = system::restore_attributes(path, &attrs);
     let lossy = result.steps.iter().any(|s| s.contains('='));

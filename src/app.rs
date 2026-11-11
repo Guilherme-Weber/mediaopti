@@ -42,9 +42,11 @@ const SPEEDS: &[(&str, &str)] = &[
     ("medium", "Medium (NVENC p7)"),
     ("veryfast", "Very fast (NVENC p5)"),
 ];
-const ORIGINALS: &[(bool, &str)] = &[
-    (true, "Move to the Recycle Bin"),
-    (false, "Delete permanently"),
+// Keep "Move to a backup folder" at index 1: the window shows the folder line for it.
+const ORIGINALS: &[(u32, &str)] = &[
+    (1, "Move to the Recycle Bin"),
+    (2, "Move to a backup folder"),
+    (0, "Delete permanently"),
 ];
 const GIFS: &[(u32, &str)] = &[
     (1, "Over 1 MB to video"),
@@ -74,7 +76,10 @@ struct Prefs {
     concurrency: u32,
     crf: u32,
     preset: String,
-    recycle: bool,
+    /// 0 = delete, 1 = Recycle Bin, 2 = backup folder.
+    originals: u32,
+    /// Chosen backup folder; empty = next to the scanned folder.
+    backup_dir: String,
     gif_min_mb: u32,
     vmaf_floor: u32,
     images: u32,
@@ -87,7 +92,8 @@ impl Default for Prefs {
             concurrency: 2,
             crf: 23,
             preset: "slow".into(),
-            recycle: true,
+            originals: 1,
+            backup_dir: String::new(),
             gif_min_mb: 1,
             vmaf_floor: 93,
             images: 2,
@@ -123,7 +129,8 @@ impl Prefs {
             concurrency: JOBS[pick(w.get_jobs_index(), JOBS.len())].0,
             crf: QUALITY[pick(w.get_quality_index(), QUALITY.len())].0,
             preset: SPEEDS[pick(w.get_speed_index(), SPEEDS.len())].0.into(),
-            recycle: ORIGINALS[pick(w.get_originals_index(), ORIGINALS.len())].0,
+            originals: ORIGINALS[pick(w.get_originals_index(), ORIGINALS.len())].0,
+            backup_dir: w.get_backup_dir().into(),
             gif_min_mb: GIFS[pick(w.get_gifs_index(), GIFS.len())].0,
             vmaf_floor: QUALITY_CHECK[pick(w.get_check_index(), QUALITY_CHECK.len())].0,
             images: IMAGES[pick(w.get_images_index(), IMAGES.len())].0,
@@ -138,7 +145,8 @@ impl Prefs {
         w.set_jobs_index(position(JOBS, &self.concurrency, &d.concurrency));
         w.set_quality_index(position(QUALITY, &self.crf, &d.crf));
         w.set_speed_index(position(SPEEDS, &self.preset.as_str(), &d.preset.as_str()));
-        w.set_originals_index(position(ORIGINALS, &self.recycle, &d.recycle));
+        w.set_originals_index(position(ORIGINALS, &self.originals, &d.originals));
+        w.set_backup_dir(self.backup_dir.as_str().into());
         w.set_gifs_index(position(GIFS, &self.gif_min_mb, &d.gif_min_mb));
         w.set_check_index(position(QUALITY_CHECK, &self.vmaf_floor, &d.vmaf_floor));
         w.set_images_index(position(IMAGES, &self.images, &d.images));
@@ -150,7 +158,8 @@ impl Prefs {
             preset: Some(self.preset.clone()),
             encoder: Some(self.encoder.clone()),
             concurrency: Some(self.concurrency as f64),
-            recycle: Some(self.recycle),
+            originals: Some(self.originals),
+            backup_dir: Some(self.backup_dir.clone()),
             gif_min_mb: Some(self.gif_min_mb),
             vmaf_floor: Some(self.vmaf_floor),
             images: Some(self.images),
@@ -655,6 +664,27 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
                 prefs.apply_to_window(&w);
                 last_encoder.borrow_mut().clone_from(&prefs.encoder);
             }
+            prefs.save(&prefs_path);
+            engine.apply_options(prefs.to_raw());
+        });
+    }
+
+    {
+        let engine = engine.clone();
+        let weak = window.as_weak();
+        let prefs_path = prefs_path.clone();
+        window.on_choose_backup_folder(move || {
+            let Some(w) = weak.upgrade() else { return };
+            let handle = w.window().window_handle();
+            let Some(dir) = rfd::FileDialog::new()
+                .set_title("Choose the folder for replaced originals")
+                .set_parent(&handle)
+                .pick_folder()
+            else {
+                return;
+            };
+            w.set_backup_dir(dir.to_string_lossy().as_ref().into());
+            let prefs = Prefs::from_window(&w);
             prefs.save(&prefs_path);
             engine.apply_options(prefs.to_raw());
         });

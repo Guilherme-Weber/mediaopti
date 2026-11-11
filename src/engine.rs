@@ -1,7 +1,7 @@
 //! Batch engine: folder scanning, the work queue, parallel ffmpeg workers with retries
 //! and fallbacks, GPU telemetry and state broadcasting to the UI.
 
-use crate::args::{self, ImageMode, Mode, Options, RawOptions};
+use crate::args::{self, ImageMode, Mode, Options, Originals, RawOptions};
 use crate::image;
 use crate::history::{self, ContentHash, History};
 
@@ -122,6 +122,8 @@ struct Inner {
     file_sizes: Vec<u64>,
     pending_queue: Vec<PathBuf>,
     queue_cursor: usize,
+    /// Single-frame GIFs found by the scan: always images, whatever their size.
+    static_gifs: HashSet<PathBuf>,
     /// PNG/JPEG and small GIFs, processed by the CPU image workers.
     image_queue: Vec<PathBuf>,
     image_cursor: usize,
@@ -200,12 +202,37 @@ fn is_generated_name(path: &Path) -> bool {
     is_orphan_temp(path) || name.contains(".tmp.") || name.contains("-h264.")
 }
 
-/// Temp outputs of this app, including ones left by batchviproc (which this app replaces).
+/// Temp outputs of this app (`clip.mediaopti.w1.mp4`, `photo.mediaopti.i3.png`), including
+/// ones left by batchviproc (`clip.batchviproc.w1.mp4`). Only this exact shape matches, so a
+/// user's own file that merely contains ".mediaopti." in its name is never deleted.
 fn is_orphan_temp(path: &Path) -> bool {
-    path.file_name().is_some_and(|n| {
-        let n = n.to_string_lossy().to_lowercase();
-        n.contains(".mediaopti.") || n.contains(".batchviproc.")
-    })
+    static TEMP: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?i)\.(mediaopti\.[wi]|batchviproc\.w)\d+\.[a-z0-9]+$").unwrap()
+    });
+    path.file_name().is_some_and(|n| TEMP.is_match(&n.to_string_lossy()))
+}
+
+/// Puts the new version `tmp` in place of `original` (as `final_target`), disposing of the
+/// original as `disposal` says. On failure the error says what happened; if the original was
+/// already set aside (Recycle Bin or backup folder), the new version is never deleted.
+/// Blocking. Shared by the video and image workers.
+fn replace_original(tmp: &Path, final_target: &Path, original: &Path, disposal: &system::Disposal) -> Result<(), String> {
+    let Err(err) = system::replace_file_with_retry(tmp, final_target, original, disposal) else {
+        return Ok(());
+    };
+    if original.exists() {
+        let _ = system::remove_file_if_exists(tmp);
+        return Err(format!("could not replace it: {err}"));
+    }
+    let gone_to = match disposal {
+        system::Disposal::RecycleBin => "is in the Recycle Bin".to_string(),
+        system::Disposal::MoveTo(dest) => format!("was moved to {}", dest.parent().unwrap_or(dest).display()),
+        system::Disposal::Delete => "was deleted".to_string(),
+    };
+    Err(format!(
+        "could not finish replacing it: {err}. The original {gone_to} and the new version is kept as {}",
+        tmp.display()
+    ))
 }
 
 /// Finds the ffmpeg binary: next to the executable (release zip), in the project's `bin/`
@@ -224,11 +251,11 @@ pub fn locate_ffmpeg() -> PathBuf {
 }
 
 impl Inner {
-    /// Whether `file` (of `size` bytes) is handled by the image workers: PNG/JPEG, and
-    /// GIFs under the size limit (bigger animated GIFs become video).
+    /// Whether `file` (of `size` bytes) is handled by the image workers: PNG/JPEG, still
+    /// GIFs, and animated GIFs under the size limit (bigger ones become video).
     fn is_image_job(&self, file: &Path, size: u64) -> bool {
         match image::kind_of(file) {
-            Some(image::Kind::Gif) => size < self.options.gif_min_bytes,
+            Some(image::Kind::Gif) => size < self.options.gif_min_bytes || self.static_gifs.contains(file),
             Some(_) => true,
             None => false,
         }
@@ -247,6 +274,30 @@ impl Inner {
 
     fn images_lossy(&self) -> bool {
         self.options.images == ImageMode::Lossy
+    }
+
+    /// Root of the backup folder for replaced originals, if that option is chosen.
+    fn backup_root(&self) -> Option<PathBuf> {
+        let Originals::BackupFolder(chosen) = &self.options.originals else { return None };
+        chosen.clone().or_else(|| self.dir.as_deref().map(default_backup_root))
+    }
+
+    /// What happens to `original` when it is replaced. Backups mirror the scanned folder's
+    /// structure, so originals can be found (and restored) where they belong.
+    fn disposal_for(&self, original: &Path) -> system::Disposal {
+        match &self.options.originals {
+            Originals::Delete => system::Disposal::Delete,
+            Originals::RecycleBin => system::Disposal::RecycleBin,
+            Originals::BackupFolder(_) => {
+                let root = self.backup_root().unwrap_or_else(|| default_backup_root(original));
+                let rel = self
+                    .dir
+                    .as_deref()
+                    .and_then(|d| original.strip_prefix(d).ok())
+                    .map_or_else(|| PathBuf::from(original.file_name().unwrap_or_default()), Path::to_path_buf);
+                system::Disposal::MoveTo(root.join(rel))
+            }
+        }
     }
 
     /// Rebuilds the work queues from the scanned files, history and this run's failures.
@@ -401,6 +452,7 @@ impl Engine {
                 file_sizes: Vec::new(),
                 pending_queue: Vec::new(),
                 queue_cursor: 0,
+                static_gifs: HashSet::new(),
                 image_queue: Vec::new(),
                 image_cursor: 0,
                 images_active: 0,
@@ -607,6 +659,7 @@ impl Engine {
             inner.queue_cursor = 0;
             inner.image_queue.clear();
             inner.image_cursor = 0;
+            inner.static_gifs.clear();
             inner.reset_run_tracking();
             inner.run = RunStats::default();
             inner.status = Status::Scanning;
@@ -615,7 +668,9 @@ impl Engine {
         self.send_state(true);
 
         let scan_dir = dir.clone();
-        let scan = self.rt.spawn_blocking(move || scan_folder(&scan_dir)).await;
+        // A backup folder inside the scanned folder must not be scanned (or optimized again).
+        let exclude = self.lock().backup_root();
+        let scan = self.rt.spawn_blocking(move || scan_folder(&scan_dir, exclude.as_deref())).await;
 
         match scan {
             Ok(result) => {
@@ -638,6 +693,7 @@ impl Engine {
                     let mut inner = self.lock();
                     inner.files = result.files;
                     inner.file_sizes = result.sizes;
+                    inner.static_gifs = result.static_gifs;
                     inner.reset_run_tracking();
                     inner.rebuild_queue();
                     inner.run = RunStats::default();
@@ -1377,10 +1433,10 @@ impl Engine {
         }
 
         let attrs = OriginalAttributes::from_metadata(&in_meta);
-        let use_recycle_bin = self.lock().options.recycle;
+        let disposal = self.lock().disposal_for(&input);
         let (tmp_c, target_c, input_c) = (tmp.clone(), final_target.clone(), input.clone());
         let replaced = self
-            .blocking(move || system::replace_file_with_retry(&tmp_c, &target_c, &input_c, use_recycle_bin))
+            .blocking(move || replace_original(&tmp_c, &target_c, &input_c, &disposal))
             .await;
         if let Err(err) = replaced {
             {
@@ -1388,16 +1444,7 @@ impl Engine {
                 inner.failed.insert(input.clone());
                 inner.run.failed += 1;
             }
-            if input.exists() {
-                self.log_remove(&tmp);
-                self.log(format!("Could not replace {display}: {err}"));
-            } else {
-                // The original already went to the Recycle Bin: never delete the new version.
-                self.log(format!(
-                    "Could not finish replacing {display}: {err}. The original is in the Recycle Bin and the new version is kept as {}",
-                    tmp.display()
-                ));
-            }
+            self.log(format!("[Worker {worker_id}] {display}: {err}"));
             self.send_state(true);
             return Outcome::Failed;
         }
@@ -1886,6 +1933,15 @@ fn summarize_vmaf(mut scores: Vec<f64>) -> Option<(f64, f64)> {
     Some((mean, p5))
 }
 
+/// Default backup folder: next to the scanned folder, named `<folder> (originals)`.
+/// For a drive root (no parent), a `mediaopti originals` folder inside it.
+fn default_backup_root(scanned: &Path) -> PathBuf {
+    match (scanned.parent(), scanned.file_name()) {
+        (Some(parent), Some(name)) => parent.join(format!("{} (originals)", name.to_string_lossy())),
+        _ => scanned.join("mediaopti originals"),
+    }
+}
+
 /// Size and modification time, to detect a file that changed during processing.
 fn file_state(path: &Path) -> Option<(u64, Option<std::time::SystemTime>)> {
     std::fs::metadata(path).ok().map(|m| (m.len(), m.modified().ok()))
@@ -1912,6 +1968,8 @@ fn hash_files_parallel(files: &[PathBuf]) -> Vec<(PathBuf, Option<ContentHash>)>
 
 struct ScanResult {
     files: Vec<PathBuf>,
+    /// Single-frame GIFs (handled as images).
+    static_gifs: HashSet<PathBuf>,
     /// Size of each entry of `files`, same order.
     sizes: Vec<u64>,
     cleaned_orphans: usize,
@@ -1922,16 +1980,19 @@ struct ScanResult {
 /// Recursively finds videos (skipping hidden folders like the old glob did), deletes leftover
 /// temp files and sorts the queue by size, largest first. File sizes come from the directory
 /// listing itself (on Windows `DirEntry::metadata` needs no extra system call).
-fn scan_folder(dir: &Path) -> ScanResult {
+fn scan_folder(dir: &Path, exclude: Option<&Path>) -> ScanResult {
     let mut messages = Vec::new();
     let mut cleaned_orphans = 0;
     let mut unreadable = 0;
     let mut with_sizes = Vec::new();
+    let mut static_gifs = HashSet::new();
 
     let walker = walkdir::WalkDir::new(dir)
         .follow_links(false)
         .into_iter()
-        .filter_entry(|e| e.depth() == 0 || !e.file_name().to_string_lossy().starts_with('.'));
+        .filter_entry(|e| {
+            e.depth() == 0 || (!e.file_name().to_string_lossy().starts_with('.') && Some(e.path()) != exclude)
+        });
 
     for entry in walker {
         let Ok(entry) = entry else {
@@ -1951,6 +2012,13 @@ fn scan_folder(dir: &Path) -> ScanResult {
             }
             continue;
         }
+        if args::is_gif(entry.path()) {
+            let animated = std::fs::File::open(entry.path())
+                .is_ok_and(|f| system::is_animated_and_valid_gif(std::io::BufReader::new(f)));
+            if !animated {
+                static_gifs.insert(entry.path().to_path_buf());
+            }
+        }
         match entry.metadata() {
             Ok(meta) if meta.len() > 0 => with_sizes.push((entry.into_path(), meta.len())),
             Ok(_) => {}
@@ -1962,6 +2030,7 @@ fn scan_folder(dir: &Path) -> ScanResult {
     let (files, sizes) = with_sizes.into_iter().unzip();
     ScanResult {
         files,
+        static_gifs,
         sizes,
         cleaned_orphans,
         unreadable,
@@ -2012,5 +2081,8 @@ mod tests {
         assert!(is_generated_name(Path::new(r"C:\v\clip-H264.mkv")));
         assert!(!is_generated_name(Path::new(r"C:\v\clip.mp4")));
         assert!(is_orphan_temp(Path::new(r"C:\v\x.BatchViProc.w2.mp4")));
+        assert!(is_orphan_temp(Path::new(r"C:\v\x.mediaopti.i12.png")));
+        assert!(!is_orphan_temp(Path::new(r"C:\v\notes.mediaopti.final.mp4")), "user file");
+        assert!(!is_orphan_temp(Path::new(r"C:\v\my.batchviproc.mp4")), "user file");
     }
 }

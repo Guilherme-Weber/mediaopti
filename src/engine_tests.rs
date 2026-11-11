@@ -78,7 +78,8 @@ fn opts(encoder: &str, concurrency: f64) -> RawOptions {
         concurrency: Some(concurrency),
         // Tests must not fill the user's Recycle Bin; GIF limit and VMAF retry off so the
         // older tests keep checking what they were written for.
-        recycle: Some(false),
+        originals: Some(0),
+        backup_dir: None,
         gif_min_mb: Some(0),
         vmaf_floor: Some(0),
         images: Some(0),
@@ -126,7 +127,9 @@ fn full_batch_handles_every_file_kind() {
         let s = engine.snapshot();
         assert_eq!(s.total_files, 7, "logs: {:#?}", rec.logs.lock().unwrap());
         assert_eq!(s.skipped_generated, 1);
-        assert_eq!(s.pending_files, 6);
+        // static.gif is a still image: it goes to the image workers (off here), never to video.
+        assert_eq!(s.pending_files, 5);
+        assert_eq!(s.skipped_small_gifs, 1);
         assert!(!videos.join("old.mediaopti.w1.mp4").exists(), "orphan temp not removed");
 
         engine.clone().run_batch(opts("av1_nvenc", 2.0)).await;
@@ -136,10 +139,10 @@ fn full_batch_handles_every_file_kind() {
     println!("{logs}");
     let s = engine.snapshot();
     assert_eq!(s.status, Status::Done, "{logs}");
-    assert_eq!(s.completed_this_run, 6, "{logs}");
+    assert_eq!(s.completed_this_run, 5, "{logs}");
     assert_eq!(s.compressed_this_run, 3, "{logs}"); // big.mp4, clip.mov, anim.gif
     assert_eq!(s.failed_this_run, 1, "{logs}"); // broken.mp4
-    assert_eq!(s.skipped_larger_this_run, 2, "{logs}"); // voice.mp4, static.gif
+    assert_eq!(s.skipped_larger_this_run, 1, "{logs}"); // voice.mp4
 
     let big_after = std::fs::metadata(&big).unwrap();
     assert!(big_after.len() < big_before, "big.mp4 was not compressed");
@@ -164,7 +167,7 @@ fn full_batch_handles_every_file_kind() {
     // Content history: processed videos moved, renamed or copied elsewhere are still
     // recognised; a genuinely new video is not.
     let content = std::fs::read_to_string(root.join("appdata").join("processed-content.tsv")).unwrap();
-    assert!(content.lines().count() >= 6, "{content}");
+    assert!(content.lines().count() >= 5, "{content}");
     let elsewhere = root.join("elsewhere");
     std::fs::create_dir_all(&elsewhere).unwrap();
     std::fs::rename(&big, elsewhere.join("renamed.mp4")).unwrap();
@@ -640,5 +643,60 @@ fn bench_folder() {
         after as f64 / 1048576.0,
         100.0 * (before - after) as f64 / before as f64
     );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn originals_go_to_a_mirrored_backup_folder() {
+    let Some(ff) = ffmpeg() else {
+        eprintln!("skipping: bundled ffmpeg not found");
+        return;
+    };
+    let tools = crate::image::tools::Tools::discover(ff.clone(), &std::env::temp_dir());
+    if !tools.has("oxipng") {
+        eprintln!("skipping: image tools not found");
+        return;
+    }
+    let root = test_dir("backup");
+    let media = root.join("media");
+    std::fs::create_dir_all(media.join("sub")).unwrap();
+    let clip = media.join("clip.mp4");
+    lossless_video(&ff, 2, "640x360", &clip);
+    let png = media.join("sub").join("a.png");
+    make(&ff, &["-f", "lavfi", "-i", "mandelbrot=s=320x240", "-frames:v", "1", "-compression_level", "1"], &png);
+    let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_577_836_800);
+    std::fs::File::options().write(true).open(&png).unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(old)).unwrap();
+    let (clip_before, png_before) = (std::fs::read(&clip).unwrap(), std::fs::read(&png).unwrap());
+
+    let rt = runtime();
+    let (engine, rec) = new_engine(&rt, &root, ff.clone());
+    let raw = || RawOptions { originals: Some(2), images: Some(1), ..opts("av1_nvenc", 1.0) };
+    rt.block_on(async {
+        engine.apply_options(raw());
+        engine.load_dir(media.clone()).await;
+        engine.clone().run_batch(raw()).await;
+    });
+    let logs = rec.logs.lock().unwrap().join("\n");
+    assert_eq!(engine.snapshot().compressed_this_run, 2, "{logs}");
+    // Default: next to the scanned folder, same subfolders, untouched bytes and dates.
+    let backup = root.join("media (originals)");
+    assert_eq!(std::fs::read(backup.join("clip.mp4")).unwrap(), clip_before, "{logs}");
+    let png_backup = backup.join("sub").join("a.png");
+    assert_eq!(std::fs::read(&png_backup).unwrap(), png_before, "{logs}");
+    assert_eq!(std::fs::metadata(&png_backup).unwrap().modified().unwrap(), old, "backup date changed");
+    assert!(std::fs::metadata(&png).unwrap().len() < png_before.len() as u64);
+
+    // A backup folder chosen inside the scanned folder is never scanned.
+    let inside = media.join("old versions");
+    std::fs::create_dir_all(&inside).unwrap();
+    std::fs::copy(&png_backup, inside.join("x.png")).unwrap();
+    let (engine2, _) = new_engine(&rt, &root, ff);
+    engine2.apply_options(RawOptions {
+        backup_dir: Some(inside.to_string_lossy().into_owned()),
+        ..raw()
+    });
+    rt.block_on(engine2.load_dir(media));
+    assert_eq!(engine2.snapshot().total_files, 2, "the backup folder must be excluded");
     let _ = std::fs::remove_dir_all(&root);
 }

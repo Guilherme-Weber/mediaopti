@@ -1,6 +1,6 @@
 //! Option normalization and ffmpeg command-line construction.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub const VIDEO_EXTENSIONS: &[&str] = &[
     "mp4", "mts", "m2ts", "flv", "m4v", "mkv", "mov", "webm", "avi", "wmv", "ts", "3gp", "mpg",
@@ -33,6 +33,16 @@ const ALLOWED_GIF_MIN_MB: &[u32] = &[0, 1, 5, NO_GIFS];
 /// VMAF floors for the quality-checked fallback; 0 turns it off.
 const ALLOWED_VMAF_FLOOR: &[u32] = &[0, 93, 95];
 
+/// What happens to an original once a smaller version replaces it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Originals {
+    Delete,
+    RecycleBin,
+    /// Moved into a backup folder that mirrors the scanned folder's structure.
+    /// `None`: next to the scanned folder, as `<folder> (originals)`.
+    BackupFolder(Option<PathBuf>),
+}
+
 /// How images (PNG, JPEG, small GIFs) are optimized.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImageMode {
@@ -49,8 +59,7 @@ pub struct Options {
     pub preset: String,
     pub encoder: String,
     pub concurrency: u32,
-    /// Move replaced originals to the Recycle Bin instead of deleting them.
-    pub recycle: bool,
+    pub originals: Originals,
     /// Animated GIFs smaller than this stay GIFs (`u64::MAX`: no GIF is converted).
     pub gif_min_bytes: u64,
     /// When the preset output is not smaller, retry with stronger settings and accept the
@@ -68,7 +77,7 @@ impl Default for Options {
             preset: "slow".into(),
             encoder: "av1_nvenc".into(),
             concurrency: 2,
-            recycle: true,
+            originals: Originals::RecycleBin,
             gif_min_bytes: 1024 * 1024,
             vmaf_floor: Some(93.0),
             cq_boost: 0,
@@ -84,7 +93,9 @@ pub struct RawOptions {
     pub preset: Option<String>,
     pub encoder: Option<String>,
     pub concurrency: Option<f64>,
-    pub recycle: Option<bool>,
+    /// 0 = delete, 1 = Recycle Bin, 2 = backup folder (`backup_dir`, empty = default).
+    pub originals: Option<u32>,
+    pub backup_dir: Option<String>,
     pub gif_min_mb: Option<u32>,
     pub vmaf_floor: Option<u32>,
     /// 0 = off, 1 = lossless, 2 = lossy (visually lossless).
@@ -117,7 +128,14 @@ impl Options {
             preset: preset.unwrap_or(d.preset),
             encoder: encoder.unwrap_or(d.encoder),
             concurrency: concurrency.unwrap_or(d.concurrency),
-            recycle: raw.recycle.unwrap_or(d.recycle),
+            originals: match raw.originals {
+                Some(0) => Originals::Delete,
+                Some(2) => Originals::BackupFolder(
+                    raw.backup_dir.filter(|d| !d.trim().is_empty()).map(PathBuf::from),
+                ),
+                Some(1) => Originals::RecycleBin,
+                _ => d.originals,
+            },
             gif_min_bytes,
             vmaf_floor,
             cq_boost: 0,
@@ -313,7 +331,8 @@ mod tests {
             preset: Some("bogus".into()),
             encoder: Some("rm -rf".into()),
             concurrency: Some(9.0),
-            recycle: None,
+            originals: Some(9),
+            backup_dir: None,
             gif_min_mb: Some(3),
             vmaf_floor: Some(50),
             images: Some(7),
@@ -323,17 +342,18 @@ mod tests {
         assert_eq!(o.preset, "slow");
         assert_eq!(o.encoder, "av1_nvenc");
         assert_eq!(o.concurrency, 2);
-        assert!(o.recycle, "originals go to the Recycle Bin by default");
+        assert_eq!(o.originals, Originals::RecycleBin, "originals go to the Recycle Bin by default");
         assert_eq!(o.gif_min_bytes, 1024 * 1024);
         assert_eq!(o.vmaf_floor, Some(93.0));
 
         let o = Options::normalize(RawOptions {
-            recycle: Some(false),
+            originals: Some(2),
+            backup_dir: Some(r"D:\old".into()),
             gif_min_mb: Some(NO_GIFS),
             vmaf_floor: Some(0),
             ..RawOptions::default()
         });
-        assert!(!o.recycle);
+        assert_eq!(o.originals, Originals::BackupFolder(Some(PathBuf::from(r"D:\old"))));
         assert_eq!(o.gif_min_bytes, u64::MAX);
         assert_eq!(o.vmaf_floor, None);
     }

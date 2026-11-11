@@ -309,29 +309,81 @@ pub fn hard_link_count(path: &Path) -> std::io::Result<u32> {
     }
 }
 
+/// What to do with an original that is being replaced.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Disposal {
+    Delete,
+    RecycleBin,
+    /// Move it here (parent folders are created; an existing file is never overwritten).
+    MoveTo(std::path::PathBuf),
+}
+
+/// `path`, or `path` with " (2)", " (3)"... before the extension if it exists.
+pub fn unused_name(path: &Path) -> std::path::PathBuf {
+    if !path.exists() {
+        return path.to_path_buf();
+    }
+    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let ext = path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    (2..)
+        .map(|n| path.with_file_name(format!("{stem} ({n}){ext}")))
+        .find(|p| !p.exists())
+        .expect("an unused name exists")
+}
+
+/// Moves a file, also across drives (copy, keep its dates, then delete). Returns where it went.
+pub fn move_file(from: &Path, to: &Path) -> std::io::Result<std::path::PathBuf> {
+    if let Some(parent) = to.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let to = unused_name(to);
+    if fs::rename(from, &to).is_ok() {
+        return Ok(to);
+    }
+    let attrs = OriginalAttributes::from_metadata(&fs::metadata(from)?);
+    fs::copy(from, &to)?;
+    restore_attributes(&to, &attrs)?;
+    clear_readonly(from);
+    if let Err(err) = fs::remove_file(from) {
+        let _ = remove_file_if_exists(&to);
+        return Err(err);
+    }
+    Ok(to)
+}
+
 /// Puts `tmp` in place of `original` (named `final_target`, which differs when the container
 /// changes), coping with read-only originals (common on phone backups) and Explorer or
-/// antivirus briefly holding a handle. With `use_recycle_bin` the original is moved to the
-/// Recycle Bin first, and if that fails nothing is changed; otherwise it is deleted.
+/// antivirus briefly holding a handle. The original is recycled, moved or deleted as
+/// `disposal` says; recycling and moving happen first, and if they fail nothing is changed.
 /// Blocking: sleeps between retries.
 pub fn replace_file_with_retry(
     tmp: &Path,
     final_target: &Path,
     original: &Path,
-    use_recycle_bin: bool,
+    disposal: &Disposal,
 ) -> std::io::Result<()> {
     const MAX_ATTEMPTS: u64 = 6;
     let mut attempt = 1;
-    let mut recycled = false;
+    let mut set_aside = false;
     loop {
         let result = (|| -> std::io::Result<()> {
+            if !set_aside {
+                match disposal {
+                    Disposal::RecycleBin => {
+                        clear_readonly(original);
+                        recycle(original)?;
+                    }
+                    // Moved with its read-only flag and dates intact.
+                    Disposal::MoveTo(dest) => {
+                        move_file(original, dest)?;
+                    }
+                    Disposal::Delete => {}
+                }
+                set_aside = true;
+            }
             clear_readonly(original);
             if final_target != original {
                 clear_readonly(final_target);
-            }
-            if use_recycle_bin && !recycled {
-                recycle(original)?;
-                recycled = true;
             }
             if let Err(err) = fs::rename(tmp, final_target) {
                 if err.kind() == std::io::ErrorKind::PermissionDenied {
@@ -341,7 +393,7 @@ pub fn replace_file_with_retry(
                     return Err(err);
                 }
             }
-            if final_target != original && !use_recycle_bin {
+            if final_target != original && *disposal == Disposal::Delete {
                 let _ = remove_file_if_exists(original);
             }
             Ok(())
@@ -555,9 +607,27 @@ mod tests {
         let (orig, tmp) = (dir.join("clip.mp4"), dir.join("clip.mediaopti.w1.mp4"));
         fs::write(&orig, b"original").unwrap();
         fs::write(&tmp, b"new").unwrap();
-        replace_file_with_retry(&tmp, &orig, &orig, true).unwrap();
+        replace_file_with_retry(&tmp, &orig, &orig, &Disposal::RecycleBin).unwrap();
         assert_eq!(fs::read(&orig).unwrap(), b"new");
         assert!(!tmp.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn moves_originals_to_a_backup_folder_without_overwriting() {
+        let dir = std::env::temp_dir().join(format!("mo-backup-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let backup = dir.join("backup").join("sub").join("clip.mp4");
+        for round in 1..=2 {
+            let (orig, tmp) = (dir.join("clip.mp4"), dir.join("clip.mediaopti.w1.mp4"));
+            fs::write(&orig, format!("original {round}")).unwrap();
+            fs::write(&tmp, b"new").unwrap();
+            replace_file_with_retry(&tmp, &orig, &orig, &Disposal::MoveTo(backup.clone())).unwrap();
+            assert_eq!(fs::read(&orig).unwrap(), b"new");
+        }
+        assert_eq!(fs::read_to_string(&backup).unwrap(), "original 1");
+        assert_eq!(fs::read_to_string(backup.with_file_name("clip (2).mp4")).unwrap(), "original 2");
         let _ = fs::remove_dir_all(&dir);
     }
 
