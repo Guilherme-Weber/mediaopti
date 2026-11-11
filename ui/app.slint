@@ -450,7 +450,7 @@ export component AppWindow inherits Window {
                     SettingField {
                         glyph: "\u{EB9F}";
                         label: "Images";
-                        hint: "PNG, JPEG and small GIFs, on the CPU next to the video encodes.";
+                        hint: "PNG, JPEG, small GIFs, and cover art in FLAC and MP3 files, on the CPU.";
                         model: root.images-options;
                         current-index <=> root.images-index;
                         changed => { root.settings-changed(); }

@@ -28,14 +28,26 @@ pub enum Kind {
     Png,
     Jpg,
     Gif,
+    /// Audio: cover art and re-encoding, see [`crate::audio`].
+    Flac,
+    Mp3,
 }
 
-/// PNG/JPEG by extension (GIFs are routed separately: big animated ones become video).
+impl Kind {
+    pub fn is_audio(self) -> bool {
+        matches!(self, Kind::Flac | Kind::Mp3)
+    }
+}
+
+/// Files for the CPU workers, by extension (GIFs are routed separately: big animated ones
+/// become video).
 pub fn kind_of(path: &Path) -> Option<Kind> {
     match crate::args::ext_lower(path).as_str() {
         "png" => Some(Kind::Png),
         "jpg" | "jpeg" | "jpe" | "jfif" => Some(Kind::Jpg),
         "gif" => Some(Kind::Gif),
+        "flac" => Some(Kind::Flac),
+        "mp3" => Some(Kind::Mp3),
         _ => None,
     }
 }
@@ -169,6 +181,9 @@ impl<'a> Chain<'a> {
 
 /// Optimizes `src` (a private copy inside `work`). Returns the best verified result.
 pub fn optimize(ctx: &Ctx, kind: Kind, src: &Path, work: &Path) -> Result<Optimized, RunError> {
+    if kind.is_audio() {
+        return crate::audio::optimize(ctx, kind, src, work);
+    }
     let ver = Verifier::new(ctx, kind, src);
     let skip = |why: &str| Ok(Optimized { best: None, steps: Vec::new(), note: Some(why.to_string()) });
     match kind {
@@ -185,12 +200,13 @@ pub fn optimize(ctx: &Ctx, kind: Kind, src: &Path, work: &Path) -> Result<Optimi
             c.write_to("gifsicle", "gifsicle", |i, o| crate::os_args!["-O3", "--no-warnings", "-o", o, i], &mut check, None)?;
             c
         }
+        Kind::Flac | Kind::Mp3 => unreachable!("audio is handled above"),
     };
     if ctx.lossy && ctx.tools.has("ssimulacra2") {
         match kind {
             Kind::Png => lossy_png(ctx, work, src, &mut chain, &ver)?,
             Kind::Jpg => lossy_jpeg(ctx, work, src, &mut chain, &ver)?,
-            Kind::Gif => {}
+            _ => {}
         }
     }
     let best = (chain.best != src).then_some(chain.best);

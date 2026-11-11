@@ -18,6 +18,9 @@ use std::time::Duration;
 /// machine runs out of commit, allocations fail and processes (this app included) abort.
 const IMAGE_MIN_FREE_COMMIT: u64 = 2 * 1024 * 1024 * 1024;
 
+/// Audio files are replaced when at least this much smaller, even below 0.5%.
+const AUDIO_MIN_GAIN: u64 = 64 * 1024;
+
 /// Log a progress line every this many images (one line per image would flood the log).
 const PROGRESS_EVERY: usize = 250;
 
@@ -254,7 +257,10 @@ pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, dispo
         return ImageResult::Kept { content: content_of(path), note: result.note };
     };
     let after = std::fs::metadata(&best).map_or(before, |m| m.len());
-    if before.saturating_sub(after) < (before / 200).max(1) {
+    // At least 0.5% smaller. Audio also counts 64 KiB: cover art is a small part of a
+    // song, but its saving is lossless and verified, and adds up over a music library.
+    let min_gain = if kind.is_audio() { (before / 200).min(AUDIO_MIN_GAIN) } else { before / 200 };
+    if before.saturating_sub(after) < min_gain.max(1) {
         return ImageResult::Kept { content: content_of(path), note: None };
     }
     if file_state(path) != Some(state) {

@@ -119,6 +119,7 @@ impl<'a> Verifier<'a> {
                 _ => false,
             },
             Kind::Gif => true,
+            Kind::Flac | Kind::Mp3 => false, // audio has its own checks
         }
     }
 

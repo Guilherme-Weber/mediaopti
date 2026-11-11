@@ -703,7 +703,7 @@ impl Engine {
                 let found = {
                     let inner = self.lock();
                     format!(
-                        "Found {} files in {} ({} videos and {} images to process)",
+                        "Found {} files in {} ({} videos and {} images or audio files to process)",
                         inner.files.len(),
                         dir.display(),
                         inner.pending_queue.len(),

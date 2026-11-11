@@ -3,6 +3,7 @@
 
 mod app;
 mod args;
+mod audio;
 mod engine;
 #[cfg(test)]
 mod engine_tests;
