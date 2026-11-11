@@ -140,7 +140,7 @@ Recycle Bin handles only about 25–30 files per second and keeps only the most 
 it is full.
 
 Each file is worked on in a private folder in `%TEMP%`. When the temp drive has less than about
-four times the file's size free (plus 4 GB), a hidden `.mediaopti-temp` folder on the file's own
+four times the file's size free (16 times for a PDF, plus 4 GB), a hidden `.mediaopti-temp` folder on the file's own
 drive is used instead. Work folders left by a run that crashed are removed at the next scan. Pages
 of a comic or document are optimized in parallel when CPU workers are idle. **Pause** also
 suspends the image, audio, and document tools that are running.

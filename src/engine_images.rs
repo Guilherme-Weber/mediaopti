@@ -261,9 +261,10 @@ struct WorkDir {
 
 impl WorkDir {
     /// A work folder for a file of `size` bytes: in the temp folder, or on the file's own
-    /// drive when the temp drive hasn't room for about 4x the file (copy, candidates, output).
-    fn new(path: &Path, size: u64, name: &str) -> Result<Self, String> {
-        let need = size.saturating_mul(4).saturating_add(64 << 20);
+    /// drive when the temp drive hasn't room for `factor` times the file (copy, candidates,
+    /// output; a PDF's streams are written out decompressed).
+    fn new(path: &Path, size: u64, factor: u64, name: &str) -> Result<Self, String> {
+        let need = size.saturating_mul(factor).saturating_add(64 << 20);
         let temp = std::env::temp_dir();
         let mut places = vec![temp];
         if let Some(root) = volume_root(path) {
@@ -324,7 +325,8 @@ pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, dispo
         return ImageResult::Kept { content: content_of(path), note: None };
     }
     let job = NEXT_JOB.fetch_add(1, Ordering::Relaxed);
-    let workdir = match WorkDir::new(path, state.0, &format!("mediaopti-img-{}-{job}", std::process::id())) {
+    let factor = if kind == image::Kind::Pdf { 16 } else { 4 };
+    let workdir = match WorkDir::new(path, state.0, factor, &format!("mediaopti-img-{}-{job}", std::process::id())) {
         Ok(w) => w,
         Err(why) => return ImageResult::Skipped(why),
     };
@@ -403,12 +405,12 @@ mod tests {
             eprintln!("skipping: needs a temp drive with less free space than D:");
             return;
         }
-        let w = WorkDir::new(file, size, "mediaopti-img-test-0").expect("fits on D:");
+        let w = WorkDir::new(file, size, 4, "mediaopti-img-test-0").expect("fits on D:");
         assert!(w.path.starts_with(r"D:\.mediaopti-temp"), "{}", w.path.display());
         #[cfg(windows)]
         assert!(std::os::windows::fs::MetadataExt::file_attributes(&std::fs::metadata(r"D:\.mediaopti-temp").unwrap()) & 0x2 != 0, "hidden");
         // A second one doesn't fit on either drive while the first holds its reservation.
-        assert!(WorkDir::new(file, d_free / 4, "mediaopti-img-test-1").is_err());
+        assert!(WorkDir::new(file, d_free / 4, 4, "mediaopti-img-test-1").is_err());
         drop(w);
         assert!(!Path::new(r"D:\.mediaopti-temp").exists(), "removed when empty");
     }
