@@ -320,17 +320,18 @@ mod tests {
         let (tx, rx) = tokio::sync::watch::channel(true);
         let gate = Gate::new(CancellationToken::new(), Some(rx));
         let resume = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(5));
+            std::thread::sleep(Duration::from_secs(6));
             tx.send_replace(false);
         });
         let t = Instant::now();
-        // 1 s of real-time work, paused for the first 5 s: it ends after the pause (it was
-        // suspended) and isn't killed by the 4 s limit (paused time doesn't count).
+        // 1 s of real-time work, paused for the first 6 s: it ends after the pause (it was
+        // suspended) and isn't killed by the 5 s limit (paused time doesn't count; the rest is
+        // margin for a busy machine).
         let args = crate::os_args!["-v", "error", "-re", "-f", "lavfi", "-i", "anullsrc=d=1", "-f", "null", "-"];
-        let ran = run(&ffmpeg, args, None, Capture::None, Duration::from_secs(4), &gate);
+        let ran = run(&ffmpeg, args, None, Capture::None, Duration::from_secs(5), &gate);
         resume.join().unwrap();
         assert!(ran.as_ref().is_ok_and(|r| r.success), "{ran:?}");
-        assert!(t.elapsed() >= Duration::from_millis(4900), "it ran while paused: {:?}", t.elapsed());
+        assert!(t.elapsed() >= Duration::from_millis(5900), "it ran while paused: {:?}", t.elapsed());
     }
 
     #[test]
