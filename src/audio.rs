@@ -245,11 +245,41 @@ fn vendor(blocks: &[(u8, Vec<u8>)]) -> &[u8] {
         .unwrap_or_default()
 }
 
+/// The decoded-audio hash of `src`, computed on first use (`None` if it can't be decoded).
+fn reference_audio(ctx: &Ctx, src: &Path, slot: &mut Option<Option<[u8; 32]>>) -> Result<Option<[u8; 32]>, RunError> {
+    if slot.is_none() {
+        *slot = Some(audio_hash(ctx, src)?);
+    }
+    Ok(slot.flatten())
+}
+
+/// Written by libFLAC 1.4 or later: re-encoding gains almost nothing (about 0.1%).
+fn is_modern(f: &Flac) -> bool {
+    [b"reference libFLAC 1.4".as_slice(), b"reference libFLAC 1.5"].iter().any(|v| vendor(&f.blocks).starts_with(v))
+}
+
+/// A cheap look at the original's header: is there anything to try? Most music files have
+/// no cover art (or a tiny one) and a modern encoder; they are not copied or decoded.
+pub fn worth_trying(ctx: &Ctx, kind: Kind, path: &Path) -> bool {
+    let has_art = |data: &[u8]| data.len() >= MIN_ART && sniff(data).is_some();
+    match kind {
+        Kind::Flac => flac_read(path).ok().flatten().is_some_and(|f| {
+            (!is_modern(&f) && ctx.tools.has("flac"))
+                || f.blocks.iter().any(|(t, b)| *t == PICTURE && picture_parse(b).is_some_and(|p| has_art(p.data)))
+        }),
+        Kind::Mp3 => mp3_tag(path).ok().flatten().is_some_and(|tag| {
+            id3_frames(&tag.body, tag.ver).iter().any(|(id, b)| *id == b"APIC" && apic_data_start(b).is_some_and(|i| has_art(&b[i..])))
+        }),
+        _ => true,
+    }
+}
+
 fn flac(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, AudioError> {
     let Some(orig) = flac_read(src)? else {
         return skip("not a native FLAC (Ogg FLAC, an ID3 header or damaged): skipped");
     };
-    let Some(orig_audio) = audio_hash(ctx, src)? else { return skip("its audio could not be decoded") };
+    // Decoding is the slow part: done only once a candidate exists.
+    let mut orig_audio = None;
     let mut best = src.to_path_buf();
     let mut best_size = std::fs::metadata(src)?.len();
     let mut steps = Vec::new();
@@ -273,17 +303,14 @@ fn flac(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, AudioError> {
         let out = work.join("art.flac");
         write_with_tail(&out, &flac_header(&new_blocks), src, orig.audio_at)?;
         let size = std::fs::metadata(&out)?.len();
-        if size < best_size && flac_art_ok(ctx, &orig, &orig_audio, src, &out)? {
+        if size < best_size && flac_art_ok(ctx, &orig, reference_audio(ctx, src, &mut orig_audio)?, src, &out)? {
             (best, best_size) = (out, size);
             steps.push(art_label(n_art, &art_steps));
         }
     }
 
     // 2) re-encoding: worthwhile only for files from older or other encoders.
-    let modern = [b"reference libFLAC 1.4".as_slice(), b"reference libFLAC 1.5"]
-        .iter()
-        .any(|v| vendor(&orig.blocks).starts_with(v));
-    if !modern {
+    if !is_modern(&orig) {
         if let Some(flac) = ctx.tools.get("flac") {
             let out = work.join("enc.flac");
             let args = crate::os_args![
@@ -292,7 +319,7 @@ fn flac(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, AudioError> {
             let ran = tools::run(flac, args, Some(work), Capture::None, ctx.timeout, &ctx.cancel)?;
             if ran.success {
                 let size = std::fs::metadata(&out).map_or(u64::MAX, |m| m.len());
-                if size < best_size && flac_encode_ok(ctx, &orig_audio, &best, &out)? {
+                if size < best_size && flac_encode_ok(ctx, reference_audio(ctx, src, &mut orig_audio)?, &best, &out)? {
                     best = out;
                     steps.push("flac-8p".to_string());
                 }
@@ -305,7 +332,7 @@ fn flac(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, AudioError> {
 
 /// The new file has the same blocks except for picture data, the same audio bytes, and
 /// still decodes to the same audio.
-fn flac_art_ok(ctx: &Ctx, orig: &Flac, orig_audio: &[u8; 32], src: &Path, out: &Path) -> Result<bool, AudioError> {
+fn flac_art_ok(ctx: &Ctx, orig: &Flac, orig_audio: Option<[u8; 32]>, src: &Path, out: &Path) -> Result<bool, AudioError> {
     let Some(new) = flac_read(out)? else { return Ok(false) };
     let same_blocks = new.blocks.len() == orig.blocks.len()
         && new.blocks.iter().zip(&orig.blocks).all(|(n, o)| {
@@ -319,18 +346,18 @@ fn flac_art_ok(ctx: &Ctx, orig: &Flac, orig_audio: &[u8; 32], src: &Path, out: &
                     n.1 == o.1
                 }
         });
-    Ok(same_blocks && same_tail(src, orig.audio_at, out, new.audio_at)? && audio_hash(ctx, out)?.as_ref() == Some(orig_audio))
+    Ok(same_blocks && same_tail(src, orig.audio_at, out, new.audio_at)? && orig_audio.is_some() && audio_hash(ctx, out)? == orig_audio)
 }
 
 /// A re-encoded file must decode to the same audio and keep the tags and the CUESHEET,
 /// APPLICATION and PICTURE blocks exactly.
-fn flac_encode_ok(ctx: &Ctx, orig_audio: &[u8; 32], before: &Path, out: &Path) -> Result<bool, AudioError> {
+fn flac_encode_ok(ctx: &Ctx, orig_audio: Option<[u8; 32]>, before: &Path, out: &Path) -> Result<bool, AudioError> {
     let (Some(a), Some(b)) = (flac_read(before)?, flac_read(out)?) else { return Ok(false) };
     let kept = |f: &Flac| -> Vec<(u8, Vec<u8>)> { f.blocks.iter().filter(|b| matches!(b.0, 2 | 5 | 6)).cloned().collect() };
     let tags = |f: &Flac| -> Option<Vec<u8>> {
         f.blocks.iter().find(|b| b.0 == VORBIS_COMMENT).map(|b| vorbis_comments(&b.1).unwrap_or_default().to_vec())
     };
-    Ok(kept(&a) == kept(&b) && tags(&a) == tags(&b) && audio_hash(ctx, out)?.as_ref() == Some(orig_audio))
+    Ok(kept(&a) == kept(&b) && tags(&a) == tags(&b) && orig_audio.is_some() && audio_hash(ctx, out)? == orig_audio)
 }
 
 // ---------------------------------------------------------------- MP3
@@ -345,26 +372,37 @@ fn to_syncsafe(n: u32) -> [u8; 4] {
 
 /// Cover art (APIC frames) in an ID3v2.3/2.4 tag. The MP3 audio stream and all other tag
 /// frames are copied byte for byte.
-fn mp3(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, AudioError> {
-    let mut f = File::open(src)?;
+struct Id3 {
+    /// The 10-byte header.
+    head: [u8; 10],
+    ver: u8,
+    body: Vec<u8>,
+}
+
+/// The ID3v2.3/2.4 tag at the start of a file, if it has a plain layout (no
+/// unsynchronisation, extended header or footer: those are left alone).
+fn mp3_tag(path: &Path) -> io::Result<Option<Id3>> {
+    let mut f = File::open(path)?;
     let mut head = [0u8; 10];
-    if read_full(&mut f, &mut head)? != 10 || &head[..3] != b"ID3" || !matches!(head[3], 3 | 4) {
-        return Ok(Optimized { best: None, steps: Vec::new(), note: None }); // no ID3v2.3/2.4 tag: no art
-    }
-    let (ver, flags) = (head[3], head[5]);
-    if flags & 0xd0 != 0 {
-        return skip("unusual ID3 layout (unsynchronisation, extended header or footer): skipped");
+    if read_full(&mut f, &mut head)? != 10 || &head[..3] != b"ID3" || !matches!(head[3], 3 | 4) || head[5] & 0xd0 != 0 {
+        return Ok(None);
     }
     let size = u64::from(syncsafe(&head[6..10]));
     if size > MAX_META {
-        return skip("ID3 tag too large: skipped");
+        return Ok(None);
     }
-    let tag_end = 10 + size;
-    let mut tag = vec![0u8; size as usize];
-    if read_full(&mut f, &mut tag)? != tag.len() {
-        return skip("damaged ID3 tag: skipped");
+    let mut body = vec![0u8; size as usize];
+    if read_full(&mut f, &mut body)? != body.len() {
+        return Ok(None);
     }
-    drop(f);
+    Ok(Some(Id3 { head, ver: head[3], body }))
+}
+
+fn mp3(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, AudioError> {
+    let Some(Id3 { head, ver, body: tag }) = mp3_tag(src)? else {
+        return Ok(Optimized { best: None, steps: Vec::new(), note: None }); // no plain ID3v2.3/2.4 tag
+    };
+    let tag_end = 10 + tag.len() as u64;
 
     let mut frames: Vec<(&[u8], &[u8], Vec<u8>)> = Vec::new();
     let mut i = 0;

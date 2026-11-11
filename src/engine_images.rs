@@ -237,6 +237,10 @@ pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, dispo
     if system::hard_link_count(path).unwrap_or(1) > 1 {
         return ImageResult::Skipped("it is a hard link (several names for one file)".into());
     }
+    // Most music has nothing to try: don't copy (to C:) or decode it.
+    if kind.is_audio() && !crate::audio::worth_trying(ctx, kind, path) {
+        return ImageResult::Kept { content: content_of(path), note: None };
+    }
     let job = NEXT_JOB.fetch_add(1, Ordering::Relaxed);
     let work = std::env::temp_dir().join(format!("mediaopti-img-{}-{job}", std::process::id()));
     let _cleanup = WorkDir(work.clone());
