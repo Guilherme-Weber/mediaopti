@@ -1,27 +1,32 @@
-# Installs the image optimizers mediaopti uses.
+# Installs the external tools mediaopti uses for images, audio and documents.
 #   - Open-source tools come from Scoop (per user, no admin rights): oxipng, ECT, mozjpeg
-#     (jpegtran/cjpeg/djpeg), gifsicle and libjxl (for its ssimulacra2 quality metric).
-#     mediaopti finds them on PATH.
+#     (jpegtran/cjpeg/djpeg), gifsicle, libjxl (its ssimulacra2 quality metric), flac,
+#     7-Zip (CBR), qpdf and MuPDF (mutool, PDF page rendering). mediaopti finds them on PATH.
 #   - cjpegli (jpegli JPEG encoder) comes from the libjxl 0.11.2 release on GitHub, the last
-#     one that ships it for Windows.
+#     one that ships it for Windows; OptiVorbis (Ogg Vorbis) from its 0.3.2 release.
 #   - pingo and beeim (freeware by Cedric Louvrier, css-ig.net) allow private use only and
 #     may not be redistributed, so they are downloaded from the author's site, never bundled.
 #
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File scripts/fetch-tools.ps1                 # into bin\ (development)
 #   powershell -ExecutionPolicy Bypass -File scripts/fetch-tools.ps1 -Dest <folder>  # e.g. the "tools" folder next to mediaopti.exe
-#   add -NoPingo to skip pingo and beeim
+#   add -NoPingo to skip pingo and beeim, -NoScoop to only download (tools already installed)
 param(
     [string]$Dest = (Join-Path (Split-Path $PSScriptRoot -Parent) 'bin'),
-    [switch]$NoPingo
+    [switch]$NoPingo,
+    [switch]$NoScoop
 )
 $ErrorActionPreference = 'Stop'
 
-if (-not (Get-Command scoop -ErrorAction SilentlyContinue)) {
-    Write-Host "Scoop not found. Install it from https://scoop.sh, then run this script again." -ForegroundColor Yellow
-    exit 1
+if (-not $NoScoop) {
+    if (-not (Get-Command scoop -ErrorAction SilentlyContinue)) {
+        Write-Host "Scoop not found. Install it from https://scoop.sh, then run this script again." -ForegroundColor Yellow
+        exit 1
+    }
+    # mupdf is in the "extras" bucket.
+    if (-not ((scoop bucket list) | Where-Object { $_.Name -eq 'extras' })) { scoop bucket add extras }
+    scoop install oxipng ect mozjpeg gifsicle libjxl flac 7zip qpdf mupdf
 }
-scoop install oxipng ect mozjpeg gifsicle libjxl
 
 New-Item -ItemType Directory -Force $Dest | Out-Null
 function Get-FromZip([string]$Url, [string[]]$Names) {
@@ -42,6 +47,9 @@ function Get-FromZip([string]$Url, [string[]]$Names) {
 Write-Host "Downloading cjpegli (libjxl 0.11.2, GitHub) ..."
 Get-FromZip 'https://github.com/libjxl/libjxl/releases/download/v0.11.2/jxl-x64-windows-static.zip' @('cjpegli.exe')
 
+Write-Host "Downloading OptiVorbis 0.3.2 (GitHub) ..."
+Get-FromZip 'https://github.com/OptiVorbis/OptiVorbis/releases/download/v0.3.2/OptiVorbis.CLI.x86_64-pc-windows-gnu.zip' @('optivorbis.exe')
+
 if (-not $NoPingo) {
     foreach ($name in 'pingo', 'beeim') {
         Write-Host "Downloading $name (css-ig.net, private use only) ..."
@@ -49,4 +57,4 @@ if (-not $NoPingo) {
     }
 }
 
-Write-Host "Image tools installed. mediaopti lists what it found when a batch with images starts."
+Write-Host "Tools installed. mediaopti lists what it found when a batch with images starts."

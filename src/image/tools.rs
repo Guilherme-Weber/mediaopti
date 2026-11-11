@@ -33,7 +33,14 @@ impl Tools {
         let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf));
         let mut dirs: Vec<PathBuf> = Vec::new();
         if let Some(d) = &exe_dir {
-            dirs.push(d.join("tools"));
+            // The release zip keeps each tool in its own folder (with its DLLs and licence).
+            let tools = d.join("tools");
+            let mut sub: Vec<PathBuf> = std::fs::read_dir(&tools)
+                .map(|r| r.filter_map(Result::ok).map(|e| e.path()).filter(|p| p.is_dir()).collect())
+                .unwrap_or_default();
+            sub.sort();
+            dirs.push(tools);
+            dirs.extend(sub);
         }
         dirs.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("bin"));
         if let Some(path) = std::env::var_os("PATH") {
@@ -78,6 +85,9 @@ pub enum Capture {
     None,
     /// Keep stdout (small outputs).
     Bytes,
+    /// Keep stdout up to this many bytes; a tool writing more is stopped and fails (big
+    /// decodes must never be held in memory whole: running out of commit aborts the app).
+    BytesUpTo(usize),
     /// SHA-256 of stdout, streamed (large decoder outputs).
     Hash,
 }
@@ -213,6 +223,8 @@ pub fn run(
 
     let mut out = child.stdout.take().expect("piped");
     let mut err = child.stderr.take().expect("piped");
+    let overflow = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let overflowed = std::sync::Arc::clone(&overflow);
     let out_thread = std::thread::spawn(move || {
         let mut buf = vec![0u8; 1 << 16];
         let (mut bytes, mut hasher, mut len) = (Vec::new(), Sha256::new(), 0u64);
@@ -224,6 +236,12 @@ pub fn run(
                     match capture {
                         Capture::None => {}
                         Capture::Bytes => bytes.extend_from_slice(&buf[..n]),
+                        Capture::BytesUpTo(limit) if bytes.len() + n > limit => {
+                            overflowed.store(true, std::sync::atomic::Ordering::Relaxed);
+                            bytes = Vec::new();
+                            break; // the pipe closes: the tool stops writing
+                        }
+                        Capture::BytesUpTo(_) => bytes.extend_from_slice(&buf[..n]),
                         Capture::Hash => hasher.update(&buf[..n]),
                     }
                 }
@@ -253,6 +271,13 @@ pub fn run(
             }
         }
         let active = started.elapsed().saturating_sub(paused_for + suspended_at.map_or(Duration::ZERO, |t| t.elapsed()));
+        if overflow.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = out_thread.join();
+            let _ = err_thread.join();
+            return Ok(Ran { success: false, stdout: Vec::new(), hash: None, stdout_len: 0, code: None });
+        }
         if gate.is_cancelled() || active > timeout {
             let _ = child.kill();
             let _ = child.wait();
@@ -268,7 +293,8 @@ pub fn run(
     };
     let (stdout, hash, stdout_len) = out_thread.join().unwrap_or_default();
     let _ = err_thread.join();
-    Ok(Ran { success: status.is_some_and(|s| s.success()), stdout, hash, stdout_len, code: status.and_then(|s| s.code()) })
+    let success = status.is_some_and(|s| s.success()) && !overflow.load(std::sync::atomic::Ordering::Relaxed);
+    Ok(Ran { success, stdout, hash, stdout_len, code: status.and_then(|s| s.code()) })
 }
 
 /// `OsString` arguments from anything path- or string-like.

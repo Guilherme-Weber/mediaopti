@@ -735,6 +735,54 @@ mod tests {
 
     /// BMP/TGA -> PNG: 24-bit, opaque 32-bit (alpha dropped), palette, and real alpha all
     /// convert pixel-identically (checked here independently, at 16 bits per channel).
+    /// GIF frames must keep their timing: a GIF with the same pixels but other delays fails
+    /// verification, also on the path that ignores invisible pixels; a misnamed JPEG is
+    /// recognised by content.
+    #[test]
+    fn gif_timing_is_verified_and_pictures_are_sniffed() {
+        let Some(t) = tools() else {
+            eprintln!("skipping: image tools not found");
+            return;
+        };
+        let Some(gifsicle) = t.get("gifsicle").map(Path::to_path_buf) else {
+            eprintln!("skipping: gifsicle not found");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("mo-giftime-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let gif = dir.join("a.gif");
+        make(&t.ffmpeg, &["-f", "lavfi", "-i", "testsrc=s=64x48:r=5:d=1", "-vf", "split[a][b];[a]palettegen=reserve_transparent=1[p];[b][p]paletteuse", "-loop", "0"], &gif);
+        let c = ctx(t, false);
+        let ver = Verifier::new(&c, Kind::Gif, &gif);
+        let slow = dir.join("slow.gif");
+        let ok = std::process::Command::new(&gifsicle).arg("-d").arg("50").arg(&gif).arg("-o").arg(&slow).status().unwrap().success();
+        assert!(ok);
+        assert!(!ver.ok(&slow).unwrap(), "changed frame delays must fail");
+        let opt = dir.join("opt.gif");
+        let ok = std::process::Command::new(&gifsicle).arg("-O3").arg(&gif).arg("-o").arg(&opt).status().unwrap().success();
+        assert!(ok);
+        assert!(ver.ok(&opt).unwrap(), "gifsicle -O3 keeps pixels and timing");
+
+        let jpg_as_png = dir.join("photo.png");
+        make(&c.tools.ffmpeg, &["-f", "lavfi", "-i", "testsrc=s=64x48:d=1", "-frames:v", "1", "-f", "mjpeg"], &jpg_as_png);
+        assert_eq!(sniff_picture(&jpg_as_png), Some(Kind::Jpg));
+        assert_eq!(sniff_picture(&gif), Some(Kind::Gif));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn big_decodes_are_not_held_in_memory() {
+        let Some(t) = tools() else {
+            eprintln!("skipping: image tools not found");
+            return;
+        };
+        // 64 frames of 1000x1000 RGBA = 256 MB, over a 16 MB cap: stopped, reported as failed.
+        let args = crate::os_args!["-v", "error", "-f", "lavfi", "-i", "color=s=1000x1000:d=64:r=1", "-pix_fmt", "rgba", "-f", "rawvideo", "-"];
+        let ran = tools::run(&t.ffmpeg, args, None, Capture::BytesUpTo(16 << 20), Duration::from_secs(60), &tools::Gate::default()).unwrap();
+        assert!(!ran.success && ran.stdout.is_empty());
+    }
+
     #[test]
     fn bmp_and_tga_become_identical_pngs() {
         let Some(t) = tools() else {

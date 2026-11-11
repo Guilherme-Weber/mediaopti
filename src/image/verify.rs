@@ -15,9 +15,10 @@ use std::cell::OnceCell;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-/// Masked compares hold two decoded rasters in memory: one at a time.
+/// Masked compares hold two decoded rasters in memory: one at a time, each at most this big
+/// (decoding stops beyond it, and only pixel-identical results are then accepted).
 static MASK_LOCK: Mutex<()> = Mutex::new(());
-const MASK_LIMIT: usize = 600 * 1024 * 1024;
+const MASK_LIMIT: usize = 256 * 1024 * 1024;
 
 pub struct Verifier<'a> {
     ctx: &'a Ctx,
@@ -25,7 +26,15 @@ pub struct Verifier<'a> {
     reference: PathBuf,
     pub png: Option<PngInfo>,
     pub segs: Option<jpeg::Segments>,
-    signature: OnceCell<Option<Vec<u8>>>,
+    signature: OnceCell<Option<Signature>>,
+}
+
+/// What a decode must match: the pixels (and frame timing) as one hash, and the frame
+/// timing alone (for compares that ignore invisible pixels).
+#[derive(Clone, PartialEq, Eq)]
+struct Signature {
+    all: Vec<u8>,
+    timing: Vec<u8>,
 }
 
 impl<'a> Verifier<'a> {
@@ -49,19 +58,22 @@ impl<'a> Verifier<'a> {
         if self.png.as_ref().is_some_and(PngInfo::is_apng) {
             args.extend(crate::os_args!["-f", "apng"]);
         }
-        args.extend(crate::os_args!["-i", path, "-map", "0:v:0", "-pix_fmt", self.pix_fmt(), "-f", format, "-"]);
+        // Every frame once, stamped in the file's own time base: by default ffmpeg renumbers
+        // frames 0, 1, 2... and a GIF with other frame delays would look the same.
+        args.extend(crate::os_args!["-i", path, "-map", "0:v:0", "-fps_mode", "passthrough", "-enc_time_base", "demux"]);
+        args.extend(crate::os_args!["-pix_fmt", self.pix_fmt(), "-f", format, "-"]);
         let ran = tools::run(&self.ctx.tools.ffmpeg, args, None, capture, self.ctx.timeout, &self.ctx.gate)?;
         Ok(ran.success.then_some(ran))
     }
 
-    fn signature_of(&self, path: &Path) -> Result<Option<Vec<u8>>, RunError> {
+    fn signature_of(&self, path: &Path) -> Result<Option<Signature>, RunError> {
         if self.kind == Kind::Jpg {
             if let Some(djpeg) = self.ctx.tools.get("djpeg") {
                 let ran = tools::run(djpeg, crate::os_args![path], None, Capture::Hash, self.ctx.timeout, &self.ctx.gate)?;
                 if ran.success {
-                    let mut sig = b"djpeg:".to_vec();
-                    sig.extend(ran.hash.unwrap_or_default());
-                    return Ok(Some(sig));
+                    let mut all = b"djpeg:".to_vec();
+                    all.extend(ran.hash.unwrap_or_default());
+                    return Ok(Some(Signature { all, timing: Vec::new() }));
                 }
             }
         }
@@ -69,19 +81,23 @@ impl<'a> Verifier<'a> {
             return Ok(None);
         };
         let text = String::from_utf8_lossy(&ran.stdout);
-        let mut h = Sha256::new();
+        let (mut all, mut timing) = (Sha256::new(), Sha256::new());
+        // Lines: stream, dts, pts, duration, size, md5.
         for line in text.lines().filter(|l| !l.is_empty() && !l.starts_with('#')) {
-            h.update(line.as_bytes());
-            h.update(b"\n");
+            all.update(line.as_bytes());
+            all.update(b"\n");
+            let fields: Vec<&str> = line.split(',').map(str::trim).collect();
+            timing.update(fields.get(..4).unwrap_or(&fields[..]).join(",").as_bytes());
+            timing.update(b"\n");
         }
-        Ok(Some(h.finalize().to_vec()))
+        Ok(Some(Signature { all: all.finalize().to_vec(), timing: timing.finalize().to_vec() }))
     }
 
     fn masked_equal(&self, path: &Path) -> Result<bool, RunError> {
         let _guard = MASK_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (Some(a), Some(b)) = (
-            self.ffmpeg_decode(&self.reference, "rawvideo", Capture::Bytes)?,
-            self.ffmpeg_decode(path, "rawvideo", Capture::Bytes)?,
+            self.ffmpeg_decode(&self.reference, "rawvideo", Capture::BytesUpTo(MASK_LIMIT))?,
+            self.ffmpeg_decode(path, "rawvideo", Capture::BytesUpTo(MASK_LIMIT))?,
         ) else {
             return Ok(false);
         };
@@ -102,7 +118,8 @@ impl<'a> Verifier<'a> {
             return Ok(true);
         }
         let alpha = self.kind == Kind::Gif || self.png.as_ref().is_some_and(PngInfo::has_alpha);
-        if alpha && !self.ctx.strict_alpha {
+        // Same frames at the same times; only the colour of invisible pixels may differ.
+        if alpha && !self.ctx.strict_alpha && candidate.timing == reference.timing {
             return self.masked_equal(path);
         }
         Ok(false)
