@@ -492,7 +492,7 @@ export component AppWindow inherits Window {
                     SettingField {
                         glyph: "\u{E945}";
                         label: "Effort";
-                        hint: "Images, audio and documents. Maximum tries every tool at its highest setting; files already done stay done.";
+                        hint: "Maximum tries every tool at its highest setting (much slower).";
                         model: root.effort-options;
                         current-index <=> root.effort-index;
                         changed => { root.settings-changed(); }

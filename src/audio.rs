@@ -456,6 +456,28 @@ fn wav_format(path: &Path) -> io::Result<Option<PcmFormat>> {
     Ok(None)
 }
 
+/// The ids of a WAV's chunks besides the format, the audio and padding.
+fn wav_extra_chunks(path: &Path) -> io::Result<Vec<[u8; 4]>> {
+    let mut f = BufReader::new(File::open(path)?);
+    let len = f.get_ref().metadata()?.len();
+    f.seek(SeekFrom::Start(12))?;
+    let (mut at, mut extra) = (12u64, Vec::new());
+    while at + 8 <= len {
+        let mut ch = [0u8; 8];
+        if read_full(&mut f, &mut ch)? != 8 {
+            break;
+        }
+        let id: [u8; 4] = ch[..4].try_into().unwrap();
+        if !matches!(&id, b"fmt " | b"data" | b"fact" | b"JUNK" | b"junk" | b"PAD ") {
+            extra.push(id);
+        }
+        let size = u64::from(u32::from_le_bytes(ch[4..].try_into().unwrap()));
+        at += 8 + size + (size & 1);
+        f.seek(SeekFrom::Start(at))?;
+    }
+    Ok(extra)
+}
+
 /// Channels, sample rate and bits per sample from a FLAC's STREAMINFO.
 fn flac_format(f: &Flac) -> Option<PcmFormat> {
     let b = f.blocks.first().filter(|b| b.0 == 0)?.1.get(10..14)?;
@@ -472,7 +494,13 @@ fn wav(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, AudioError> {
     };
     let out = work.join("out.flac");
     let mut encoded = false;
+    // Without --keep-foreign-metadata, flac drops the other RIFF chunks (tags, cue points,
+    // a game rip's loop points): that fallback is only for WAVs that have none.
+    let plain_ok = wav_extra_chunks(src)?.is_empty();
     for keep in [true, false] {
+        if !keep && !plain_ok {
+            return skip("flac could not keep its extra RIFF chunks (tags, cue or loop points): kept as WAV");
+        }
         let mut args = flac_level(ctx);
         if keep {
             args.push("--keep-foreign-metadata-if-present".into());
@@ -530,7 +558,8 @@ fn flac(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, AudioError> {
     }
 
     // 2) re-encoding: worthwhile only for files from older or other encoders (any at max).
-    if ctx.max || !is_modern(&orig) {
+    // flac would drop an ID3v1 or APE tag appended after the audio (the art path copies it).
+    if (ctx.max || !is_modern(&orig)) && !tag_at_end(src)? {
         if let Some(flac) = ctx.tools.get("flac") {
             let out = work.join("enc.flac");
             let mut args = flac_level(ctx);
@@ -547,6 +576,17 @@ fn flac(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, AudioError> {
     }
     let best = (best != src).then_some(best);
     Ok(Optimized::found(best, steps))
+}
+
+/// Whether an ID3v1 or APE tag follows the audio frames (some taggers append them to FLAC).
+fn tag_at_end(path: &Path) -> io::Result<bool> {
+    let mut f = File::open(path)?;
+    let len = f.metadata()?.len();
+    f.seek(SeekFrom::Start(len.saturating_sub(160)))?;
+    let mut tail = Vec::new();
+    f.read_to_end(&mut tail)?;
+    let id3v1 = tail.len() >= 128 && tail[tail.len() - 128..].starts_with(b"TAG");
+    Ok(id3v1 || tail.windows(8).any(|w| w == b"APETAGEX"))
 }
 
 /// The new file has the same blocks except for picture data, the same audio bytes, and
@@ -759,6 +799,49 @@ mod tests {
     fn ff(ctx: &Ctx, args: &[&str]) {
         let ok = std::process::Command::new(&ctx.tools.ffmpeg).args(["-v", "error", "-y"]).args(args).status().unwrap().success();
         assert!(ok, "ffmpeg {args:?}");
+    }
+
+    /// A game-rip WAV with loop points (`smpl` chunk) becomes a FLAC that keeps them: decoding
+    /// it back with --keep-foreign-metadata gives the WAV byte for byte.
+    #[test]
+    fn wav_loop_points_survive_conversion() {
+        let Some(c) = ctx() else {
+            eprintln!("skipping: tools not found");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("mo-wavsmpl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let plain = dir.join("plain.wav");
+        ff(&c, &["-f", "lavfi", "-i", "sine=f=440:d=2", "-c:a", "pcm_s16le", "-ar", "44100", plain.to_str().unwrap()]);
+        // Append a smpl chunk (loop points) and fix the RIFF size.
+        let mut wav = std::fs::read(&plain).unwrap();
+        let mut smpl = b"smpl".to_vec();
+        smpl.extend(60u32.to_le_bytes());
+        smpl.extend([7u8; 60]);
+        wav.extend(&smpl);
+        let riff = (wav.len() - 8) as u32;
+        wav[4..8].copy_from_slice(&riff.to_le_bytes());
+        let src = dir.join("loop.wav");
+        std::fs::write(&src, &wav).unwrap();
+        assert!(wav_extra_chunks(&src).unwrap().contains(b"smpl"));
+        assert!(wav_extra_chunks(&plain).unwrap().iter().all(|c| c == b"LIST"), "ffmpeg adds only LIST");
+
+        let work = dir.join("w");
+        std::fs::create_dir_all(&work).unwrap();
+        let r = optimize(&c, Kind::Wav, &src, &work).unwrap();
+        let flac = r.best.unwrap_or_else(|| panic!("not converted: {:?}", r.note));
+        let back = dir.join("back.wav");
+        let ok = std::process::Command::new(c.tools.get("flac").unwrap())
+            .args(["-d", "--keep-foreign-metadata", "--silent", "-f", "-o"])
+            .arg(&back)
+            .arg(&flac)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        assert_eq!(std::fs::read(&back).unwrap(), wav, "loop points and audio restored exactly");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A FLAC and an MP3 with a badly compressed PNG cover: the cover gets smaller, the
