@@ -360,10 +360,17 @@ pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, dispo
     }
     // A conversion (WAV -> FLAC) saves under the new extension, never over another file.
     let target = result.new_ext.map_or_else(|| path.to_path_buf(), |e| path.with_extension(e));
-    if target != path && target.exists() {
+    // Claimed atomically: a.bmp and a.tga running at once can't both become a.png.
+    if target != path && system::claim_new_name(&target).is_err() {
         let name = target.file_name().unwrap_or_default().to_string_lossy().into_owned();
         return ImageResult::Kept { content: content_of(path), note: Some(format!("{name} already exists, kept the original")) };
     }
+    let claimed = (target != path).then(|| target.clone());
+    let unclaim = || {
+        if let Some(t) = &claimed {
+            system::release_claim(t);
+        }
+    };
 
     // The new version goes next to the original first (same volume), then replaces it.
     let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
@@ -371,13 +378,18 @@ pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, dispo
     let sibling = path.with_file_name(format!("{stem}.mediaopti.i{worker_id}.{new_ext}"));
     let attrs = match std::fs::metadata(path) {
         Ok(m) => system::OriginalAttributes::from_metadata(&m),
-        Err(err) => return ImageResult::Failed(err.to_string()),
+        Err(err) => {
+            unclaim();
+            return ImageResult::Failed(err.to_string());
+        }
     };
     if let Err(err) = std::fs::copy(&best, &sibling) {
         let _ = system::remove_file_if_exists(&sibling);
+        unclaim();
         return ImageResult::Failed(format!("could not write next to the original: {err}"));
     }
     if let Err(err) = super::replace_original(&sibling, &target, path, disposal) {
+        unclaim();
         return ImageResult::Failed(err);
     }
     let _ = system::restore_attributes(&target, &attrs);

@@ -626,7 +626,9 @@ fn bench_folder() {
     let (engine, rec) = new_engine(&rt, &root, ff);
     // MEDIAOPTI_BENCH_EFFORT=2: maximum effort.
     let effort = std::env::var("MEDIAOPTI_BENCH_EFFORT").ok().and_then(|e| e.parse().ok());
-    let raw = || RawOptions { images: Some(2), effort, ..opts("av1_nvenc", 2.0) };
+    // MEDIAOPTI_BENCH_CONVERT=1: conversions on (BMP/TGA -> PNG, WAV -> FLAC, CBR -> CBZ).
+    let convert = std::env::var("MEDIAOPTI_BENCH_CONVERT").ok().and_then(|e| e.parse().ok());
+    let raw = || RawOptions { images: Some(2), effort, convert: convert.or(Some(0)), ..opts("av1_nvenc", 2.0) };
     let t = std::time::Instant::now();
     rt.block_on(async {
         engine.apply_options(raw());

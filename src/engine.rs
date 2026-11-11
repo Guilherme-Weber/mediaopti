@@ -1459,7 +1459,10 @@ impl Engine {
             input.with_file_name(format!("{stem}{ext}"))
         };
 
-        if final_target != input && final_target.exists() {
+        // Claimed atomically: x.mkv and x.avi running at once can't both become x.mp4.
+        let claimed = final_target != input;
+        let t = final_target.clone();
+        if claimed && self.blocking(move || system::claim_new_name(&t)).await.is_err() {
             self.remember(&input, &input).await;
             self.lock().run.skipped_larger += 1;
             self.log_remove(&tmp);
@@ -1476,6 +1479,9 @@ impl Engine {
 
         let path = input.clone();
         if self.blocking(move || file_state(&path)).await != source_state {
+            if claimed {
+                system::release_claim(&final_target);
+            }
             self.lock().run.skipped_larger += 1;
             self.log_remove(&tmp);
             self.log(format!(
@@ -1492,6 +1498,9 @@ impl Engine {
             .blocking(move || replace_original(&tmp_c, &target_c, &input_c, &disposal))
             .await;
         if let Err(err) = replaced {
+            if claimed {
+                system::release_claim(&final_target);
+            }
             {
                 let mut inner = self.lock();
                 inner.failed.insert(input.clone());

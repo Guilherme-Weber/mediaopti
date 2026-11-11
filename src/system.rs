@@ -426,6 +426,20 @@ pub enum Disposal {
     MoveTo(std::path::PathBuf),
 }
 
+/// Claims a new file name by creating it empty, only if no file has it (atomic). Two jobs
+/// converting to the same name (`a.bmp` and `a.tga` both to `a.png`) can't both win: the new
+/// version then replaces only its own placeholder, never someone else's file.
+pub fn claim_new_name(path: &Path) -> std::io::Result<()> {
+    fs::OpenOptions::new().write(true).create_new(true).open(path).map(drop)
+}
+
+/// Removes a placeholder made by [`claim_new_name`] if it is still empty.
+pub fn release_claim(path: &Path) {
+    if fs::metadata(path).is_ok_and(|m| m.len() == 0) {
+        let _ = fs::remove_file(path);
+    }
+}
+
 /// `path`, or `path` with " (2)", " (3)"... before the extension if it exists.
 pub fn unused_name(path: &Path) -> std::path::PathBuf {
     if !path.exists() {
@@ -781,6 +795,27 @@ mod tests {
         assert_eq!(clean_stale_work(&dir), 2);
         assert!(dead.iter().all(|d| !dir.join(d).exists()));
         assert!(kept.iter().all(|d| dir.join(d).exists()), "only dead runs' exact names are removed");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_new_name_is_claimed_once() {
+        let dir = std::env::temp_dir().join(format!("mo-claim-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("a.png");
+        let (a, b) = std::thread::scope(|s| {
+            let a = s.spawn(|| claim_new_name(&target).is_ok());
+            let b = s.spawn(|| claim_new_name(&target).is_ok());
+            (a.join().unwrap(), b.join().unwrap())
+        });
+        assert!(a ^ b, "exactly one job gets the name");
+        fs::write(dir.join("b.png"), b"user file").unwrap();
+        assert!(claim_new_name(&dir.join("b.png")).is_err());
+        release_claim(&dir.join("b.png"));
+        assert_eq!(fs::read(dir.join("b.png")).unwrap(), b"user file", "never removes a real file");
+        release_claim(&target);
+        assert!(!target.exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
