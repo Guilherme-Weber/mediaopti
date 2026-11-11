@@ -173,6 +173,21 @@ pub fn free_space(path: &Path) -> Option<u64> {
     }
 }
 
+/// Gives a file or folder the hidden attribute (best effort).
+pub fn set_hidden(path: &Path) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let Ok(meta) = fs::metadata(path) else { return };
+        let current = std::os::windows::fs::MetadataExt::file_attributes(&meta);
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        // SAFETY: `wide` is NUL-terminated and lives through the call.
+        unsafe { windows_sys::Win32::Storage::FileSystem::SetFileAttributesW(wide.as_ptr(), current | 0x2) };
+    }
+    #[cfg(not(windows))]
+    let _ = path;
+}
+
 /// Whether a process with this id is running.
 pub fn process_alive(pid: u32) -> bool {
     #[cfg(windows)]

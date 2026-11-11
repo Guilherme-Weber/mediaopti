@@ -275,6 +275,9 @@ impl WorkDir {
             let taken: u64 = reserved.iter().filter(|(r, _)| *r == root).map(|(_, n)| n).sum();
             let fits = system::free_space(&root).is_none_or(|free| free >= taken + need + DISK_RESERVE);
             if fits && std::fs::create_dir_all(place.join(name)).is_ok() {
+                if place.ends_with(DRIVE_WORK_DIR) {
+                    system::set_hidden(&place);
+                }
                 reserved.push((root.clone(), need));
                 return Ok(Self { path: place.join(name), root, reserved: need });
             }
@@ -379,4 +382,34 @@ pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, dispo
     let lossy = result.steps.iter().any(|s| s.contains('='));
     let renamed = (target != path).then(|| target.clone());
     ImageResult::Smaller { before, after, lossy, content: content_of(&target), renamed }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A job too big for the temp drive's free space works on the file's own drive, in a
+    /// hidden folder that disappears with the job. (Only a reservation: nothing is written.)
+    #[test]
+    fn work_folder_moves_to_the_files_drive_when_temp_is_short() {
+        let file = Path::new(r"D:\mediaopti-test\some file.wav");
+        let (Some(temp_free), Some(d_free)) = (system::free_space(&std::env::temp_dir()), system::free_space(Path::new(r"D:\"))) else {
+            eprintln!("skipping: no D: drive");
+            return;
+        };
+        // 4x this must exceed the temp drive's free space but fit on D:.
+        let size = temp_free / 4 + (1 << 30);
+        if volume_root(&std::env::temp_dir()) == volume_root(file) || size * 4 + DISK_RESERVE + (1 << 30) > d_free {
+            eprintln!("skipping: needs a temp drive with less free space than D:");
+            return;
+        }
+        let w = WorkDir::new(file, size, "mediaopti-img-test-0").expect("fits on D:");
+        assert!(w.path.starts_with(r"D:\.mediaopti-temp"), "{}", w.path.display());
+        #[cfg(windows)]
+        assert!(std::os::windows::fs::MetadataExt::file_attributes(&std::fs::metadata(r"D:\.mediaopti-temp").unwrap()) & 0x2 != 0, "hidden");
+        // A second one doesn't fit on either drive while the first holds its reservation.
+        assert!(WorkDir::new(file, d_free / 4, "mediaopti-img-test-1").is_err());
+        drop(w);
+        assert!(!Path::new(r"D:\.mediaopti-temp").exists(), "removed when empty");
+    }
 }
