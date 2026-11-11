@@ -600,3 +600,45 @@ fn images_and_videos_in_one_batch() {
     assert!(logs4.contains("1 moved, renamed or copied files recognised"), "{logs4}");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Benchmark on a copy of a real folder: `MEDIAOPTI_BENCH_DIR=<folder> cargo test --release
+/// bench_folder -- --ignored --nocapture`. The folder itself is never modified.
+#[test]
+#[ignore = "benchmark on a real folder (MEDIAOPTI_BENCH_DIR)"]
+fn bench_folder() {
+    let (Some(ff), Ok(src)) = (ffmpeg(), std::env::var("MEDIAOPTI_BENCH_DIR")) else { return };
+    let root = test_dir("bench");
+    let media = root.join("media");
+    std::fs::create_dir_all(&media).unwrap();
+    let mut before = 0u64;
+    for e in std::fs::read_dir(&src).unwrap().filter_map(Result::ok) {
+        if e.path().is_file() {
+            before += std::fs::copy(e.path(), media.join(e.file_name())).unwrap();
+        }
+    }
+    let rt = runtime();
+    let (engine, rec) = new_engine(&rt, &root, ff);
+    let raw = || RawOptions { images: Some(2), ..opts("av1_nvenc", 2.0) };
+    let t = std::time::Instant::now();
+    rt.block_on(async {
+        engine.apply_options(raw());
+        engine.load_dir(media.clone()).await;
+        engine.clone().run_batch(raw()).await;
+    });
+    let secs = t.elapsed().as_secs_f64();
+    let after: u64 = std::fs::read_dir(&media).unwrap().filter_map(Result::ok).map(|e| e.metadata().unwrap().len()).sum();
+    let s = engine.snapshot();
+    let logs = rec.logs.lock().unwrap();
+    for l in logs.iter().filter(|l| l.contains("Failed") || l.starts_with("Done") || l.starts_with("Images:")) {
+        println!("{l}");
+    }
+    println!(
+        "{} images in {secs:.0}s ({:.2} s/image wall), {:.1} MB -> {:.1} MB ({:.2}% saved)",
+        s.images_done_this_run,
+        secs / s.images_done_this_run.max(1) as f64,
+        before as f64 / 1048576.0,
+        after as f64 / 1048576.0,
+        100.0 * (before - after) as f64 / before as f64
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
