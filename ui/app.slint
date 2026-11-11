@@ -234,7 +234,7 @@ export component AppWindow inherits Window {
     in property <bool> empty-folder;
     in property <string> folder-title: "No folder selected";
     in property <string> folder-path;
-    in property <string> folder-summary: "Choose a folder to scan it for videos, including subfolders.";
+    in property <string> folder-summary: "Choose a folder to scan it for videos and images, including subfolders.";
     in property <bool> busy;
     in property <bool> processing;
     in property <bool> can-start;
@@ -271,6 +271,8 @@ export component AppWindow inherits Window {
     in-out property <int> check-index;
     in-out property <int> gifs-index;
     in-out property <int> originals-index;
+    in property <[string]> images-options;
+    in-out property <int> images-index;
 
     callback choose-folder();
     callback start();
@@ -442,6 +444,14 @@ export component AppWindow inherits Window {
                     }
                 }
                 Row {
+                    SettingField {
+                        glyph: "\u{EB9F}";
+                        label: "Images";
+                        hint: "PNG, JPEG and small GIFs, on the CPU next to the video encodes.";
+                        model: root.images-options;
+                        current-index <=> root.images-index;
+                        changed => { root.settings-changed(); }
+                    }
                     SettingField {
                         glyph: "\u{E74D}";
                         label: "Replaced originals";

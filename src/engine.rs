@@ -1,8 +1,12 @@
 //! Batch engine: folder scanning, the work queue, parallel ffmpeg workers with retries
 //! and fallbacks, GPU telemetry and state broadcasting to the UI.
 
-use crate::args::{self, Mode, Options, RawOptions};
+use crate::args::{self, ImageMode, Mode, Options, RawOptions};
+use crate::image;
 use crate::history::{self, ContentHash, History};
+
+#[path = "engine_images.rs"]
+mod images;
 use crate::progress::{self, Diagnostics, WorkerProgress};
 use crate::system::{self, OriginalAttributes, PowerGuard};
 
@@ -63,6 +67,9 @@ struct RunStats {
     compressed: usize,
     skipped_larger: usize,
     failed: usize,
+    images_total: usize,
+    images_done: usize,
+    images_lossy: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -101,6 +108,10 @@ pub struct StateDto {
     pub skipped_larger_this_run: usize,
     pub failed_this_run: usize,
     pub space_saved_mb: f64,
+    pub images_total_this_run: usize,
+    pub images_done_this_run: usize,
+    /// Image workers busy right now.
+    pub images_active: usize,
     pub telemetry: TelemetryDto,
 }
 
@@ -111,6 +122,10 @@ struct Inner {
     file_sizes: Vec<u64>,
     pending_queue: Vec<PathBuf>,
     queue_cursor: usize,
+    /// PNG/JPEG and small GIFs, processed by the CPU image workers.
+    image_queue: Vec<PathBuf>,
+    image_cursor: usize,
+    images_active: usize,
     skipped_known: usize,
     skipped_generated: usize,
     skipped_small_gifs: usize,
@@ -142,6 +157,8 @@ pub struct Engine {
     /// Runtime that runs workers, ffmpeg I/O and timers (the UI thread stays free).
     rt: tokio::runtime::Handle,
     ffmpeg_path: PathBuf,
+    /// External image optimizers found at start-up.
+    image_tools: image::tools::Tools,
     inner: Mutex<Inner>,
     emit: Mutex<EmitThrottle>,
     /// Serializes encoder start-up so memory checks see the previous encoder's usage.
@@ -207,32 +224,70 @@ pub fn locate_ffmpeg() -> PathBuf {
 }
 
 impl Inner {
-    /// Rebuilds the work queue from the scanned files, history and this run's failures.
+    /// Whether `file` (of `size` bytes) is handled by the image workers: PNG/JPEG, and
+    /// GIFs under the size limit (bigger animated GIFs become video).
+    fn is_image_job(&self, file: &Path, size: u64) -> bool {
+        match image::kind_of(file) {
+            Some(image::Kind::Gif) => size < self.options.gif_min_bytes,
+            Some(_) => true,
+            None => false,
+        }
+    }
+
+    /// Content-history request for a file under the current settings.
+    fn want(&self, file: &Path, size: u64) -> history::Want {
+        if !self.is_image_job(file, size) {
+            history::Want::Video
+        } else if self.images_lossy() {
+            history::Want::ImageLossy
+        } else {
+            history::Want::ImageLossless
+        }
+    }
+
+    fn images_lossy(&self) -> bool {
+        self.options.images == ImageMode::Lossy
+    }
+
+    /// Rebuilds the work queues from the scanned files, history and this run's failures.
     fn rebuild_queue(&mut self) {
-        let mut queue = Vec::new();
+        let (mut queue, mut images) = (Vec::new(), Vec::new());
         let (mut known, mut generated, mut small_gifs) = (0, 0, 0);
+        let lossy = self.images_lossy();
         for (i, file) in self.files.iter().enumerate() {
             let size = self.file_sizes.get(i).copied().unwrap_or(u64::MAX);
             if is_generated_name(file) {
                 generated += 1;
+            } else if self.is_image_job(file, size) {
+                if self.options.images == ImageMode::Off {
+                    // Not remembered: they may be optimized once images are switched on.
+                    if args::is_gif(file) {
+                        small_gifs += 1;
+                    }
+                } else if self.history.contains_image(file, lossy) {
+                    known += 1;
+                } else if !self.failed.contains(file) {
+                    images.push(file.clone());
+                }
             } else if self.history.contains(file) {
                 known += 1;
-            } else if args::is_gif(file) && size < self.options.gif_min_bytes {
-                // Not remembered: they stay GIFs and the image optimizer handles them.
-                small_gifs += 1;
             } else if !self.failed.contains(file) {
                 queue.push(file.clone());
             }
         }
         self.pending_queue = queue;
         self.queue_cursor = 0;
+        self.image_queue = images;
+        self.image_cursor = 0;
         self.skipped_known = known;
         self.skipped_generated = generated;
         self.skipped_small_gifs = small_gifs;
     }
 
     fn remaining_pending(&self) -> usize {
-        self.pending_queue.len().saturating_sub(self.queue_cursor) + self.in_progress.len()
+        self.pending_queue.len().saturating_sub(self.queue_cursor)
+            + self.image_queue.len().saturating_sub(self.image_cursor)
+            + self.in_progress.len()
     }
 
     fn display_name(&self, path: &Path) -> String {
@@ -311,6 +366,9 @@ impl Inner {
             skipped_larger_this_run: self.run.skipped_larger,
             failed_this_run: self.run.failed,
             space_saved_mb: round1(self.space_saved_mb),
+            images_total_this_run: self.run.images_total,
+            images_done_this_run: self.run.images_done,
+            images_active: self.images_active,
             telemetry: TelemetryDto {
                 total_fps: total_fps.round() as i64,
                 total_speed: round1(total_speed),
@@ -331,16 +389,21 @@ impl Engine {
         rt: tokio::runtime::Handle,
     ) -> Arc<Self> {
         let history = History::load(data_dir.join("processedFiles.txt"));
+        let image_tools = image::tools::Tools::discover(ffmpeg_path.clone(), data_dir);
         Arc::new(Self {
             ui,
             rt,
             ffmpeg_path,
+            image_tools,
             inner: Mutex::new(Inner {
                 dir: None,
                 files: Vec::new(),
                 file_sizes: Vec::new(),
                 pending_queue: Vec::new(),
                 queue_cursor: 0,
+                image_queue: Vec::new(),
+                image_cursor: 0,
+                images_active: 0,
                 skipped_known: 0,
                 skipped_generated: 0,
                 skipped_small_gifs: 0,
@@ -475,26 +538,38 @@ impl Engine {
     /// before (moved, renamed or copied), and adds them to the location history.
     /// Only files whose size matches a remembered size are hashed.
     async fn recognise_by_content(self: &Arc<Self>, files: &[PathBuf], sizes: &[u64]) -> usize {
-        let candidates: Vec<PathBuf> = {
+        let (candidates, wants): (Vec<PathBuf>, Vec<history::Want>) = {
             let inner = self.lock();
+            let lossy = inner.images_lossy();
             files
                 .iter()
                 .zip(sizes)
-                .filter(|(f, s)| inner.history.has_size(**s) && !is_generated_name(f) && !inner.history.contains(f))
-                .map(|(f, _)| f.clone())
-                .collect()
+                .filter(|(f, s)| inner.history.has_size(**s) && !is_generated_name(f))
+                .map(|(f, s)| (f, inner.want(f, *s)))
+                .filter(|(f, want)| match want {
+                    history::Want::Video => !inner.history.contains(f),
+                    _ => !inner.history.contains_image(f, lossy),
+                })
+                .map(|(f, want)| (f.clone(), want))
+                .unzip()
         };
         if candidates.is_empty() {
             return 0;
         }
-        self.log(format!("Checking {} videos by content (same size as a processed one)", candidates.len()));
+        self.log(format!("Checking {} files by content (same size as a processed one)", candidates.len()));
         let hashed = self.blocking(move || hash_files_parallel(&candidates)).await;
         let hits = {
             let mut inner = self.lock();
             let mut hits = 0;
-            for (file, hash) in hashed {
-                if hash.is_some_and(|h| inner.history.contains_content(&h)) {
-                    inner.history.add(&file);
+            for ((file, hash), want) in hashed.into_iter().zip(wants) {
+                if hash.is_some_and(|h| inner.history.contains_content(&h, want)) {
+                    match want {
+                        history::Want::Video => {
+                            inner.history.add(&file);
+                        }
+                        history::Want::ImageLossy => inner.history.add_image(&file, image::mode(true)),
+                        history::Want::ImageLossless => inner.history.add_image(&file, image::mode(false)),
+                    }
                     hits += 1;
                 }
             }
@@ -530,6 +605,8 @@ impl Engine {
             inner.file_sizes.clear();
             inner.pending_queue.clear();
             inner.queue_cursor = 0;
+            inner.image_queue.clear();
+            inner.image_cursor = 0;
             inner.reset_run_tracking();
             inner.run = RunStats::default();
             inner.status = Status::Scanning;
@@ -554,7 +631,7 @@ impl Engine {
                 let recognised = self.recognise_by_content(&result.files, &result.sizes).await;
                 if recognised > 0 {
                     self.log(format!(
-                        "{recognised} moved, renamed or copied videos recognised as already processed"
+                        "{recognised} moved, renamed or copied files recognised as already processed"
                     ));
                 }
                 let (known, generated) = {
@@ -567,11 +644,17 @@ impl Engine {
                     inner.status = Status::Ready;
                     (inner.skipped_known, inner.skipped_generated)
                 };
-                self.log(format!(
-                    "Found {} videos/GIFs in {}",
-                    self.lock().files.len(),
-                    dir.display()
-                ));
+                let found = {
+                    let inner = self.lock();
+                    format!(
+                        "Found {} files in {} ({} videos and {} images to process)",
+                        inner.files.len(),
+                        dir.display(),
+                        inner.pending_queue.len(),
+                        inner.image_queue.len()
+                    )
+                };
+                self.log(found);
                 if result.cleaned_orphans > 0 {
                     self.log(format!(
                         "Removed {} leftover temporary (.mediaopti) file(s)",
@@ -579,7 +662,7 @@ impl Engine {
                     ));
                 }
                 if known > 0 {
-                    self.log(format!("{known} videos are already in the processed history"));
+                    self.log(format!("{known} files are already in the processed history"));
                 }
                 let small_gifs = self.lock().skipped_small_gifs;
                 if small_gifs > 0 {
@@ -651,7 +734,8 @@ impl Engine {
             inner.stop_requested = false;
             self.paused.send_replace(false);
             inner.run = RunStats {
-                total: inner.pending_queue.len(),
+                total: inner.pending_queue.len() + inner.image_queue.len(),
+                images_total: inner.image_queue.len(),
                 ..RunStats::default()
             };
             if inner.run.total > 0 {
@@ -666,31 +750,61 @@ impl Engine {
         };
 
         if total == 0 {
-            self.log("No new videos to process");
+            self.log("No new files to process");
             self.send_state(true);
             return;
         }
 
-        self.start_gpu_polling();
-        self.log(format!(
-            "Starting {total} videos | Encoder: {} | Workers: {} | Base CRF: {} | Preset: {}",
-            options.encoder, options.concurrency, options.crf, options.preset
-        ));
-        self.send_state(true);
-
+        let (videos, images, cancel) = {
+            let inner = self.lock();
+            (inner.pending_queue.len(), inner.image_queue.len(), inner.cancel.clone())
+        };
+        let mut handles = Vec::new();
         let fatal = Arc::new(AtomicBool::new(false));
-        let worker_count = (options.concurrency as usize).min(total);
-        let handles: Vec<_> = (1..=worker_count as u32)
-            .map(|id| {
+        if videos > 0 {
+            self.start_gpu_polling();
+            self.log(format!(
+                "Starting {videos} videos | Encoder: {} | Workers: {} | Base CRF: {} | Preset: {}",
+                options.encoder, options.concurrency, options.crf, options.preset
+            ));
+            let worker_count = (options.concurrency as usize).min(videos);
+            for id in 1..=worker_count as u32 {
                 let engine = Arc::clone(&self);
                 let fatal = Arc::clone(&fatal);
-                self.rt.spawn(async move { engine.run_worker(id, fatal).await })
-            })
-            .collect();
-        for (id, handle) in (1..).zip(handles) {
+                handles.push((format!("Worker {id}"), self.rt.spawn(async move { engine.run_worker(id, fatal).await })));
+            }
+        }
+        if images > 0 {
+            // Leave some CPU for the video encoders' decoding and the desktop.
+            let cores = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+            let workers = cores.saturating_sub(2).clamp(1, images);
+            let ctx = Arc::new(image::Ctx {
+                tools: self.image_tools.clone(),
+                lossy: options.images == ImageMode::Lossy,
+                target: 93.0,
+                lossy_min_gain: 0.03,
+                strip: false,
+                strict_alpha: false,
+                parallel: workers > 1,
+                timeout: Duration::from_secs(900),
+                cancel,
+            });
+            self.log(format!(
+                "Starting {images} images | {} | {workers} CPU workers",
+                if ctx.lossy { "visually lossless (SSIMULACRA2 >= 93)" } else { "lossless" }
+            ));
+            self.log(self.image_tools.summary());
+            for id in 1..=workers as u32 {
+                let engine = Arc::clone(&self);
+                let ctx = Arc::clone(&ctx);
+                handles.push((format!("Image worker {id}"), self.rt.spawn(async move { engine.run_image_worker(id, ctx).await })));
+            }
+        }
+        self.send_state(true);
+        for (name, handle) in handles {
             // A worker that panicked must not vanish silently (release builds abort instead).
             if let Err(err) = handle.await {
-                self.log(format!("[Worker {id}] stopped unexpectedly: {err}"));
+                self.log(format!("[{name}] stopped unexpectedly: {err}"));
             }
         }
 
@@ -724,9 +838,15 @@ impl Engine {
             self.log(format!("Stopped after an ffmpeg startup error; saved {saved} MB"));
         } else {
             self.log(format!(
-                "Done. Compressed {}, skipped {}, failed {}. Saved {saved} MB total",
+                "Done. Made smaller {}, kept as they were {}, failed {}. Saved {saved} MB total",
                 run.compressed, run.skipped_larger, run.failed
             ));
+            if run.images_total > 0 {
+                self.log(format!(
+                    "Images: {} processed, {} made smaller with a visually lossless (lossy) pass",
+                    run.images_done, run.images_lossy
+                ));
+            }
         }
         self.send_state(true);
     }
@@ -1818,7 +1938,7 @@ fn scan_folder(dir: &Path) -> ScanResult {
             unreadable += 1;
             continue;
         };
-        if !entry.file_type().is_file() || !args::is_video_file(entry.path()) {
+        if !entry.file_type().is_file() || !(args::is_video_file(entry.path()) || image::kind_of(entry.path()).is_some()) {
             continue;
         }
         if is_orphan_temp(entry.path()) {

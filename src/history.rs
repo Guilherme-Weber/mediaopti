@@ -1,10 +1,12 @@
 //! Processed-file history, remembered two ways:
 //!
-//! - **by location** (`processedFiles.txt`): one SHA-256 hash of the absolute path per line
-//!   (hex). Same file and hashing as batchviproc and its Electron predecessor, so existing
-//!   history carries over. Instant to check, but forgets a file once it is moved or renamed.
+//! - **by location** (`processedFiles.txt`): one SHA-256 hash per line (hex). For videos it is
+//!   the hash of the absolute path, the same as batchviproc and its Electron predecessor, so
+//!   existing history carries over. For images it is the hash of path + mode, so a lossless
+//!   pass doesn't hide a file from a later lossy one. Instant to check, but a file is
+//!   forgotten once it is moved or renamed.
 //! - **by content** (`processed-content.tsv`): `<BLAKE2b-128 hex>\t<size>\t<mode>` per line,
-//!   the same format imageopti writes, so the two histories can be merged. It recognises a
+//!   the same format imageopti writes (its history is imported once). It recognises a
 //!   processed file wherever it is moved or copied to. Only files whose size matches a
 //!   remembered size are ever hashed, so checking costs almost nothing for new files.
 //!
@@ -14,7 +16,7 @@
 use blake2::digest::consts::U16;
 use blake2::Blake2b;
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -24,13 +26,48 @@ pub type ContentHash = [u8; 16];
 /// Mode recorded for videos in the content history (imageopti uses e.g. `lossless-normal`).
 pub const VIDEO_MODE: &str = "video";
 
+// What a remembered file was processed as (bit flags; a file can have several).
+const F_VIDEO: u8 = 1;
+const F_LOSSLESS: u8 = 2;
+const F_LOSSY: u8 = 4;
+
+fn mode_flag(mode: &str) -> u8 {
+    if mode == VIDEO_MODE {
+        F_VIDEO
+    } else if mode.starts_with("lossy") {
+        F_LOSSY
+    } else {
+        F_LOSSLESS
+    }
+}
+
+/// What a file is about to be processed as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Want {
+    Video,
+    ImageLossless,
+    ImageLossy,
+}
+
+impl Want {
+    /// Same rule as imageopti: a lossy pass covers everything (lossy output is never
+    /// re-encoded lossily again, so loss doesn't stack); a lossless pass covers lossless.
+    fn covered_by(self, flags: u8) -> bool {
+        match self {
+            Want::Video => flags != 0,
+            Want::ImageLossless => flags & (F_LOSSLESS | F_LOSSY) != 0,
+            Want::ImageLossy => flags & F_LOSSY != 0,
+        }
+    }
+}
+
 pub struct History {
     path: PathBuf,
     hashes: HashSet<Hash>,
     /// Added since the last save, in insertion order.
     unsaved: Vec<Hash>,
     content_path: PathBuf,
-    content: HashSet<ContentHash>,
+    content: HashMap<ContentHash, u8>,
     sizes: HashSet<u64>,
     unsaved_content: Vec<(ContentHash, u64, &'static str)>,
     /// The files no longer match memory (after clear) and must be rewritten.
@@ -39,6 +76,15 @@ pub struct History {
 
 fn hash_path(file: &Path) -> Hash {
     Sha256::digest(file.to_string_lossy().as_bytes()).into()
+}
+
+/// Location key of an image: path plus mode. (Videos keep the plain path hash.)
+fn hash_image_path(file: &Path, mode: &str) -> Hash {
+    let mut h = Sha256::new();
+    h.update(file.to_string_lossy().as_bytes());
+    h.update([0u8]);
+    h.update(mode.as_bytes());
+    h.finalize().into()
 }
 
 /// BLAKE2b with a 16-byte digest (identical to Python's `hashlib.blake2b(digest_size=16)`).
@@ -62,11 +108,11 @@ fn parse_hex<const N: usize>(text: &str) -> Option<[u8; N]> {
     Some(out)
 }
 
-fn parse_content_line(line: &str) -> Option<(ContentHash, u64)> {
+fn parse_content_line(line: &str) -> Option<(ContentHash, u64, u8)> {
     let mut parts = line.trim().split('\t');
     let hash = parse_hex::<16>(parts.next()?)?;
     let size = parts.next()?.parse().ok()?;
-    Some((hash, size))
+    Some((hash, size, mode_flag(parts.next().unwrap_or(VIDEO_MODE))))
 }
 
 impl History {
@@ -76,10 +122,10 @@ impl History {
             .map(|data| data.split('\n').filter_map(|l| parse_hex::<32>(l.trim())).collect())
             .unwrap_or_default();
         let content_path = path.with_file_name("processed-content.tsv");
-        let (mut content, mut sizes) = (HashSet::new(), HashSet::new());
+        let (mut content, mut sizes) = (HashMap::new(), HashSet::new());
         if let Ok(data) = std::fs::read_to_string(&content_path) {
-            for (hash, size) in data.lines().filter_map(parse_content_line) {
-                content.insert(hash);
+            for (hash, size, flag) in data.lines().filter_map(parse_content_line) {
+                *content.entry(hash).or_insert(0) |= flag;
                 sizes.insert(size);
             }
         }
@@ -99,8 +145,16 @@ impl History {
         self.hashes.len().max(self.content.len())
     }
 
+    /// Location check for a video.
     pub fn contains(&self, file: &Path) -> bool {
         self.hashes.contains(&hash_path(file))
+    }
+
+    /// Location check for an image to be processed lossily or not (a lossy entry also
+    /// covers a lossless request).
+    pub fn contains_image(&self, file: &Path, lossy: bool) -> bool {
+        self.hashes.contains(&hash_image_path(file, crate::image::mode(true)))
+            || (!lossy && self.hashes.contains(&hash_image_path(file, crate::image::mode(false))))
     }
 
     /// Whether some processed file had exactly this size (only those are worth hashing).
@@ -108,11 +162,11 @@ impl History {
         self.sizes.contains(&size)
     }
 
-    pub fn contains_content(&self, hash: &ContentHash) -> bool {
-        self.content.contains(hash)
+    pub fn contains_content(&self, hash: &ContentHash, want: Want) -> bool {
+        self.content.get(hash).is_some_and(|&f| want.covered_by(f))
     }
 
-    /// Returns true if the file was newly added.
+    /// Remembers a video by location. Returns true if it was newly added.
     pub fn add(&mut self, file: &Path) -> bool {
         let hash = hash_path(file);
         let added = self.hashes.insert(hash);
@@ -122,8 +176,19 @@ impl History {
         added
     }
 
+    /// Remembers an image by location, for the mode it was processed in.
+    pub fn add_image(&mut self, file: &Path, mode: &str) {
+        let hash = hash_image_path(file, mode);
+        if self.hashes.insert(hash) {
+            self.unsaved.push(hash);
+        }
+    }
+
     pub fn add_content(&mut self, hash: ContentHash, size: u64, mode: &'static str) {
-        if self.content.insert(hash) {
+        let flag = mode_flag(mode);
+        let flags = self.content.entry(hash).or_insert(0);
+        if *flags & flag == 0 {
+            *flags |= flag;
             self.sizes.insert(size);
             self.unsaved_content.push((hash, size, mode));
         }
@@ -132,7 +197,7 @@ impl History {
     pub fn clear(&mut self) {
         self.hashes = HashSet::new();
         self.unsaved = Vec::new();
-        self.content = HashSet::new();
+        self.content = HashMap::new();
         self.sizes = HashSet::new();
         self.unsaved_content = Vec::new();
         self.needs_rewrite = true;
@@ -197,6 +262,30 @@ pub fn import_batchviproc(old_dir: &Path, data_dir: &Path) {
     }
 }
 
+/// One-time import of imageopti's content history (same line format), so images it
+/// already optimized are recognised.
+pub fn import_imageopti(imageopti_dir: &Path, data_dir: &Path) {
+    let marker = data_dir.join("imageopti-imported");
+    let from = imageopti_dir.join("history-hashes.tsv");
+    if marker.exists() || !from.is_file() {
+        return;
+    }
+    let Ok(data) = std::fs::read_to_string(&from) else { return };
+    let lines: String = data
+        .lines()
+        .filter(|l| parse_content_line(l).is_some())
+        .flat_map(|l| [l, "\n"])
+        .collect();
+    let appended = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(data_dir.join("processed-content.tsv"))
+        .and_then(|mut f| f.write_all(lines.as_bytes()));
+    if appended.is_ok() {
+        let _ = std::fs::write(marker, "");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,7 +345,7 @@ mod tests {
     }
 
     #[test]
-    fn content_history_survives_reload_and_reads_imageopti_lines() {
+    fn content_history_modes_and_imageopti_lines() {
         let dir = temp("content");
         let file = dir.join("processedFiles.txt");
         // A line as imageopti writes it, plus junk that must be ignored.
@@ -267,34 +356,52 @@ mod tests {
         .unwrap();
         let mut h = History::load(file.clone());
         let img = parse_hex::<16>("e67a4fc97c7ac57455fe91c3a7a91279").unwrap();
-        assert!(h.contains_content(&img));
+        assert!(h.contains_content(&img, Want::ImageLossless));
+        assert!(!h.contains_content(&img, Want::ImageLossy), "lossless doesn't cover lossy");
         assert!(h.has_size(336_517));
 
         let vid = [7u8; 16];
         h.add_content(vid, 1234, VIDEO_MODE);
         h.add_content(vid, 1234, VIDEO_MODE); // duplicate: written once
+        h.add_content(img, 336_517, crate::image::mode(true));
         h.save().unwrap();
         let text = std::fs::read_to_string(dir.join("processed-content.tsv")).unwrap();
         assert_eq!(text.matches("\tvideo\n").count(), 1);
 
-        let reloaded = History::load(file);
-        assert!(reloaded.contains_content(&vid) && reloaded.contains_content(&img));
-        assert!(reloaded.has_size(1234) && !reloaded.has_size(1235));
+        let mut r = History::load(file);
+        assert!(r.contains_content(&vid, Want::Video));
+        assert!(r.contains_content(&img, Want::ImageLossy), "lossy pass survives reload");
+        assert!(r.has_size(1234) && !r.has_size(1235));
+
+        // Image location keys are per mode and don't collide with video keys.
+        let f = Path::new(r"C:\p\a.png");
+        r.add_image(f, crate::image::mode(false));
+        assert!(r.contains_image(f, false) && !r.contains_image(f, true) && !r.contains(f));
+        r.add_image(f, crate::image::mode(true));
+        assert!(r.contains_image(f, true));
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn imports_batchviproc_once() {
+    fn imports_batchviproc_and_imageopti_once() {
         let dir = temp("import");
-        let (old, new) = (dir.join("old"), dir.join("new"));
-        std::fs::create_dir_all(&old).unwrap();
-        std::fs::create_dir_all(&new).unwrap();
+        let (old, new, io) = (dir.join("old"), dir.join("new"), dir.join("imageopti"));
+        for d in [&old, &new, &io] {
+            std::fs::create_dir_all(d).unwrap();
+        }
         std::fs::write(old.join("processedFiles.txt"), "aa").unwrap();
         import_batchviproc(&old, &new);
         assert_eq!(std::fs::read_to_string(new.join("processedFiles.txt")).unwrap(), "aa");
         std::fs::write(old.join("processedFiles.txt"), "bb").unwrap();
         import_batchviproc(&old, &new); // never overwrites this app's own history
         assert_eq!(std::fs::read_to_string(new.join("processedFiles.txt")).unwrap(), "aa");
+
+        let line = "e67a4fc97c7ac57455fe91c3a7a91279\t336517\tlossy-normal-t93";
+        std::fs::write(io.join("history-hashes.tsv"), format!("{line}\njunk\n")).unwrap();
+        import_imageopti(&io, &new);
+        import_imageopti(&io, &new); // second call does nothing
+        let text = std::fs::read_to_string(new.join("processed-content.tsv")).unwrap();
+        assert_eq!(text, format!("{line}\n"));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

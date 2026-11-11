@@ -94,6 +94,17 @@ pub fn assign_to_kill_on_exit_job(child: &tokio::process::Child) {
     let _ = child;
 }
 
+/// Same as [`assign_to_kill_on_exit_job`] for a `std::process::Child` (image tools).
+pub fn assign_std_child_to_job(child: &std::process::Child) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        job::assign(child.as_raw_handle());
+    }
+    #[cfg(not(windows))]
+    let _ = child;
+}
+
 #[cfg(windows)]
 #[link(name = "ntdll", kind = "raw-dylib")]
 extern "system" {

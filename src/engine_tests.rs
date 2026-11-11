@@ -81,6 +81,7 @@ fn opts(encoder: &str, concurrency: f64) -> RawOptions {
         recycle: Some(false),
         gif_min_mb: Some(0),
         vmaf_floor: Some(0),
+        images: Some(0),
     }
 }
 
@@ -156,6 +157,7 @@ fn full_batch_handles_every_file_kind() {
     let history = std::fs::read_to_string(root.join("appdata").join("processedFiles.txt")).unwrap();
     assert!(history.lines().count() >= 6);
     let (engine2, _) = new_engine(&rt, &root, ff.clone());
+    engine2.apply_options(opts("av1_nvenc", 2.0)); // same settings as the run
     rt.block_on(engine2.load_dir(videos.clone()));
     assert_eq!(engine2.snapshot().pending_files, 0);
 
@@ -174,7 +176,7 @@ fn full_batch_handles_every_file_kind() {
     let logs3 = rec3.logs.lock().unwrap().join("\n");
     assert_eq!(s3.total_files, 3, "{logs3}");
     assert_eq!(s3.pending_files, 1, "only new.mp4 should be queued: {logs3}");
-    assert!(logs3.contains("2 moved, renamed or copied videos recognised"), "{logs3}");
+    assert!(logs3.contains("2 moved, renamed or copied files recognised"), "{logs3}");
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -409,6 +411,7 @@ fn historical_problem_files_are_handled() {
 
     // Everything is remembered: a second scan finds nothing new.
     let (engine2, _) = new_engine(&rt, &root, ff);
+    engine2.apply_options(opts("av1_nvenc", 2.0)); // same settings as the run
     rt.block_on(engine2.load_dir(videos));
     assert_eq!(engine2.snapshot().pending_files, 0, "{logs}");
 
@@ -508,5 +511,92 @@ fn quality_retry_accepts_only_above_the_vmaf_floor() {
     let leftovers: Vec<_> = walkdir::WalkDir::new(&root).into_iter().filter_map(Result::ok)
         .filter(|e| e.file_name().to_string_lossy().contains(".mediaopti.")).collect();
     assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn images_and_videos_in_one_batch() {
+    let Some(ff) = ffmpeg() else {
+        eprintln!("skipping: bundled ffmpeg not found");
+        return;
+    };
+    let tools = crate::image::tools::Tools::discover(ff.clone(), &std::env::temp_dir());
+    if !["oxipng", "jpegtran", "djpeg"].iter().all(|t| tools.has(t)) {
+        eprintln!("skipping: image tools not found");
+        return;
+    }
+    let root = test_dir("images");
+    let media = root.join("media");
+    std::fs::create_dir_all(media.join("fotos")).unwrap();
+    lossless_video(&ff, 2, "640x360", &media.join("clip.mp4"));
+    let png = media.join("fotos").join("Ação.png");
+    make(&ff, &["-f", "lavfi", "-i", "mandelbrot=s=640x480", "-frames:v", "1", "-compression_level", "1"], &png);
+    let jpg = media.join("photo.jpg");
+    make(&ff, &["-f", "lavfi", "-i", "testsrc2=s=800x600", "-frames:v", "1", "-q:v", "1"], &jpg);
+    let linked = media.join("linked.png");
+    std::fs::copy(&png, &linked).unwrap();
+    std::fs::hard_link(&linked, root.join("other-name.png")).unwrap();
+    // Old date + read-only, like files from a phone backup.
+    let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_577_836_800);
+    std::fs::File::options().write(true).open(&jpg).unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(old)).unwrap();
+    let mut perms = std::fs::metadata(&jpg).unwrap().permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(&jpg, perms).unwrap();
+    let (png_before, jpg_before, linked_before) = (
+        std::fs::metadata(&png).unwrap().len(),
+        std::fs::metadata(&jpg).unwrap().len(),
+        std::fs::metadata(&linked).unwrap().len(),
+    );
+
+    let rt = runtime();
+    let (engine, rec) = new_engine(&rt, &root, ff.clone());
+    let raw = || RawOptions { images: Some(1), ..opts("av1_nvenc", 1.0) };
+    rt.block_on(async {
+        engine.apply_options(raw());
+        engine.load_dir(media.clone()).await;
+        let s = engine.snapshot();
+        assert_eq!(s.pending_files, 4, "1 video + 3 images");
+        engine.clone().run_batch(raw()).await;
+    });
+    let logs = rec.logs.lock().unwrap().join("\n");
+    println!("{logs}");
+    let s = engine.snapshot();
+    assert_eq!(s.images_total_this_run, 3, "{logs}");
+    assert_eq!(s.images_done_this_run, 3, "{logs}");
+    assert_eq!(s.compressed_this_run, 3, "video + PNG + JPEG: {logs}");
+    assert!(std::fs::metadata(&png).unwrap().len() < png_before, "{logs}");
+    let jpg_meta = std::fs::metadata(&jpg).unwrap();
+    assert!(jpg_meta.len() < jpg_before, "{logs}");
+    assert_eq!(jpg_meta.modified().unwrap(), old, "date not kept");
+    assert!(jpg_meta.permissions().readonly(), "read-only flag not kept");
+    assert_eq!(std::fs::metadata(&linked).unwrap().len(), linked_before, "hard link must be left alone");
+    assert!(logs.contains("Skipped linked.png: it is a hard link"), "{logs}");
+    let leftovers: Vec<_> = walkdir::WalkDir::new(&media).into_iter().filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().contains(".mediaopti.")).collect();
+    assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
+
+    // Same settings, fresh engine: only the hard-linked image is still pending.
+    let (engine2, _) = new_engine(&rt, &root, ff.clone());
+    engine2.apply_options(raw());
+    rt.block_on(engine2.load_dir(media.clone()));
+    assert_eq!(engine2.snapshot().pending_files, 1, "{logs}");
+
+    // Lossless history doesn't cover a lossy run: the optimized images are queued again.
+    let (engine3, _) = new_engine(&rt, &root, ff.clone());
+    engine3.apply_options(RawOptions { images: Some(2), ..opts("av1_nvenc", 1.0) });
+    rt.block_on(engine3.load_dir(media));
+    assert_eq!(engine3.snapshot().pending_files, 3);
+
+    // A moved image is recognised by content.
+    let moved = root.join("moved");
+    std::fs::create_dir_all(&moved).unwrap();
+    std::fs::rename(&png, moved.join("renamed.png")).unwrap();
+    let (engine4, rec4) = new_engine(&rt, &root, ff);
+    engine4.apply_options(raw());
+    rt.block_on(engine4.load_dir(moved));
+    let logs4 = rec4.logs.lock().unwrap().join("\n");
+    assert_eq!(engine4.snapshot().pending_files, 0, "{logs4}");
+    assert!(logs4.contains("1 moved, renamed or copied files recognised"), "{logs4}");
     let _ = std::fs::remove_dir_all(&root);
 }

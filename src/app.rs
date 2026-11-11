@@ -52,6 +52,11 @@ const GIFS: &[(u32, &str)] = &[
     (0, "All animated GIFs to video"),
     (NO_GIFS, "Keep all GIFs as GIF"),
 ];
+const IMAGES: &[(u32, &str)] = &[
+    (2, "Visually lossless (SSIMULACRA2 ≥ 93)"),
+    (1, "Lossless only (pixel-identical)"),
+    (0, "Don't process images"),
+];
 const QUALITY_CHECK: &[(u32, &str)] = &[
     (93, "VMAF 93 (recommended)"),
     (95, "VMAF 95 (stricter)"),
@@ -72,6 +77,7 @@ struct Prefs {
     recycle: bool,
     gif_min_mb: u32,
     vmaf_floor: u32,
+    images: u32,
 }
 
 impl Default for Prefs {
@@ -84,6 +90,7 @@ impl Default for Prefs {
             recycle: true,
             gif_min_mb: 1,
             vmaf_floor: 93,
+            images: 2,
         }
     }
 }
@@ -119,6 +126,7 @@ impl Prefs {
             recycle: ORIGINALS[pick(w.get_originals_index(), ORIGINALS.len())].0,
             gif_min_mb: GIFS[pick(w.get_gifs_index(), GIFS.len())].0,
             vmaf_floor: QUALITY_CHECK[pick(w.get_check_index(), QUALITY_CHECK.len())].0,
+            images: IMAGES[pick(w.get_images_index(), IMAGES.len())].0,
         }
     }
 
@@ -133,6 +141,7 @@ impl Prefs {
         w.set_originals_index(position(ORIGINALS, &self.recycle, &d.recycle));
         w.set_gifs_index(position(GIFS, &self.gif_min_mb, &d.gif_min_mb));
         w.set_check_index(position(QUALITY_CHECK, &self.vmaf_floor, &d.vmaf_floor));
+        w.set_images_index(position(IMAGES, &self.images, &d.images));
     }
 
     fn to_raw(&self) -> RawOptions {
@@ -144,6 +153,7 @@ impl Prefs {
             recycle: Some(self.recycle),
             gif_min_mb: Some(self.gif_min_mb),
             vmaf_floor: Some(self.vmaf_floor),
+            images: Some(self.images),
         }
     }
 }
@@ -308,11 +318,11 @@ impl Controller {
         let has_run = s.run_total > 0 || s.completed_this_run > 0;
         let has_logs = self.log_model.row_count() > 0;
 
-        // A scanned folder without videos has nothing to start: not "Ready".
+        // A scanned folder without media has nothing to start: not "Ready".
         let empty_folder = s.status == Status::Ready && s.total_files == 0;
         if empty_folder {
             w.set_status("idle".into());
-            w.set_status_label("No videos".into());
+            w.set_status_label("Nothing to do".into());
         } else {
             w.set_status(status_key(s.status).into());
             w.set_status_label(status_label(s.status).into());
@@ -327,7 +337,7 @@ impl Controller {
         w.set_folder_summary(if has_folder || s.status == Status::Scanning {
             file_count_text(s).into()
         } else {
-            "Choose a folder to scan it for videos, including subfolders.".into()
+            "Choose a folder to scan it for videos and images, including subfolders.".into()
         });
         w.set_busy(busy);
         w.set_processing(processing);
@@ -407,7 +417,7 @@ impl Controller {
             _ => "mediaopti".to_string(),
         }
         .into());
-        let workers = if processing {
+        let mut workers: Vec<WorkerRow> = if processing {
             t.workers
                 .iter()
                 .map(|wk| WorkerRow {
@@ -424,6 +434,14 @@ impl Controller {
         } else {
             Vec::new()
         };
+        if processing && s.images_total_this_run > 0 {
+            let total = s.images_total_this_run.max(1);
+            workers.push(WorkerRow {
+                title: format!("Images · {} of {}", group_thousands(s.images_done_this_run), group_thousands(total)).into(),
+                meta: format!("{} CPU workers busy", s.images_active).into(),
+                progress: s.images_done_this_run as f32 / total as f32,
+            });
+        }
         sync_model(&self.worker_model, workers);
 
         // Taskbar button progress
@@ -525,6 +543,7 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
     window.set_originals_options(labels(ORIGINALS));
     window.set_gifs_options(labels(GIFS));
     window.set_check_options(labels(QUALITY_CHECK));
+    window.set_images_options(labels(IMAGES));
     let prefs = Prefs::load(&prefs_path);
     prefs.apply_to_window(&window);
     engine.apply_options(prefs.to_raw());
@@ -560,7 +579,7 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
             let Some(w) = weak.upgrade() else { return };
             let handle = w.window().window_handle();
             let picked = rfd::FileDialog::new()
-                .set_title("Choose a folder with videos")
+                .set_title("Choose a folder with videos and images")
                 .set_parent(&handle)
                 .pick_folder();
             match picked {
@@ -727,10 +746,10 @@ fn file_count_text(s: &StateDto) -> String {
         return "Scanning folder…".into();
     }
     if s.total_files == 0 {
-        return "No videos in this folder or its subfolders. Choose another folder.".into();
+        return "No videos or images in this folder or its subfolders. Choose another folder.".into();
     }
     let mut parts = vec![
-        plural(s.total_files, "video found", "videos found"),
+        plural(s.total_files, "file found", "files found"),
         format!("{} ready", group_thousands(s.pending_files)),
     ];
     if s.skipped_known > 0 {

@@ -33,6 +33,16 @@ const ALLOWED_GIF_MIN_MB: &[u32] = &[0, 1, 5, NO_GIFS];
 /// VMAF floors for the quality-checked fallback; 0 turns it off.
 const ALLOWED_VMAF_FLOOR: &[u32] = &[0, 93, 95];
 
+/// How images (PNG, JPEG, small GIFs) are optimized.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageMode {
+    Off,
+    /// Pixel-identical only.
+    Lossless,
+    /// Also lossy, at the lowest quality that keeps SSIMULACRA2 >= 93.
+    Lossy,
+}
+
 #[derive(Clone, Debug)]
 pub struct Options {
     pub crf: u32,
@@ -48,6 +58,7 @@ pub struct Options {
     pub vmaf_floor: Option<f64>,
     /// Added to the CQ/CRF for the quality-checked retry (0 for the normal encode).
     pub cq_boost: u32,
+    pub images: ImageMode,
 }
 
 impl Default for Options {
@@ -61,6 +72,7 @@ impl Default for Options {
             gif_min_bytes: 1024 * 1024,
             vmaf_floor: Some(93.0),
             cq_boost: 0,
+            images: ImageMode::Lossy,
         }
     }
 }
@@ -75,6 +87,8 @@ pub struct RawOptions {
     pub recycle: Option<bool>,
     pub gif_min_mb: Option<u32>,
     pub vmaf_floor: Option<u32>,
+    /// 0 = off, 1 = lossless, 2 = lossy (visually lossless).
+    pub images: Option<u32>,
 }
 
 impl Options {
@@ -107,6 +121,12 @@ impl Options {
             gif_min_bytes,
             vmaf_floor,
             cq_boost: 0,
+            images: match raw.images {
+                Some(0) => ImageMode::Off,
+                Some(1) => ImageMode::Lossless,
+                Some(2) => ImageMode::Lossy,
+                _ => d.images,
+            },
         }
     }
 }
@@ -296,7 +316,9 @@ mod tests {
             recycle: None,
             gif_min_mb: Some(3),
             vmaf_floor: Some(50),
+            images: Some(7),
         });
+        assert_eq!(o.images, ImageMode::Lossy, "images: visually lossless by default");
         assert_eq!(o.crf, 23);
         assert_eq!(o.preset, "slow");
         assert_eq!(o.encoder, "av1_nvenc");

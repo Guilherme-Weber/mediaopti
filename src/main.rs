@@ -7,6 +7,7 @@ mod engine;
 #[cfg(test)]
 mod engine_tests;
 mod history;
+mod image;
 mod logfile;
 mod progress;
 mod system;
@@ -19,6 +20,8 @@ fn main() -> Result<(), slint::PlatformError> {
     logfile::install_panic_hook(data_dir.join("logs"));
     // mediaopti replaces batchviproc: carry its processed history and settings over once.
     history::import_batchviproc(&appdata.join("batchviproc"), &data_dir);
+    // ...and imageopti's content history, so images it already optimized are recognised.
+    history::import_imageopti(&appdata.join("imageopti"), &data_dir);
 
     // Two instances would append to the same history and fight over the same files.
     let Some(_instance) = system::SingleInstance::acquire(r"Local\mediaopti-single-instance") else {

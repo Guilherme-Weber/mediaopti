@@ -9,7 +9,7 @@ mediaopti merges two tools:
 - [batchviproc](https://github.com/Guilherme-Weber/batchviproc) (videos and animated GIFs);
 - imageopti (images, audio cover art, PDFs, and Office/EPUB/comic files).
 
-The video part works today. The image, audio, and document parts are still being ported (see
+Videos and images work today. Audio and documents are still being ported (see
 [Roadmap](#roadmap)); until then, imageopti covers them.
 
 ## Origin
@@ -70,6 +70,52 @@ New in mediaopti:
   - A file that changes while it is being encoded (still downloading, synced, edited) is left
     unchanged.
 
+## Images
+
+PNG, JPEG, and GIFs under the size limit are optimized by a separate pool of CPU workers
+(cores − 2), running next to the GPU video encodes. This is the imageopti pipeline, ported:
+
+- **PNG:** beeim (pingo if beeim is missing) → oxipng. beeim drops colour profiles and text chunks;
+  mediaopti copies them back from the original.
+- **JPEG:** jpegtran (mozjpeg) → ECT.
+- **GIF:** gifsicle.
+
+Every lossless step must decode to the same pixels: djpeg for JPEG, ffmpeg frame hashes for
+PNG/GIF. Only the colour hidden under fully transparent pixels may change. The colour profile,
+EXIF rotation, and metadata must survive.
+
+The **Images** setting chooses:
+
+- **Visually lossless** (default): also tries lossy encoders (beeim's quantizer for PNG; jpegli,
+  mozjpeg, and pingo for JPEG). It uses the lowest quality that keeps a
+  [SSIMULACRA2](https://github.com/cloudinary/ssimulacra2) score of at least 93, the level of
+  pingo/Pinga at quality 100. A lossy result must be at least 3% smaller than the lossless one.
+  JPEGs saved below quality 90 are not re-encoded, because they can't get smaller at that score.
+  One probe skips images that were already optimized.
+- **Lossless only:** pixel-identical results only.
+- **Don't process images.**
+
+An image is replaced only if the result is at least 0.5% smaller. Hard links, the "changed meanwhile"
+check, the Recycle Bin, dates, and attributes work as for videos. On imageopti's test images,
+mediaopti produced the same results, for example Kodak PNG −26.4% and a quality-97 JPEG −28.0%.
+
+The optimizers are external programs. Install them with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/fetch-tools.ps1
+```
+
+This installs the open-source ones with [Scoop](https://scoop.sh) (found on PATH). It downloads
+cjpegli from libjxl 0.11.2, and pingo and beeim from css-ig.net. pingo and beeim are free for
+private use and may not be redistributed, so they are never bundled. mediaopti looks for the tools
+in `%APPDATA%\mediaopti	ools.json` (`{"pingo": "C:\path\pingo.exe"}`), a `tools` folder next
+to `mediaopti.exe`, the project's `bin` folder, and PATH. Missing tools are skipped. The tools found
+are listed in the log when a batch with images starts.
+
+The Recycle Bin handles about 25–30 files per second. For a very large image library that becomes
+the bottleneck, and the bin's size limit means only the most recent originals stay restorable.
+Consider *Delete permanently* for such runs.
+
 ## Requirements
 
 - Windows 10 or 11 (64-bit).
@@ -97,7 +143,9 @@ All data is stored in `%APPDATA%\mediaopti`:
 - `processedFiles.txt`: the processed history by location (SHA-256 of each path). It has the same
   format as batchviproc.
 - `processed-content.tsv`: the processed history by content (`hash`, `size`, `mode` per line). It
-  has the same format as imageopti's `history-hashes.tsv`.
+  has the same format as imageopti's `history-hashes.tsv`, and imageopti's history is imported once.
+  Images are remembered per mode: a lossless pass doesn't stop a later lossy one, and an image that
+  had a lossy pass is never lossily re-encoded again.
 - `ui-settings.json`: the last settings.
 - `logs\mediaopti.log`: the activity log, rotated at 5 MB.
 - `logs\crash-*.txt`: crash reports, written only if the application fails.
@@ -106,12 +154,12 @@ All data is stored in `%APPDATA%\mediaopti`:
 
 1. Done: rename, the batchviproc import, content-hash history, the Recycle Bin, safety checks, the
    GIF size limit, and the VMAF-checked retry.
-2. Images: PNG/JPEG/GIF with the imageopti chains (beeim, pingo, oxipng, ECT, jpegtran, jpegli,
-   gifsicle). Every step is verified, with optional lossy encoding at SSIMULACRA2 ≥ 93. This runs
-   in a separate CPU worker pool, so images and GPU video encodes don't block each other.
+2. Done: images (PNG/JPEG/small GIFs) in a CPU worker pool, the imageopti import, and per-mode
+   image history.
 3. Audio and documents: cover art in FLAC/MP3, FLAC/Ogg repacking, WAV → FLAC, PDF/Office/EPUB/CBZ,
    and the BMP/TGA/CBR conversions.
-4. A one-time import of imageopti's history.
+4. A faster option than the Recycle Bin for huge image runs (for example a backup folder on the same
+   drive).
 
 ## Development
 
@@ -128,7 +176,9 @@ cargo run
 Project layout:
 
 - `src/engine.rs`: queue, workers, fallbacks, the quality retry, pause, and memory control.
-- `src/history.rs`: the location and content histories, and the batchviproc import.
+- `src/history.rs`: the location and content histories, and the batchviproc and imageopti imports.
+- `src/image/`: the image pipeline (chains, verification, lossy search, PNG/JPEG parsing, tool runner).
+- `src/engine_images.rs`: the CPU image workers.
 - `src/args.rs`: FFmpeg arguments.
 - `src/system.rs`: Windows integration (Recycle Bin, hard links, job objects, attributes).
 - `src/app.rs`: the bridge between the engine and the interface.
