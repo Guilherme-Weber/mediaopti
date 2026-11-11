@@ -60,7 +60,8 @@ impl From<zip::result::ZipError> for Error {
     }
 }
 
-/// Image pipeline settings for the pictures inside: documents never lossy, comics as set.
+/// Image pipeline settings for the pictures inside: documents never lossy and with strict
+/// alpha, comics as set.
 fn inner_ctx(ctx: &Ctx, kind: Kind) -> Ctx {
     Ctx {
         tools: ctx.tools.clone(),
@@ -68,7 +69,9 @@ fn inner_ctx(ctx: &Ctx, kind: Kind) -> Ctx {
         target: ctx.target,
         lossy_min_gain: ctx.lossy_min_gain,
         strip: ctx.strip,
-        strict_alpha: ctx.strict_alpha,
+        // Documents keep every pixel, even fully transparent ones (invisible, but their
+        // colours are content: an editor could change the alpha later).
+        strict_alpha: ctx.strict_alpha || kind == Kind::Doc,
         parallel: ctx.parallel,
         timeout: ctx.timeout,
         cancel: ctx.cancel.clone(),

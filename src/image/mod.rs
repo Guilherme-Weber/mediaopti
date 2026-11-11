@@ -335,9 +335,14 @@ fn png_chain<'a>(ctx: &'a Ctx, work: &Path, src: &Path, restore_from: &Path, ver
         let _ = png::restore_chunks(restore_from, p, strip);
     };
     let mut check = |p: &Path| ver.ok(p);
-    if ctx.tools.has("beeim") && !apng {
+    let use_beeim = ctx.tools.has("beeim") && !apng;
+    if use_beeim {
         c.inplace("beeim", "beeim", |o| crate::os_args!["-sl=5", "-force", o], &mut check, Some(&repair))?;
-    } else {
+    }
+    // beeim recolours fully transparent pixels, which strict alpha rejects: pingo -noalpha
+    // keeps them, so it is tried too on images with alpha.
+    let alpha_img = ver.png.as_ref().is_some_and(png::PngInfo::has_alpha);
+    if !use_beeim || (ctx.strict_alpha && alpha_img) {
         let alpha = if ctx.strict_alpha { "-noalpha" } else { "-quiet" };
         c.inplace("pingo", "pingo", |o| crate::os_args!["-s4", "-lossless", "-quiet", "-nostrip", alpha, o], &mut check, Some(&repair))?;
     }
