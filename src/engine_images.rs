@@ -12,6 +12,11 @@ use crate::{args, system};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
+
+/// Free commit (RAM + page file) an image worker needs before starting another file. When the
+/// machine runs out of commit, allocations fail and processes (this app included) abort.
+const IMAGE_MIN_FREE_COMMIT: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Log a progress line every this many images (one line per image would flood the log).
 const PROGRESS_EVERY: usize = 250;
@@ -50,10 +55,81 @@ impl Inner {
 }
 
 impl Engine {
+    /// Settings for the image pipeline under the current options.
+    pub(super) fn image_ctx(&self, options: &crate::args::Options, parallel: bool, cancel: tokio_util::sync::CancellationToken) -> image::Ctx {
+        image::Ctx {
+            tools: self.image_tools.clone(),
+            lossy: options.images == crate::args::ImageMode::Lossy,
+            target: 93.0,
+            lossy_min_gain: 0.03,
+            strip: false,
+            strict_alpha: false,
+            parallel,
+            timeout: std::time::Duration::from_secs(900),
+            cancel,
+        }
+    }
+
+    /// A big GIF whose video wasn't smaller: optimize it as a GIF instead (from a video
+    /// worker, so it counts as that worker's file).
+    pub(super) async fn gif_as_image(self: &Arc<Self>, worker_id: u32, input: &Path, display: &str) -> super::Outcome {
+        let (ctx, disposal, lossy) = {
+            let inner = self.lock();
+            (
+                Arc::new(self.image_ctx(&inner.options, true, inner.cancel.clone())),
+                inner.disposal_for(input),
+                inner.images_lossy(),
+            )
+        };
+        self.reset_worker(worker_id, format!("{display} (optimizing as GIF)"));
+        self.send_state(false);
+        let p = input.to_path_buf();
+        // Video worker ids are 1-4; image-temp names use a separate range.
+        let result = self.blocking(move || process_image(&ctx, &p, worker_id + 100, &disposal)).await;
+        self.lock().workers.remove(&worker_id);
+        let outcome = match &result {
+            ImageResult::Stopped => super::Outcome::Stopped,
+            ImageResult::Failed(_) => super::Outcome::Failed,
+            ImageResult::Smaller { before, after, .. } => {
+                self.log(format!(
+                    "[Worker {worker_id}] {display} stays a GIF: {:.0}% smaller as an image",
+                    100.0 * (before - after) as f64 / *before as f64
+                ));
+                super::Outcome::Processed
+            }
+            _ => super::Outcome::Skipped,
+        };
+        // Recorded like any finished image (history, savings, log). The video attempt already
+        // counted this file as completed, so that count is taken back.
+        {
+            let mut inner = self.lock();
+            inner.images_active += 1; // finish_image decrements it
+            inner.run.images_total += 1;
+            inner.run.completed = inner.run.completed.saturating_sub(1);
+        }
+        self.finish_image(input, lossy, result);
+        outcome
+    }
+
+    /// Waits until starting another image is safe for memory. One image worker always may
+    /// run (so a low-memory machine still makes progress). Returns false on Stop.
+    async fn wait_for_image_memory(&self, cancel: &tokio_util::sync::CancellationToken) -> bool {
+        loop {
+            let busy = self.lock().images_active;
+            if busy == 0 || system::memory_status().is_none_or(|m| m.available_commit >= IMAGE_MIN_FREE_COMMIT) {
+                return true;
+            }
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(1)) => {}
+                () = cancel.cancelled() => return false,
+            }
+        }
+    }
+
     pub(super) async fn run_image_worker(self: Arc<Self>, worker_id: u32, ctx: Arc<image::Ctx>) {
         loop {
             let cancel = self.lock().cancel.clone();
-            if !self.wait_while_paused(&cancel).await {
+            if !self.wait_while_paused(&cancel).await || !self.wait_for_image_memory(&cancel).await {
                 break;
             }
             let (path, lossy, disposal) = {

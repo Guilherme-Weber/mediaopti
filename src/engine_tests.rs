@@ -700,3 +700,44 @@ fn originals_go_to_a_mirrored_backup_folder() {
     assert_eq!(engine2.snapshot().total_files, 2, "the backup folder must be excluded");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Real run, in place, on a folder of copies: `MEDIAOPTI_REAL_DIR=<folder>
+/// MEDIAOPTI_REAL_DATA=<history folder> cargo test --release real_folder_run -- --ignored
+/// --nocapture`. Originals go to "<folder> (originals)". Never point it at real files.
+#[test]
+#[ignore = "real run on a folder of copies (MEDIAOPTI_REAL_DIR)"]
+fn real_folder_run() {
+    let (Some(ff), Ok(dir), Ok(data)) = (ffmpeg(), std::env::var("MEDIAOPTI_REAL_DIR"), std::env::var("MEDIAOPTI_REAL_DATA")) else {
+        return;
+    };
+    let rt = runtime();
+    let rec = Arc::new(Recorder::default());
+    let engine = Engine::new(Box::new(RecorderUi(rec.clone())), Path::new(&data), ff, rt.handle().clone());
+    // The author's batchviproc settings (AV1, quality 20) and mediaopti's defaults otherwise.
+    let raw = || RawOptions {
+        crf: Some(20.0),
+        preset: Some("slow".into()),
+        encoder: Some("av1_nvenc".into()),
+        concurrency: Some(2.0),
+        originals: Some(2),
+        backup_dir: None,
+        gif_min_mb: Some(1),
+        vmaf_floor: Some(93),
+        images: Some(2),
+    };
+    let t = std::time::Instant::now();
+    rt.block_on(async {
+        engine.apply_options(raw());
+        engine.load_dir(PathBuf::from(&dir)).await;
+        engine.clone().run_batch(raw()).await;
+    });
+    for line in rec.logs.lock().unwrap().iter() {
+        println!("{line}");
+    }
+    let s = engine.snapshot();
+    println!(
+        "== {:.0}s | done {} (images {}) | smaller {} | kept {} | failed {} | saved {} MB",
+        t.elapsed().as_secs_f64(), s.completed_this_run, s.images_done_this_run,
+        s.compressed_this_run, s.skipped_larger_this_run, s.failed_this_run, s.space_saved_mb
+    );
+}

@@ -831,20 +831,12 @@ impl Engine {
             }
         }
         if images > 0 {
-            // Leave some CPU for the video encoders' decoding and the desktop.
+            // Leave some CPU for the desktop, and half of the rest for the video encoders'
+            // decoding (and their memory) while there are videos to encode.
             let cores = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
-            let workers = cores.saturating_sub(2).clamp(1, images);
-            let ctx = Arc::new(image::Ctx {
-                tools: self.image_tools.clone(),
-                lossy: options.images == ImageMode::Lossy,
-                target: 93.0,
-                lossy_min_gain: 0.03,
-                strip: false,
-                strict_alpha: false,
-                parallel: workers > 1,
-                timeout: Duration::from_secs(900),
-                cancel,
-            });
+            let spare = cores.saturating_sub(2);
+            let workers = if videos > 0 { spare / 2 } else { spare }.clamp(1, images);
+            let ctx = Arc::new(self.image_ctx(&options, workers > 1, cancel));
             self.log(format!(
                 "Starting {images} images | {} | {workers} CPU workers",
                 if ctx.lossy { "visually lossless (SSIMULACRA2 >= 93)" } else { "lossless" }
@@ -1377,12 +1369,17 @@ impl Engine {
                     ));
                 }
                 Retry::Rejected(reason) => {
-                    self.remember(&input, &input).await;
-                    self.lock().run.skipped_larger += 1;
                     self.log_remove(&tmp);
                     self.log(format!(
-                        "[Worker {worker_id}] Output was not smaller for {display}; kept the original file ({reason})"
+                        "[Worker {worker_id}] Video was not smaller for {display}; kept the original file ({reason})"
                     ));
+                    // A GIF that doesn't make a smaller video stays a GIF, but is still
+                    // optimized as an image (e.g. slideshow-like "process" GIFs).
+                    if args::is_gif(&input) && self.lock().options.images != ImageMode::Off {
+                        return self.gif_as_image(worker_id, &input, &display).await;
+                    }
+                    self.remember(&input, &input).await;
+                    self.lock().run.skipped_larger += 1;
                     self.send_state(false);
                     return Outcome::Skipped;
                 }
@@ -1558,13 +1555,38 @@ impl Engine {
             }
             self.reset_worker(worker_id, format!("{display} (measuring quality at +{boost})"));
             self.send_state(false);
-            let measured = match self.measure_vmaf(input, tmp, duration_sec).await {
+            let mut measured = match self.measure_vmaf(input, tmp, duration_sec, None).await {
                 Err(Stopped) => {
                     self.log_remove(&keep);
                     return Retry::Stopped;
                 }
                 Ok(m) => m,
             };
+            // libvmaf fails to allocate when memory is tight (parallel 4K encodes): wait for
+            // free memory and measure once more on fewer threads.
+            if measured.as_ref().is_err_and(|e| e.contains("alloc")) {
+                self.log(format!("[Worker {worker_id}] {display}: not enough memory to measure quality; waiting to retry"));
+                let cancel = self.lock().cancel.clone();
+                for _ in 0..60 {
+                    if system::memory_status().is_none_or(|m| m.available_commit >= 4 << 30) {
+                        break;
+                    }
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                        _ = cancel.cancelled() => {
+                            self.log_remove(&keep);
+                            return Retry::Stopped;
+                        }
+                    }
+                }
+                measured = match self.measure_vmaf(input, tmp, duration_sec, Some(2)).await {
+                    Err(Stopped) => {
+                        self.log_remove(&keep);
+                        return Retry::Stopped;
+                    }
+                    Ok(m) => m,
+                };
+            }
             match measured {
                 Ok((vmaf, worst)) if vmaf >= floor && worst >= floor - 5.0 => {
                     if let Err(err) = system::remove_file_if_exists(&keep).and_then(|()| std::fs::rename(tmp, &keep)) {
@@ -1611,6 +1633,7 @@ impl Engine {
         original: &Path,
         encoded: &Path,
         duration_sec: f64,
+        threads: Option<usize>,
     ) -> Result<Result<(f64, f64), String>, Stopped> {
         let cancel = self.lock().cancel.clone();
         let windows: Vec<(f64, f64)> = if duration_sec > 30.0 {
@@ -1618,7 +1641,7 @@ impl Engine {
         } else {
             vec![(0.0, 0.0)] // whole video
         };
-        let threads = std::thread::available_parallelism().map_or(4, |n| (n.get() / 2).max(1));
+        let threads = threads.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| (n.get() / 2).max(1)));
         let log_dir = std::env::temp_dir();
         // Unique per measurement; only [A-Za-z0-9-.] so it is safe inside the filter graph.
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1641,10 +1664,13 @@ impl Engine {
             a.extend(["-i".into(), original.to_string_lossy().into_owned()]);
             a.extend([
                 "-lavfi".into(),
+                // Both sides are brought to at most 1080p (same pixel count, aspect kept): the
+                // VMAF model is made for 1080p viewing, and 4K measurements can exhaust memory.
                 format!(
-                    "[0:v:0]setpts=PTS-STARTPTS,format=yuv420p10le[d];\
-                     [1:v:0]scale=max(2\\,trunc(iw/2)*2):max(2\\,trunc(ih/2)*2),setpts=PTS-STARTPTS,format=yuv420p10le[r];\
-                     [d][r]libvmaf=shortest=1:n_subsample=2:n_threads={threads}:log_fmt=json:log_path={log_name}"
+                    "[0:v:0]setpts=PTS-STARTPTS,{fit},format=yuv420p10le[d];\
+                     [1:v:0]scale=max(2\\,trunc(iw/2)*2):max(2\\,trunc(ih/2)*2),setpts=PTS-STARTPTS,{fit},format=yuv420p10le[r];\
+                     [d][r]libvmaf=shortest=1:n_subsample=2:n_threads={threads}:log_fmt=json:log_path={log_name}",
+                    fit = VMAF_FIT
                 ),
                 "-f".into(),
                 "null".into(),
@@ -1901,6 +1927,9 @@ impl Engine {
         Attempt { status, diag }
     }
 }
+
+/// Scales a video down to at most 1920x1080 worth of pixels (never up), even dimensions.
+const VMAF_FIT: &str = "scale=w='trunc(iw*min(1\\,sqrt(2073600/(iw*ih)))/2)*2':h='trunc(ih*min(1\\,sqrt(2073600/(iw*ih)))/2)*2':flags=bicubic";
 
 /// Outcome of the quality-checked retry.
 enum Retry {

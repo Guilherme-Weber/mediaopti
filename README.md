@@ -50,21 +50,34 @@ New in mediaopti:
     against the original stays at or above the floor, with the worst 5% of frames at least 5 below
     it.
   - It keeps climbing while quality holds, and uses the strongest step that passes.
-  - Quality is measured on three 8-second windows, or the whole video if it is short.
+  - Quality is measured on three 8-second windows, or the whole video if it is short, at no more
+    than 1080p (the resolution the VMAF model is made for). If libvmaf runs out of memory, for
+    example next to two 4K encodes, it waits for free memory and measures again on fewer threads.
   - These are the videos batchviproc used to leave untouched. On a test of 30 of them, 21 shrank at
     VMAF ≥ 93, to 66% of their size overall. At the preset, they scored VMAF 95–100 but came out
     bigger than the original.
-- **Recycle Bin.** Replaced originals go to the Recycle Bin by default, so you can restore them.
-  - If Windows can't recycle a file, it asks instead of deleting it, and nothing is changed if
-    recycling fails.
-  - The other choice is *Delete permanently*.
-  - When the Recycle Bin is full, Windows silently drops its *oldest* items. On a very large run,
-    only the most recent originals stay restorable.
+- **Replaced originals** (setting), with three choices:
+  - **Move to the Recycle Bin** (default), so you can restore them. If Windows can't recycle a
+    file, it asks instead of deleting it, and nothing is changed if recycling fails. When the
+    Recycle Bin is full, Windows silently drops its *oldest* items, and it handles only about 25–30
+    files per second.
+  - **Move to a backup folder.** Originals move into a folder that mirrors the scanned folder's
+    structure. By default it sits next to the scanned folder, as `<folder> (originals)`, so
+    scanning `F:\USER\Pictures` fills `F:\USER\Pictures (originals)\...`; you can choose another
+    folder. On the same drive this is an instant rename with no size limit, which makes it the best
+    choice for big image runs. An existing backup is never overwritten (the new one is named
+    `name (2).ext`), and a backup folder inside the scanned folder is never scanned.
+  - **Delete permanently.**
 - **Content-hash history.** Finished files are also remembered by a BLAKE2b hash of their content,
   so a video that was moved, renamed, or copied is not encoded again. Only files whose size matches
   a processed one are hashed, so the check is almost free.
-- **Animated GIFs** under a size limit (default 1 MB) stay GIFs, to be optimized as images. Bigger
-  ones become video, as before.
+- **GIFs:**
+  - Animated GIFs under a size limit (default 1 MB) stay GIFs and are optimized as images.
+  - Bigger ones become video, as before.
+  - If the video isn't smaller, the GIF stays a GIF and is still optimized as an image. This
+    happens with slideshow-like "process" GIFs, where the encoder can't save anything on a few
+    frames.
+  - Still (single-frame) GIFs of any size are always images.
 - **Safety checks:**
   - Hard-linked files are skipped, because replacing one would split it from its other names.
   - A file that changes while it is being encoded (still downloading, synced, edited) is left
@@ -112,9 +125,9 @@ in `%APPDATA%\mediaopti\tools.json` (`{"pingo": "C:\\path\\pingo.exe"}`), a `too
 to `mediaopti.exe`, the project's `bin` folder, and PATH. Missing tools are skipped. The tools found
 are listed in the log when a batch with images starts.
 
-The Recycle Bin handles about 25–30 files per second. For a very large image library that becomes
-the bottleneck, and the bin's size limit means only the most recent originals stay restorable.
-Consider *Delete permanently* for such runs.
+For a very large image library, choose *Move to a backup folder* (or *Delete permanently*). The
+Recycle Bin handles only about 25–30 files per second and keeps only the most recent originals once
+it is full.
 
 ## Requirements
 
