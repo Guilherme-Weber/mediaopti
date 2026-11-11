@@ -728,6 +728,7 @@ mod tests {
             lossy_min_gain: 0.03,
             strip: false,
             strict_alpha: false,
+            lossy_docs: false,
             parallel: false,
             timeout: Duration::from_secs(120),
             cancel: CancellationToken::new(),

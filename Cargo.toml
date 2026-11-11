@@ -8,6 +8,7 @@ edition = "2021"
 [dependencies]
 blake2 = "0.10"
 crc32fast = "1.5"
+flate2 = "1"
 hex = "0.4.3"
 raw-window-handle = "0.6"
 regex = "1.13.1"

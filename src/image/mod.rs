@@ -44,6 +44,8 @@ pub enum Kind {
     Cbz,
     /// Comic book archive (RAR), converted to CBZ when conversions are on.
     Cbr,
+    /// PDF: qpdf rewrite, images optimized (see [`crate::pdf`]).
+    Pdf,
 }
 
 impl Kind {
@@ -77,6 +79,7 @@ pub fn kind_of(path: &Path) -> Option<Kind> {
         "docx" | "xlsx" | "pptx" | "docm" | "xlsm" | "pptm" | "odt" | "ods" | "odp" | "odg" | "epub" => Some(Kind::Doc),
         "cbz" => Some(Kind::Cbz),
         "cbr" => Some(Kind::Cbr),
+        "pdf" => Some(Kind::Pdf),
         _ => None,
     }
 }
@@ -90,6 +93,8 @@ pub struct Ctx {
     pub lossy_min_gain: f64,
     pub strip: bool,
     pub strict_alpha: bool,
+    /// PDFs may get lossy images (at the target, every rendered page checked).
+    pub lossy_docs: bool,
     /// Several files run at once: keep each tool single-threaded.
     pub parallel: bool,
     pub timeout: Duration,
@@ -125,12 +130,12 @@ pub fn mode(lossy: bool) -> &'static str {
     if lossy { "lossy-normal-t93" } else { "lossless-normal" }
 }
 
-fn run(ctx: &Ctx, tool: &str, args: Vec<OsString>, cwd: &Path) -> Result<bool, RunError> {
+pub(crate) fn run(ctx: &Ctx, tool: &str, args: Vec<OsString>, cwd: &Path) -> Result<bool, RunError> {
     let Some(program) = ctx.tools.get(tool) else { return Ok(false) };
     Ok(tools::run(program, args, Some(cwd), Capture::None, ctx.timeout, &ctx.cancel)?.success)
 }
 
-fn size(p: &Path) -> Option<u64> {
+pub(crate) fn size(p: &Path) -> Option<u64> {
     std::fs::metadata(p).ok().map(|m| m.len()).filter(|&n| n > 0)
 }
 
@@ -228,6 +233,9 @@ impl<'a> Chain<'a> {
 pub fn optimize(ctx: &Ctx, kind: Kind, src: &Path, work: &Path) -> Result<Optimized, RunError> {
     if kind.is_audio() {
         return crate::audio::optimize(ctx, kind, src, work);
+    }
+    if kind == Kind::Pdf {
+        return crate::pdf::optimize(ctx, src, work);
     }
     if kind.is_archive() {
         return crate::archive::optimize(ctx, kind, src, work);
@@ -389,7 +397,7 @@ fn jpg_chain<'a>(ctx: &'a Ctx, work: &Path, src: &Path, ver: &Verifier) -> Resul
 
 /// SSIMULACRA2 of `b` against `a`. Retries on plain RGBA copies when ssimulacra2 can't
 /// read a file (it rejects some valid PNGs).
-fn ssim_score(ctx: &Ctx, a: &Path, b: &Path) -> Result<Option<f64>, RunError> {
+pub(crate) fn ssim_score(ctx: &Ctx, a: &Path, b: &Path) -> Result<Option<f64>, RunError> {
     let Some(ssim) = ctx.tools.get("ssimulacra2") else { return Ok(None) };
     let score = |x: &Path, y: &Path| -> Result<Option<f64>, RunError> {
         let ran = tools::run(ssim, crate::os_args![x, y], None, Capture::Bytes, ctx.timeout, &ctx.cancel)?;
@@ -413,12 +421,12 @@ fn ssim_score(ctx: &Ctx, a: &Path, b: &Path) -> Result<Option<f64>, RunError> {
     s
 }
 
-type Encoder<'e> = Box<dyn FnMut(u32) -> Result<Option<PathBuf>, RunError> + 'e>;
+pub(crate) type Encoder<'e> = Box<dyn FnMut(u32) -> Result<Option<PathBuf>, RunError> + 'e>;
 
 /// Binary-searches quality `n` in `lo..=hi` (higher = better) for the smallest output that
 /// still scores >= target and is below `limit` bytes. One probe at a fairly strong setting
 /// first: already-optimized images don't get smaller there, and are skipped cheaply.
-fn quality_search(ctx: &Ctx, reference: &Path, lo: u32, hi: u32, encode: &mut Encoder, limit: u64) -> Result<Option<PathBuf>, RunError> {
+pub(crate) fn quality_search(ctx: &Ctx, reference: &Path, lo: u32, hi: u32, encode: &mut Encoder, limit: u64) -> Result<Option<PathBuf>, RunError> {
     let probe = hi - (hi - lo) / 4;
     let first = encode(probe)?;
     if first.as_deref().and_then(size).is_none_or(|s| s >= limit) {
@@ -457,7 +465,7 @@ fn quality_search(ctx: &Ctx, reference: &Path, lo: u32, hi: u32, encode: &mut En
 }
 
 /// Tries each method, each limited by the best result so far.
-fn search_methods(ctx: &Ctx, reference: &Path, methods: Vec<(&str, u32, u32, Encoder)>, limit: u64) -> Result<Option<(PathBuf, String)>, RunError> {
+pub(crate) fn search_methods(ctx: &Ctx, reference: &Path, methods: Vec<(&str, u32, u32, Encoder)>, limit: u64) -> Result<Option<(PathBuf, String)>, RunError> {
     let mut best: Option<(PathBuf, String, u64)> = None;
     for (name, lo, hi, mut enc) in methods {
         let cap = best.as_ref().map_or(limit, |b| b.2);
@@ -595,6 +603,7 @@ mod tests {
             lossy_min_gain: 0.03,
             strip: false,
             strict_alpha: false,
+            lossy_docs: false,
             parallel: false,
             timeout: Duration::from_secs(120),
             cancel: CancellationToken::new(),

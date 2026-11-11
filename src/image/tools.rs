@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 /// Image optimizers used when present. ffmpeg (bundled) is always used for verification.
 pub const NAMES: &[&str] = &[
-    "beeim", "pingo", "oxipng", "ect", "jpegtran", "djpeg", "cjpeg", "cjpegli", "gifsicle", "ssimulacra2", "flac", "optivorbis", "7z",
+    "beeim", "pingo", "oxipng", "ect", "jpegtran", "djpeg", "cjpeg", "cjpegli", "gifsicle", "ssimulacra2", "flac", "optivorbis", "7z", "qpdf", "mutool",
 ];
 
 #[derive(Clone, Debug, Default)]
@@ -89,6 +89,8 @@ pub struct Ran {
     pub hash: Option<[u8; 32]>,
     /// Bytes written to stdout (whatever the capture).
     pub stdout_len: u64,
+    /// The exit code (qpdf: 0 = fine, 3 = warnings, 2 = errors).
+    pub code: Option<i32>,
 }
 
 #[derive(Debug)]
@@ -174,7 +176,7 @@ pub fn run(
     };
     let (stdout, hash, stdout_len) = out_thread.join().unwrap_or_default();
     let _ = err_thread.join();
-    Ok(Ran { success: status.is_some_and(|s| s.success()), stdout, hash, stdout_len })
+    Ok(Ran { success: status.is_some_and(|s| s.success()), stdout, hash, stdout_len, code: status.and_then(|s| s.code()) })
 }
 
 /// `OsString` arguments from anything path- or string-like.

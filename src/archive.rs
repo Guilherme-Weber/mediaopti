@@ -72,6 +72,7 @@ fn inner_ctx(ctx: &Ctx, kind: Kind) -> Ctx {
         // Documents keep every pixel, even fully transparent ones (invisible, but their
         // colours are content: an editor could change the alpha later).
         strict_alpha: ctx.strict_alpha || kind == Kind::Doc,
+        lossy_docs: false,
         parallel: ctx.parallel,
         timeout: ctx.timeout,
         cancel: ctx.cancel.clone(),
@@ -319,6 +320,7 @@ mod tests {
             lossy_min_gain: 0.03,
             strip: false,
             strict_alpha: false,
+            lossy_docs: false,
             parallel: false,
             timeout: Duration::from_secs(120),
             cancel: CancellationToken::new(),

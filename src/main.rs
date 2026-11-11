@@ -11,6 +11,7 @@ mod engine_tests;
 mod history;
 mod image;
 mod logfile;
+mod pdf;
 mod progress;
 mod system;
 mod taskbar;

@@ -2549,6 +2549,7 @@ version = "3.0.0-dev"
 dependencies = [
  "blake2",
  "crc32fast",
+ "flate2",
  "hex",
  "raw-window-handle",
  "regex",

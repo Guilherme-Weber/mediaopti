@@ -84,6 +84,7 @@ fn opts(encoder: &str, concurrency: f64) -> RawOptions {
         vmaf_floor: Some(0),
         images: Some(0),
         convert: Some(0),
+        lossy_docs: Some(0),
     }
 }
 
@@ -781,6 +782,7 @@ fn real_folder_run() {
         vmaf_floor: Some(93),
         images: Some(2),
         convert: Some(1),
+        lossy_docs: Some(1),
     };
     let t = std::time::Instant::now();
     rt.block_on(async {

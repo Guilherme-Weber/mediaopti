@@ -277,6 +277,8 @@ export component AppWindow inherits Window {
     in-out property <int> images-index;
     in property <[string]> convert-options;
     in-out property <int> convert-index;
+    in property <[string]> pdf-options;
+    in-out property <int> pdf-index;
 
     callback choose-folder();
     callback start();
@@ -473,6 +475,14 @@ export component AppWindow inherits Window {
                         hint: "Lossless and verified. The file extension changes.";
                         model: root.convert-options;
                         current-index <=> root.convert-index;
+                        changed => { root.settings-changed(); }
+                    }
+                    SettingField {
+                        glyph: "\u{EA90}";
+                        label: "PDF";
+                        hint: "Text and drawings never change; every page is rendered and compared.";
+                        model: root.pdf-options;
+                        current-index <=> root.pdf-index;
                         changed => { root.settings-changed(); }
                     }
                 }

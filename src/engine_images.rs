@@ -69,6 +69,7 @@ impl Engine {
             lossy_min_gain: 0.03,
             strip: false,
             strict_alpha: false,
+            lossy_docs: options.lossy_docs,
             parallel,
             timeout: std::time::Duration::from_secs(900),
             cancel,

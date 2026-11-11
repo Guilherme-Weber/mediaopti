@@ -71,6 +71,9 @@ pub struct Options {
     /// Lossless format conversions (WAV -> FLAC; later BMP/TGA -> PNG, CBR -> CBZ). They
     /// change the file extension.
     pub convert: bool,
+    /// PDF images may be re-encoded lossily (SSIMULACRA2 >= 93, every page rendered and
+    /// checked), when images are visually lossless too. Text and vectors are never touched.
+    pub lossy_docs: bool,
 }
 
 impl Default for Options {
@@ -86,6 +89,7 @@ impl Default for Options {
             cq_boost: 0,
             images: ImageMode::Lossy,
             convert: true,
+            lossy_docs: true,
         }
     }
 }
@@ -106,6 +110,8 @@ pub struct RawOptions {
     pub images: Option<u32>,
     /// 0 = keep file formats, 1 = lossless conversions.
     pub convert: Option<u32>,
+    /// 0 = PDFs lossless only, 1 = visually lossless PDF images.
+    pub lossy_docs: Option<u32>,
 }
 
 impl Options {
@@ -152,6 +158,7 @@ impl Options {
                 _ => d.images,
             },
             convert: raw.convert.map_or(d.convert, |c| c != 0),
+            lossy_docs: raw.lossy_docs.map_or(d.lossy_docs, |c| c != 0),
         }
     }
 }
@@ -344,6 +351,7 @@ mod tests {
             vmaf_floor: Some(50),
             images: Some(7),
             convert: None,
+            lossy_docs: None,
         });
         assert!(o.convert, "conversions on by default");
         assert_eq!(o.images, ImageMode::Lossy, "images: visually lossless by default");
