@@ -31,6 +31,22 @@ impl PngInfo {
 }
 
 /// Reads the chunk list without loading image data.
+/// Where a PNG ends (just after its IEND chunk); `None` if damaged.
+pub fn end_of_image(d: &[u8]) -> Option<usize> {
+    if d.get(..8)? != SIGNATURE {
+        return None;
+    }
+    let mut i = 8;
+    loop {
+        let len = u32::from_be_bytes(d.get(i..i + 4)?.try_into().ok()?) as usize;
+        let name = d.get(i + 4..i + 8)?;
+        i = i.checked_add(12 + len)?;
+        if name == b"IEND" {
+            return (i <= d.len()).then_some(i);
+        }
+    }
+}
+
 pub fn info(path: &Path) -> Option<PngInfo> {
     let mut f = std::fs::File::open(path).ok()?;
     let mut sig = [0u8; 8];

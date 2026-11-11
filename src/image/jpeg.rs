@@ -163,6 +163,41 @@ pub fn with_segments(jpg: &[u8], segs: &Segments) -> Vec<u8> {
     out
 }
 
+/// Where the first image of a JPEG ends (just after its EOI marker), following the segments
+/// and the entropy-coded data. `None` if it can't be followed (damaged, truncated).
+pub fn end_of_image(d: &[u8]) -> Option<usize> {
+    if !d.starts_with(&[0xFF, 0xD8]) {
+        return None;
+    }
+    let be16 = |i: usize| -> Option<usize> { Some(usize::from(u16::from_be_bytes([*d.get(i)?, *d.get(i + 1)?]))) };
+    let mut i = 2;
+    loop {
+        if *d.get(i)? != 0xFF {
+            return None;
+        }
+        let m = *d.get(i + 1)?;
+        match m {
+            0xFF => i += 1, // fill byte
+            0xD9 => return Some(i + 2),
+            0x01 | 0xD0..=0xD7 => i += 2,
+            0xDA => {
+                // Scan header, then entropy-coded data up to the next marker (FF 00 is a
+                // stuffed byte, FF D0-D7 a restart marker).
+                i += 2 + be16(i + 2)?;
+                loop {
+                    i += d.get(i..)?.iter().position(|&b| b == 0xFF)?;
+                    match *d.get(i + 1)? {
+                        0x00 | 0xD0..=0xD7 => i += 2,
+                        0xFF => i += 1,
+                        _ => break,
+                    }
+                }
+            }
+            _ => i += 2 + be16(i + 2)?,
+        }
+    }
+}
+
 const STD_LUMA: [u32; 64] = [
     16, 11, 10, 16, 24, 40, 51, 61, 12, 12, 14, 19, 26, 58, 60, 55, 14, 13, 16, 24, 40, 57, 69, 56, 14, 17,
     22, 29, 51, 87, 80, 62, 18, 22, 37, 56, 68, 109, 103, 77, 24, 35, 55, 64, 81, 104, 113, 92, 49, 64, 78,
@@ -249,6 +284,18 @@ mod tests {
         assert!(meta_ok(&orig, &kept, true));
         assert!(!meta_ok(&orig, &kept, false), "comment lost while keeping metadata");
         assert!(meta_ok(&orig, &orig, false));
+    }
+
+    #[test]
+    fn end_of_image_follows_scans() {
+        // Entropy data with a stuffed FF 00 and a restart marker, then EOI and a second image.
+        let mut j = vec![0xFF, 0xD8];
+        j.extend(seg(0xDB, &[0; 65]));
+        j.extend([0xFF, 0xDA, 0, 2, 1, 0xFF, 0x00, 2, 0xFF, 0xD3, 3, 0xFF, 0xD9]);
+        let end = j.len();
+        j.extend([0xFF, 0xD8, 0xFF, 0xD9]);
+        assert_eq!(end_of_image(&j), Some(end));
+        assert_eq!(end_of_image(&j[..end - 1]), None, "truncated");
     }
 
     #[test]

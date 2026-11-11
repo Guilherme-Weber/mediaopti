@@ -100,6 +100,46 @@ pub fn sniff_picture(path: &Path) -> Option<Kind> {
     }
 }
 
+/// Where a GIF ends (just after its trailer), following its blocks; `None` if damaged.
+fn gif_end(d: &[u8]) -> Option<usize> {
+    if d.len() < 13 || !d.starts_with(b"GIF8") {
+        return None;
+    }
+    let table = |flags: u8| if flags & 0x80 != 0 { 3usize << ((flags & 7) + 1) } else { 0 };
+    let mut i = 13 + table(d[10]);
+    let skip_blocks = |mut i: usize| -> Option<usize> {
+        loop {
+            let n = usize::from(*d.get(i)?);
+            i += 1 + n;
+            if n == 0 {
+                return Some(i);
+            }
+        }
+    };
+    loop {
+        match *d.get(i)? {
+            0x3B => return Some(i + 1),
+            0x21 => i = skip_blocks(i + 2)?,
+            0x2C => i = skip_blocks(i + 10 + table(*d.get(i + 9)?) + 1)?,
+            _ => return None,
+        }
+    }
+}
+
+/// Whether a picture carries data after its end: a motion photo's video, an Ultra HDR gain
+/// map, an MPO's second picture, an appended archive. Optimizers drop it and the pixel check
+/// can't see it, so such files are left alone. (Zero padding doesn't count.)
+pub fn has_data_after_end(kind: Kind, path: &Path) -> bool {
+    let Ok(d) = std::fs::read(path) else { return false };
+    let end = match kind {
+        Kind::Jpg => jpeg::end_of_image(&d),
+        Kind::Gif => gif_end(&d),
+        Kind::Png => png::end_of_image(&d),
+        _ => None,
+    };
+    end.is_some_and(|e| d.get(e..).is_some_and(|rest| rest.iter().any(|&b| b != 0)))
+}
+
 pub fn ext_of(kind: Kind) -> &'static str {
     match kind {
         Kind::Png => "png",
@@ -272,6 +312,9 @@ pub fn optimize(ctx: &Ctx, kind: Kind, src: &Path, work: &Path) -> Result<Optimi
     }
     if matches!(kind, Kind::Bmp | Kind::Tga) {
         return to_png(ctx, kind, src, work);
+    }
+    if has_data_after_end(kind, src) {
+        return Ok(Optimized::skipped("it has data after the end of the picture (a motion photo, second picture or gain map): kept as it is"));
     }
     let ver = Verifier::new(ctx, kind, src);
     let skip = |why: &str| Ok(Optimized::skipped(why));
@@ -768,6 +811,50 @@ mod tests {
         make(&c.tools.ffmpeg, &["-f", "lavfi", "-i", "testsrc=s=64x48:d=1", "-frames:v", "1", "-f", "mjpeg"], &jpg_as_png);
         assert_eq!(sniff_picture(&jpg_as_png), Some(Kind::Jpg));
         assert_eq!(sniff_picture(&gif), Some(Kind::Gif));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Motion photos, MPO and Ultra HDR keep data after the picture's end: such files are
+    /// left alone (optimizers would drop it). Zero padding is not data.
+    #[test]
+    fn pictures_with_data_after_the_end_are_kept() {
+        let Some(t) = tools() else {
+            eprintln!("skipping: image tools not found");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("mo-trailing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let c = ctx(t, false);
+        for (name, extra, kept) in [
+            ("mpo.jpg", b"\xff\xd8\xff\xe1second picture\xff\xd9".to_vec(), true),
+            ("zip.png", b"PK\x03\x04appended archive".to_vec(), true),
+            ("anim.gif", b"trailing".to_vec(), true),
+            ("padded.png", vec![0u8; 300], false),
+        ] {
+            let f = dir.join(name);
+            let fmt: &[&str] = match &name[name.len() - 3..] {
+                "jpg" => &["-q:v", "2"],
+                "png" => &["-compression_level", "0"],
+                _ => &[],
+            };
+            let mut a = vec!["-f", "lavfi", "-i", "testsrc=s=160x120:d=1", "-frames:v", "1"];
+            a.extend(fmt);
+            make(&c.tools.ffmpeg, &a, &f);
+            let mut d = std::fs::read(&f).unwrap();
+            d.extend(&extra);
+            std::fs::write(&f, d).unwrap();
+            let kind = kind_of(&f).unwrap();
+            assert_eq!(has_data_after_end(kind, &f), kept, "{name}");
+            let w = dir.join(format!("w-{name}"));
+            std::fs::create_dir_all(&w).unwrap();
+            let r = optimize(&c, kind, &f, &w).unwrap();
+            if kept {
+                assert!(r.best.is_none() && r.note.as_deref().is_some_and(|n| n.contains("after the end")), "{name}: {:?}", r.note);
+            } else {
+                assert!(r.best.is_some(), "{name}: zero padding must not block optimizing");
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
