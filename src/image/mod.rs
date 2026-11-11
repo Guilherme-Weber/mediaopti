@@ -33,11 +33,13 @@ pub enum Kind {
     Mp3,
     /// Converted to FLAC (integer PCM only), when conversions are on.
     Wav,
+    /// Ogg Vorbis, repacked losslessly by OptiVorbis.
+    Ogg,
 }
 
 impl Kind {
     pub fn is_audio(self) -> bool {
-        matches!(self, Kind::Flac | Kind::Mp3 | Kind::Wav)
+        matches!(self, Kind::Flac | Kind::Mp3 | Kind::Wav | Kind::Ogg)
     }
 
     /// Converted to another format (the extension changes): only with the conversions option.
@@ -56,6 +58,7 @@ pub fn kind_of(path: &Path) -> Option<Kind> {
         "flac" => Some(Kind::Flac),
         "mp3" => Some(Kind::Mp3),
         "wav" => Some(Kind::Wav),
+        "ogg" => Some(Kind::Ogg),
         _ => None,
     }
 }
@@ -224,7 +227,7 @@ pub fn optimize(ctx: &Ctx, kind: Kind, src: &Path, work: &Path) -> Result<Optimi
             c.write_to("gifsicle", "gifsicle", |i, o| crate::os_args!["-O3", "--no-warnings", "-o", o, i], &mut check, None)?;
             c
         }
-        Kind::Flac | Kind::Mp3 | Kind::Wav => unreachable!("audio is handled above"),
+        Kind::Flac | Kind::Mp3 | Kind::Wav | Kind::Ogg => unreachable!("audio is handled above"),
     };
     if ctx.lossy && ctx.tools.has("ssimulacra2") {
         match kind {

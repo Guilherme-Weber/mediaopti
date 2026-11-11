@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 /// Image optimizers used when present. ffmpeg (bundled) is always used for verification.
 pub const NAMES: &[&str] = &[
-    "beeim", "pingo", "oxipng", "ect", "jpegtran", "djpeg", "cjpeg", "cjpegli", "gifsicle", "ssimulacra2", "flac",
+    "beeim", "pingo", "oxipng", "ect", "jpegtran", "djpeg", "cjpeg", "cjpegli", "gifsicle", "ssimulacra2", "flac", "optivorbis",
 ];
 
 #[derive(Clone, Debug, Default)]
@@ -87,6 +87,8 @@ pub struct Ran {
     pub success: bool,
     pub stdout: Vec<u8>,
     pub hash: Option<[u8; 32]>,
+    /// Bytes written to stdout (whatever the capture).
+    pub stdout_len: u64,
 }
 
 #[derive(Debug)]
@@ -128,19 +130,22 @@ pub fn run(
     let mut err = child.stderr.take().expect("piped");
     let out_thread = std::thread::spawn(move || {
         let mut buf = vec![0u8; 1 << 16];
-        let (mut bytes, mut hasher) = (Vec::new(), Sha256::new());
+        let (mut bytes, mut hasher, mut len) = (Vec::new(), Sha256::new(), 0u64);
         loop {
             match out.read(&mut buf) {
                 Ok(0) | Err(_) => break,
-                Ok(n) => match capture {
-                    Capture::None => {}
-                    Capture::Bytes => bytes.extend_from_slice(&buf[..n]),
-                    Capture::Hash => hasher.update(&buf[..n]),
-                },
+                Ok(n) => {
+                    len += n as u64;
+                    match capture {
+                        Capture::None => {}
+                        Capture::Bytes => bytes.extend_from_slice(&buf[..n]),
+                        Capture::Hash => hasher.update(&buf[..n]),
+                    }
+                }
             }
         }
         let hash = matches!(capture, Capture::Hash).then(|| hasher.finalize().into());
-        (bytes, hash)
+        (bytes, hash, len)
     });
     // Drained so a chatty tool never blocks on a full pipe.
     let err_thread = std::thread::spawn(move || {
@@ -167,9 +172,9 @@ pub fn run(
         }
         std::thread::sleep(Duration::from_millis(15));
     };
-    let (stdout, hash) = out_thread.join().unwrap_or_default();
+    let (stdout, hash, stdout_len) = out_thread.join().unwrap_or_default();
     let _ = err_thread.join();
-    Ok(Ran { success: status.is_some_and(|s| s.success()), stdout, hash })
+    Ok(Ran { success: status.is_some_and(|s| s.success()), stdout, hash, stdout_len })
 }
 
 /// `OsString` arguments from anything path- or string-like.

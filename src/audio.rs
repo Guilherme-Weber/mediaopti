@@ -32,6 +32,7 @@ pub fn optimize(ctx: &Ctx, kind: Kind, src: &Path, work: &Path) -> Result<Optimi
         Kind::Flac => flac(ctx, src, work),
         Kind::Mp3 => mp3(ctx, src, work),
         Kind::Wav => wav(ctx, src, work),
+        Kind::Ogg => ogg(ctx, src, work),
         _ => unreachable!("not audio"),
     };
     match r {
@@ -275,8 +276,118 @@ pub fn worth_trying(ctx: &Ctx, kind: Kind, path: &Path) -> bool {
             id3_frames(&tag.body, tag.ver).iter().any(|(id, b)| *id == b"APIC" && apic_data_start(b).is_some_and(|i| has_art(&b[i..])))
         }),
         Kind::Wav => ctx.tools.has("flac") && wav_format(path).ok().flatten().is_some(),
+        Kind::Ogg => ctx.tools.has("optivorbis") && ogg_info(path).ok().flatten().is_some(),
         _ => true,
     }
+}
+
+// ---------------------------------------------------------------- Ogg Vorbis
+
+/// What a repacked Ogg Vorbis must keep.
+#[derive(Debug, PartialEq, Eq)]
+struct OggInfo {
+    channels: u8,
+    sample_rate: u32,
+    /// Declared length: the last page's granule position (in samples).
+    length: u64,
+    /// The comment packet after its vendor string (tags, embedded pictures).
+    comments: Vec<u8>,
+}
+
+/// Reads an Ogg file holding a single Vorbis stream (not Opus, FLAC, video or chained
+/// streams): its format, declared length and tags. The audio pages are skipped, not read.
+fn ogg_info(path: &Path) -> io::Result<Option<OggInfo>> {
+    let mut f = BufReader::new(File::open(path)?);
+    let (mut packets, mut current): (Vec<Vec<u8>>, Vec<u8>) = (Vec::new(), Vec::new());
+    let (mut serial, mut length) = (None, 0u64);
+    loop {
+        let mut h = [0u8; 27];
+        match read_full(&mut f, &mut h)? {
+            0 => break,
+            27 if &h[..4] == b"OggS" && h[4] == 0 => {}
+            _ => return Ok(None),
+        }
+        let page_serial = u32::from_le_bytes(h[14..18].try_into().unwrap());
+        if *serial.get_or_insert(page_serial) != page_serial {
+            return Ok(None); // several streams
+        }
+        let granule = u64::from_le_bytes(h[6..14].try_into().unwrap());
+        if granule != u64::MAX {
+            length = granule;
+        }
+        let mut lacing = vec![0u8; usize::from(h[26])];
+        if read_full(&mut f, &mut lacing)? != lacing.len() {
+            return Ok(None);
+        }
+        if packets.len() >= 2 {
+            let body: i64 = lacing.iter().map(|&l| i64::from(l)).sum();
+            f.seek_relative(body)?;
+            continue;
+        }
+        for l in lacing {
+            let mut seg = vec![0u8; usize::from(l)];
+            if read_full(&mut f, &mut seg)? != seg.len() {
+                return Ok(None);
+            }
+            if packets.len() < 2 {
+                current.extend_from_slice(&seg);
+                if current.len() as u64 > MAX_META {
+                    return Ok(None);
+                }
+                if l < 255 {
+                    packets.push(std::mem::take(&mut current));
+                }
+            }
+        }
+    }
+    let [ident, comment] = &packets[..] else { return Ok(None) };
+    if !ident.starts_with(b"\x01vorbis") || ident.len() < 16 || !comment.starts_with(b"\x03vorbis") {
+        return Ok(None);
+    }
+    let vendor_len = comment.get(7..11).map_or(usize::MAX, |b| u32::from_le_bytes(b.try_into().unwrap()) as usize);
+    let Some(comments) = comment.get(11usize.saturating_add(vendor_len)..) else { return Ok(None) };
+    Ok(Some(OggInfo {
+        channels: ident[11],
+        sample_rate: u32::from_le_bytes(ident[12..16].try_into().unwrap()),
+        length,
+        comments: comments.to_vec(),
+    }))
+}
+
+/// SHA-256 and byte count of the decoded audio (32-bit float), optionally cut after
+/// `end_sample` samples.
+fn decoded(ctx: &Ctx, path: &Path, end_sample: Option<u64>) -> Result<Option<([u8; 32], u64)>, RunError> {
+    let mut args = crate::os_args!["-v", "error", "-i", path, "-map", "0:a:0"];
+    if let Some(n) = end_sample {
+        args.extend(crate::os_args!["-af", format!("atrim=end_sample={n}")]);
+    }
+    args.extend(crate::os_args!["-f", "f32le", "-"]);
+    let ran = tools::run(&ctx.tools.ffmpeg, args, None, Capture::Hash, ctx.timeout, &ctx.cancel)?;
+    Ok(ran.hash.filter(|_| ran.success).map(|h| (h, ran.stdout_len)))
+}
+
+/// Lossless repacking with OptiVorbis (better codebooks, no wasted bits).
+fn ogg(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, AudioError> {
+    let Some(optivorbis) = ctx.tools.get("optivorbis") else { return skip("optivorbis is missing") };
+    let Some(info) = ogg_info(src)? else { return skip("not a single Vorbis stream (Opus, FLAC, video or chained Ogg): skipped") };
+    let out = work.join("out.ogg");
+    let ran = tools::run(optivorbis, crate::os_args!["-q", src, &out], Some(work), Capture::None, ctx.timeout, &ctx.cancel)?;
+    let smaller = ran.success && std::fs::metadata(&out).is_ok_and(|m| m.len() < std::fs::metadata(src).map_or(0, |s| s.len()));
+    if !smaller || ogg_info(&out)?.as_ref() != Some(&info) {
+        return Ok(Optimized::nothing());
+    }
+    let (Some((want, want_len)), Some((got, got_len))) = (decoded(ctx, src, None)?, decoded(ctx, &out, None)?) else {
+        return Ok(Optimized::nothing());
+    };
+    // OptiVorbis drops samples past the declared end (the last granule position) that ffmpeg
+    // still decodes: accept a short cut tail if everything before it is identical.
+    const MAX_TAIL: u64 = 4 * 8192 * 8;
+    let same = got == want
+        || (got_len < want_len && want_len - got_len <= MAX_TAIL && {
+            let frame = 4 * u64::from(info.channels.max(1));
+            got_len % frame == 0 && decoded(ctx, src, Some(got_len / frame))?.is_some_and(|(h, n)| h == got && n == got_len)
+        });
+    Ok(if same { Optimized::found(Some(out), vec!["optivorbis".into()]) } else { Optimized::nothing() })
 }
 
 // ---------------------------------------------------------------- WAV -> FLAC
@@ -666,6 +777,36 @@ mod tests {
                 assert!(r.steps.iter().any(|s| s == "flac-8p"), "{:?}", r.steps);
             }
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// libvorbis output repacked by OptiVorbis: smaller, same format, tags and samples
+    /// (or a verified cut tail); an Opus file in an .ogg is left alone.
+    #[test]
+    fn ogg_vorbis_repack() {
+        let Some(c) = ctx().filter(|c| c.tools.has("optivorbis")) else {
+            eprintln!("skipping: optivorbis not found");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("mo-ogg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = |p: &Path| p.to_string_lossy().into_owned();
+        let ogg = dir.join("song.ogg");
+        ff(&c, &["-f", "lavfi", "-i", "sine=frequency=440:duration=8", "-c:a", "libvorbis", "-q:a", "5",
+            "-metadata", "title=Test", &s(&ogg)]);
+        let opus = dir.join("opus.ogg");
+        ff(&c, &["-f", "lavfi", "-i", "sine=frequency=440:duration=2", "-c:a", "libopus", &s(&opus)]);
+        assert!(ogg_info(&opus).unwrap().is_none() && !worth_trying(&c, Kind::Ogg, &opus), "Opus must be skipped");
+
+        let info = ogg_info(&ogg).unwrap().expect("a Vorbis stream");
+        assert_eq!((info.channels, info.sample_rate), (1, 44100));
+        let work = dir.join("w");
+        std::fs::create_dir_all(&work).unwrap();
+        let r = optimize(&c, Kind::Ogg, &ogg, &work).unwrap();
+        let best = r.best.unwrap_or_else(|| panic!("no gain ({:?})", r.note));
+        println!("Ogg: {} -> {} {:?}", std::fs::metadata(&ogg).unwrap().len(), std::fs::metadata(&best).unwrap().len(), r.steps);
+        assert_eq!(ogg_info(&best).unwrap(), Some(info), "format or tags changed");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
