@@ -108,7 +108,7 @@ powershell -ExecutionPolicy Bypass -File scripts/fetch-tools.ps1
 This installs the open-source ones with [Scoop](https://scoop.sh) (found on PATH). It downloads
 cjpegli from libjxl 0.11.2, and pingo and beeim from css-ig.net. pingo and beeim are free for
 private use and may not be redistributed, so they are never bundled. mediaopti looks for the tools
-in `%APPDATA%\mediaopti	ools.json` (`{"pingo": "C:\path\pingo.exe"}`), a `tools` folder next
+in `%APPDATA%\mediaopti\tools.json` (`{"pingo": "C:\\path\\pingo.exe"}`), a `tools` folder next
 to `mediaopti.exe`, the project's `bin` folder, and PATH. Missing tools are skipped. The tools found
 are listed in the log when a batch with images starts.
 
