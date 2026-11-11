@@ -725,7 +725,7 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
                 last_encoder.borrow_mut().clone_from(&prefs.encoder);
             }
             prefs.save(&prefs_path);
-            engine.apply_options(prefs.to_raw());
+            engine.apply_options_in_background(prefs.to_raw());
         });
     }
 
@@ -746,7 +746,7 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
             w.set_backup_dir(dir.to_string_lossy().as_ref().into());
             let prefs = Prefs::from_window(&w);
             prefs.save(&prefs_path);
-            engine.apply_options(prefs.to_raw());
+            engine.apply_options_in_background(prefs.to_raw());
         });
     }
 

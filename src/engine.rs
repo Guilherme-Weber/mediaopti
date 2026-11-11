@@ -776,6 +776,19 @@ impl Engine {
         self.rt.spawn(async move { engine.load_dir(dir).await });
     }
 
+    /// [`Self::apply_options`] off the calling thread (the window's): with a million files,
+    /// rebuilding the queue takes a moment. The newest settings always win.
+    pub fn apply_options_in_background(self: &Arc<Self>, raw: RawOptions) {
+        static LATEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let generation = LATEST.fetch_add(1, Ordering::SeqCst) + 1;
+        let engine = Arc::clone(self);
+        self.rt.spawn_blocking(move || {
+            if LATEST.load(Ordering::SeqCst) == generation {
+                engine.apply_options(raw);
+            }
+        });
+    }
+
     /// Applies settings outside a run, so the queue shown before Start already reflects
     /// them (e.g. which GIFs are queued).
     pub fn apply_options(self: &Arc<Self>, raw: RawOptions) {
@@ -2120,19 +2133,33 @@ fn scan_folder(dir: &Path, exclude: Option<&Path>) -> ScanResult {
             }
             continue;
         }
-        if args::is_gif(entry.path()) {
-            let animated = std::fs::File::open(entry.path())
-                .is_ok_and(|f| system::is_animated_and_valid_gif(std::io::BufReader::new(f)));
-            if !animated {
-                static_gifs.insert(entry.path().to_path_buf());
-            }
-        }
         match entry.metadata() {
             Ok(meta) if meta.len() > 0 => with_sizes.push((entry.into_path(), meta.len())),
             Ok(_) => {}
             Err(err) => messages.push(format!("Could not read {}: {err}", entry.path().display())),
         }
     }
+
+    // Still or animated: each GIF's header is read, on several threads (a library can hold
+    // tens of thousands of GIFs, and one at a time is slow on a hard disk).
+    let gifs: Vec<&PathBuf> = with_sizes.iter().map(|(p, _)| p).filter(|p| args::is_gif(p)).collect();
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = gifs
+            .chunks(gifs.len().div_ceil(threads).max(1))
+            .map(|part| {
+                scope.spawn(move || {
+                    part.iter()
+                        .filter(|p| !std::fs::File::open(p).is_ok_and(|f| system::is_animated_and_valid_gif(std::io::BufReader::new(f))))
+                        .map(|p| (*p).clone())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        for h in handles {
+            static_gifs.extend(h.join().unwrap_or_default());
+        }
+    });
 
     with_sizes.sort_by_key(|&(_, size)| std::cmp::Reverse(size));
     let (files, sizes) = with_sizes.into_iter().unzip();
