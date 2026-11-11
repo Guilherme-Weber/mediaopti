@@ -470,9 +470,13 @@ export component AppWindow inherits Window {
                 spacing: 12px;
                 Glyph { glyph: "\u{E8B7}"; font-size: 13px; color: Theme.text-tertiary; width: 14px; }
                 Text {
-                    text: root.backup-dir == ""
-                        ? "Originals go next to the scanned folder, into \"<folder> (originals)\", in the same subfolders."
-                        : "Originals go to " + root.backup-dir + ", in the same subfolders.";
+                    // Default: "<scanned folder> (originals)" next to it (a drive root gets a
+                    // "mediaopti originals" folder inside; that rare case keeps the generic text).
+                    text: root.backup-dir != ""
+                        ? "Originals go to " + root.backup-dir + ", in the same subfolders."
+                        : root.folder-path != "" && !root.folder-path.ends-with(":\\")
+                        ? "Originals go to " + root.folder-path + " (originals), in the same subfolders."
+                        : "Originals go next to the scanned folder, into \"<folder> (originals)\", in the same subfolders.";
                     font-size: 13px;
                     color: Theme.text-secondary;
                     vertical-alignment: center;
