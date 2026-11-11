@@ -289,7 +289,7 @@ fn optimize_images(ctx: &Ctx, src: &Path, work: &Path, lossy: bool) -> Result<Op
                 }
             }
             let ref_jpg = lw.join("ref.jpg"); // extracted streams have no extension; scorers want one
-            let quality_ok = ctx.max || jpeg::quality(&file).is_none_or(|q| q >= MIN_LOSSY_QUALITY);
+            let quality_ok = ctx.max.pdf_any_q || jpeg::quality(&file).is_none_or(|q| q >= MIN_LOSSY_QUALITY);
             if lossy && file_size >= MIN_LOSSY_JPEG && quality_ok && std::fs::copy(&file, &ref_jpg).is_ok() {
                 let pnm = lw.join("dec.pnm");
                 if image::run(ctx, "djpeg", crate::os_args!["-outfile", &pnm, &ref_jpg], &lw)? {
@@ -385,7 +385,7 @@ mod tests {
             parallel: false,
             timeout: Duration::from_secs(300),
             gate: crate::image::tools::Gate::default(),
-            max: false,
+            max: crate::image::Max::default(),
             slots: None,
         })
     }

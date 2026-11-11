@@ -140,12 +140,108 @@ pub fn has_data_after_end(kind: Kind, path: &Path) -> bool {
     end.is_some_and(|e| d.get(e..).is_some_and(|rest| rest.iter().any(|&b| b != 0)))
 }
 
+/// The real extension of a picture by its content ("png", "jpg", "gif", "webp", "bmp"), for
+/// renaming misnamed files. `None` for anything else.
+pub fn real_picture_ext(path: &Path) -> Option<&'static str> {
+    let mut head = [0u8; 12];
+    std::io::Read::read_exact(&mut std::fs::File::open(path).ok()?, &mut head).ok()?;
+    match sniff_picture(path) {
+        Some(k) => Some(ext_of(k)),
+        None if &head[..4] == b"RIFF" && &head[8..12] == b"WEBP" => Some("webp"),
+        None if &head[..2] == b"BM" && u32::from_le_bytes([head[2], head[3], head[4], head[5]]) > 26 => Some("bmp"),
+        None => None,
+    }
+}
+
+/// Whether extension `ext` (lower case) is a name for the format `real` gives.
+pub fn ext_is(real: &str, ext: &str) -> bool {
+    ext == real || (real == "jpg" && matches!(ext, "jpeg" | "jpe" | "jfif"))
+}
+
+/// Whether two pictures show the same thing: identical pixels and frame timing, or (single
+/// frames of the same size) SSIMULACRA2 at or above the target. Used before removing one of
+/// two files that would get the same name.
+pub fn same_picture(ctx: &Ctx, a: &Path, b: &Path) -> Result<bool, RunError> {
+    let decode = |p: &Path| -> Result<Option<(Vec<u8>, usize)>, RunError> {
+        let args = crate::os_args!["-v", "error", "-i", p, "-map", "0:v:0", "-fps_mode", "passthrough", "-enc_time_base", "demux", "-pix_fmt", "rgba", "-f", "framemd5", "-"];
+        let ran = tools::run(&ctx.tools.ffmpeg, args, None, Capture::BytesUpTo(64 << 20), ctx.timeout, &ctx.gate)?;
+        if !ran.success {
+            return Ok(None);
+        }
+        let lines: Vec<u8> = String::from_utf8_lossy(&ran.stdout).lines().filter(|l| !l.starts_with('#')).flat_map(|l| l.bytes().chain(*b"\n")).collect();
+        let frames = lines.iter().filter(|&&c| c == b'\n').count();
+        Ok(Some((lines, frames)))
+    };
+    let (Some((da, fa)), Some((db, fb))) = (decode(a)?, decode(b)?) else { return Ok(false) };
+    if da == db {
+        return Ok(true);
+    }
+    Ok(fa == 1 && fb == 1 && ssim_score(ctx, a, b)?.is_some_and(|s| s >= ctx.target))
+}
+
 pub fn ext_of(kind: Kind) -> &'static str {
     match kind {
         Kind::Png => "png",
         Kind::Jpg => "jpg",
         Kind::Gif => "gif",
         _ => "bin",
+    }
+}
+
+/// The parts of the "maximum" effort, each one on or off (measured separately, see
+/// [`Max::chosen`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Max {
+    /// PNG: oxipng `-o max` instead of `-o 4`.
+    pub oxipng_max: bool,
+    /// PNG: ECT after oxipng (`-9` under 2 MP, `-6` above).
+    pub png_ect: bool,
+    /// PNG lossy: pingo `-quality` as a third method.
+    pub png_pingo: bool,
+    /// JPEG: ECT `-9` instead of `-4`.
+    pub jpg_ect9: bool,
+    /// JPEG: pingo `-s4` lossless after ECT.
+    pub jpg_pingo: bool,
+    /// JPEG lossy: also JPEGs saved below quality 90.
+    pub jpg_low_q: bool,
+    /// JPEG lossy: search from quality 50 instead of 84.
+    pub jpg_wide: bool,
+    /// FLAC: re-encode files from libFLAC 1.4+ too.
+    pub flac_all: bool,
+    /// FLAC: `-e` (exhaustive model search).
+    pub flac_e: bool,
+    /// PDF: lossy JPEG re-encoding whatever the JPEG's quality.
+    pub pdf_any_q: bool,
+}
+
+impl Max {
+    /// The parts used by the Maximum setting: those that paid off when each was measured
+    /// alone on random samples of the author's library (2026-11-11, lossy images):
+    /// - ECT on PNG (-9 under 2 MP, -6 above): 80 real PNGs -2.57% -> -2.87%, Kodak 36.85% ->
+    ///   37.05%, for about a quarter more time.
+    ///
+    /// Left out: oxipng `-o max` (+0.03 points, +77% time), pingo as a lossy PNG method (0),
+    /// every JPEG part (0 on 80 real JPEGs; the q50 search +65% time), PDF JPEGs below q85 (0
+    /// on 21 PDFs), re-encoding libFLAC 1.4+ files (-0.11%, under the replace threshold for
+    /// almost every file) and flac `-e` (+0.02 points for 8x the time).
+    pub fn chosen() -> Self {
+        Self { png_ect: true, ..Self::default() }
+    }
+
+    pub fn from_names(names: &[&str]) -> Self {
+        let on = |n: &str| names.contains(&n);
+        Self {
+            oxipng_max: on("oxipng_max"),
+            png_ect: on("png_ect"),
+            png_pingo: on("png_pingo"),
+            jpg_ect9: on("jpg_ect9"),
+            jpg_pingo: on("jpg_pingo"),
+            jpg_low_q: on("jpg_low_q"),
+            jpg_wide: on("jpg_wide"),
+            flac_all: on("flac_all"),
+            flac_e: on("flac_e"),
+            pdf_any_q: on("pdf_any_q"),
+        }
     }
 }
 
@@ -165,8 +261,8 @@ pub struct Ctx {
     pub timeout: Duration,
     /// Stop and Pause.
     pub gate: tools::Gate,
-    /// imageopti's "max" level: every tool, highest settings, no quality pre-filter.
-    pub max: bool,
+    /// The "maximum" effort parts in use (all off at normal effort).
+    pub max: Max,
     /// The image workers' CPU slots (borrowed by jobs with many parts), if shared.
     pub slots: Option<std::sync::Arc<tools::Slots>>,
 }
@@ -427,7 +523,7 @@ fn png_chain<'a>(ctx: &'a Ctx, work: &Path, src: &Path, restore_from: &Path, ver
         let alpha = if ctx.strict_alpha { "-noalpha" } else { "-quiet" };
         c.inplace("pingo", "pingo", |o| crate::os_args!["-s4", "-lossless", "-quiet", "-nostrip", alpha, o], &mut check, Some(&repair))?;
     }
-    let mut args = crate::os_args!["-o", if ctx.max { "max" } else { "4" }, "-q"];
+    let mut args = crate::os_args!["-o", if ctx.max.oxipng_max { "max" } else { "4" }, "-q"];
     if ctx.parallel {
         args.extend(crate::os_args!["-t", "1"]);
     }
@@ -448,10 +544,13 @@ fn png_chain<'a>(ctx: &'a Ctx, work: &Path, src: &Path, restore_from: &Path, ver
         &mut check,
         Some(&repair),
     )?;
-    if ctx.max && !apng {
+    if ctx.max.png_ect && !apng {
         let strict = ctx.strict_alpha;
+        // -9 costs ~5x the time of -6: worth it on smaller pictures (Pictures sample: -0.50%
+        // vs -0.26% under 2 MP), less so on big ones (-0.39% vs -0.29%).
+        let level = if png::pixels(src).is_some_and(|px| px >= 2_000_000) { "-6" } else { "-9" };
         let args = |o: &Path| {
-            let mut a = crate::os_args!["-9", "-quiet"];
+            let mut a = crate::os_args![level, "-quiet"];
             if strict {
                 a.push("--strict".into()); // keeps fully transparent pixels
             }
@@ -474,9 +573,9 @@ fn jpg_chain<'a>(ctx: &'a Ctx, work: &Path, src: &Path, ver: &Verifier) -> Resul
         &mut check,
         None,
     )?;
-    let level = if ctx.max { "-9" } else { "-4" };
+    let level = if ctx.max.jpg_ect9 { "-9" } else { "-4" };
     c.inplace("ect", "ect", |o| crate::os_args![level, "-progressive", "-quiet", o], &mut check, None)?;
-    if ctx.max {
+    if ctx.max.jpg_pingo {
         c.inplace("pingo", "pingo", |o| crate::os_args!["-s4", "-lossless", "-quiet", "-nostrip", o], &mut check, None)?;
     }
     Ok(c)
@@ -593,7 +692,7 @@ fn lossy_png(ctx: &Ctx, work: &Path, src: &Path, chain: &mut Chain, ver: &Verifi
         methods.push(("beeim-quantizer", 1, 100, inplace("bq", "beeim", |n, o| crate::os_args![format!("-quantizer={n}"), "-force", o])));
         methods.push(("beeim-predicter", 1, 100, inplace("bp", "beeim", |n, o| crate::os_args![format!("-predicter={n}"), "-force", o])));
     }
-    if ctx.tools.has("pingo") && (ctx.max || !ctx.tools.has("beeim")) {
+    if ctx.tools.has("pingo") && (ctx.max.png_pingo || !ctx.tools.has("beeim")) {
         methods.push(("pingo-quality", 50, 100, inplace("pq", "pingo", |n, o| crate::os_args![format!("-quality={n}"), "-nostrip", "-quiet", o])));
     }
     let limit = (chain.best_size as f64 * (1.0 - ctx.lossy_min_gain)) as u64;
@@ -618,11 +717,11 @@ fn lossy_jpeg(ctx: &Ctx, work: &Path, src: &Path, chain: &mut Chain, ver: &Verif
     let Some(segs) = ver.segs.as_ref() else { return Ok(()) };
     // Only JPEGs saved at high quality get smaller at >= 93: on a 200-JPEG sample, q >= 90
     // kept 24 of 25 wins and skipped a third of the files.
-    if !ctx.max && jpeg::quality(src).is_some_and(|q| q < 90.0) {
+    if !ctx.max.jpg_low_q && jpeg::quality(src).is_some_and(|q| q < 90.0) {
         return Ok(());
     }
     // Winners were q90-98 on the Pictures sample; max searches from 50.
-    let lo_q = if ctx.max { 50 } else { 84 };
+    let lo_q = if ctx.max.jpg_wide { 50 } else { 84 };
     let lw = work.join("lossy");
     let _ = std::fs::create_dir_all(&lw);
     let pnm = lw.join("dec.pnm");
@@ -655,7 +754,7 @@ fn lossy_jpeg(ctx: &Ctx, work: &Path, src: &Path, chain: &mut Chain, ver: &Verif
         let lw2 = lw.clone();
         methods.push((
             "pingo-quality",
-            if ctx.max { 50 } else { 90 },
+            if ctx.max.jpg_wide { 50 } else { 90 },
             100,
             Box::new(move |n| {
                 let out = lw2.join(format!("pg{n}.jpg"));
@@ -702,7 +801,7 @@ mod tests {
             parallel: false,
             timeout: Duration::from_secs(120),
             gate: tools::Gate::default(),
-            max: false,
+            max: crate::image::Max::default(),
             slots: None,
         }
     }

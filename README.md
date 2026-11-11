@@ -111,11 +111,26 @@ The **Images** setting chooses:
 - **Lossless only:** pixel-identical results only.
 - **Don't process images.**
 
-The **Effort** setting chooses **Normal** (the benchmarked chains above) or **Maximum**, imageopti's
-"max" level: oxipng `-o max` and ECT `-9` for PNG, ECT `-9` and pingo for JPEG, pingo as another
-lossy PNG method, lossy JPEG re-encodes of every JPEG (not only those saved at quality 90 or more),
-FLAC re-encoded with `-e`, and PDF JPEGs at any quality. On the Kodak photos it saved 37.1% instead
-of 36.9%, in about twice the time. Files already processed at Normal are not redone.
+The **Effort** setting chooses **Maximum** (default) or **Normal**. Maximum adds only what paid off
+when each of imageopti's "max" steps was measured alone on random files from a real library: ECT
+after oxipng for PNG (`-9` under 2 megapixels, `-6` above). On 80 real PNGs it saved 2.79% instead
+of 2.57%, and on the Kodak photos 37.05% instead of 36.85%, for about 45% more time on PNGs. The other
+steps gained nothing measurable or too little for their time (oxipng `-o max`, pingo as a lossy
+PNG method, ECT `-9` and pingo for JPEG, lossy re-encoding of JPEGs below quality 90, PDF JPEGs
+below quality 85, re-encoding FLACs from libFLAC 1.4+, and flac `-e`), so they are not used. Files
+already processed are not redone.
+
+**Wrong extensions** (off by default) renames pictures whose extension doesn't match their format,
+for example a JPEG called `.png` becomes `.jpg` (and a WebP called `.jpg` becomes `.webp`). It can
+break saved web pages that link to the old name. With it off, a misnamed picture is still optimized
+as what it is and keeps its name.
+
+**Same names.** A conversion or rename can find its new name taken (`clip.gif` → `clip.mp4` when a
+`clip.mp4` exists, `sky.bmp` and `sky.tga` both → `sky.png`). The existing file is compared with
+the original: the same picture (identical, or SSIMULACRA2 ≥ 93), the same decoded audio, a CBZ
+with the CBR's files, or the same video (same length, VMAF ≥ 93). If it is the same, the smaller
+of the two copies stays and the original (and the other copy) go as *Replaced originals* says. If
+it is different, the new file gets a number: `clip (2).mp4`.
 
 An image is replaced only if the result is at least 0.5% smaller. Hard links, the "changed meanwhile"
 check, the Recycle Bin, dates, and attributes work as for videos. On imageopti's test images,
@@ -139,7 +154,8 @@ For a very large image library, choose *Move to a backup folder* (or *Delete per
 Recycle Bin handles only about 25–30 files per second and keeps only the most recent originals once
 it is full.
 
-Each file is worked on in a private folder in `%TEMP%`. When the temp drive has less than about
+Each file is worked on in a private folder in `%TEMP%`, or in the folder chosen under
+*Temporary files* (below the settings). When that drive has less than about
 four times the file's size free (16 times for a PDF, plus 4 GB), a hidden `.mediaopti-temp` folder on the file's own
 drive is used instead. Work folders left by a run that crashed are removed at the next scan. Pages
 of a comic or document are optimized in parallel when CPU workers are idle. **Pause** also

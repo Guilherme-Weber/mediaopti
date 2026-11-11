@@ -41,11 +41,25 @@ pub(super) enum ImageResult {
     },
     /// Left alone and not remembered (hard link, changed meanwhile).
     Skipped(String),
+    /// Only renamed to its real format (nothing smaller).
+    Renamed { to: PathBuf, content: Option<(ContentHash, u64)> },
+    /// A file with the same content already had the new name: the smaller copy (`kept`) stays,
+    /// the original is gone; `before` bytes were freed. `replaced`: the new version replaced it.
+    Duplicate { before: u64, kept: PathBuf, content: Option<(ContentHash, u64)>, replaced: bool },
     Failed(String),
     Stopped,
 }
 
 impl Inner {
+    /// The CPU jobs' settings under the current options (a chosen temp folder that is gone
+    /// falls back to the system one).
+    pub(super) fn job_opts(&self) -> JobOpts {
+        JobOpts {
+            temp: self.options.temp_dir.clone().filter(|d| d.is_dir()).unwrap_or_else(std::env::temp_dir),
+            fix_ext: self.options.fix_ext,
+        }
+    }
+
     fn claim_image(&mut self) -> Option<PathBuf> {
         while self.image_cursor < self.image_queue.len() {
             let candidate = self.image_queue[self.image_cursor].clone();
@@ -75,7 +89,7 @@ impl Engine {
             parallel: slots > 1,
             timeout: std::time::Duration::from_secs(900),
             gate: image::tools::Gate::new(cancel, Some(self.paused.subscribe())),
-            max: options.max_effort,
+            max: max_parts(options.max_effort),
             slots: (slots > 1).then(|| image::tools::Slots::new(slots)),
         }
     }
@@ -83,19 +97,20 @@ impl Engine {
     /// A big GIF whose video wasn't smaller: optimize it as a GIF instead (from a video
     /// worker, so it counts as that worker's file).
     pub(super) async fn gif_as_image(self: &Arc<Self>, worker_id: u32, input: &Path, display: &str) -> super::Outcome {
-        let (ctx, disposal, lossy) = {
+        let (ctx, disposal, lossy, opts) = {
             let inner = self.lock();
             (
                 Arc::new(self.image_ctx(&inner.options, 2, inner.cancel.clone())),
                 inner.disposal_for(input),
                 inner.images_lossy(),
+                inner.job_opts(),
             )
         };
         self.reset_worker(worker_id, format!("{display} (optimizing as GIF)"));
         self.send_state(false);
         let p = input.to_path_buf();
         // Video worker ids are 1-4; image-temp names use a separate range.
-        let result = self.blocking(move || process_image(&ctx, &p, worker_id + 100, &disposal)).await;
+        let result = self.blocking(move || process_image(&ctx, &p, worker_id + 100, &disposal, &opts)).await;
         self.lock().workers.remove(&worker_id);
         let outcome = match &result {
             ImageResult::Stopped => super::Outcome::Stopped,
@@ -142,7 +157,7 @@ impl Engine {
             if !self.wait_while_paused(&cancel).await || !self.wait_for_image_memory(&cancel).await {
                 break;
             }
-            let (path, lossy, disposal) = {
+            let (path, lossy, disposal, opts) = {
                 let mut inner = self.lock();
                 if !inner.working || inner.stop_requested {
                     break;
@@ -150,7 +165,7 @@ impl Engine {
                 let Some(path) = inner.claim_image() else { break };
                 inner.images_active += 1;
                 let disposal = inner.disposal_for(&path);
-                (path, inner.images_lossy(), disposal)
+                (path, inner.images_lossy(), disposal, inner.job_opts())
             };
             self.send_state(false);
             let (ctx2, p2) = (Arc::clone(&ctx), path.clone());
@@ -160,7 +175,7 @@ impl Engine {
                     if ctx2.slots.as_ref().is_some_and(|s| !s.acquire(&ctx2.gate)) {
                         return ImageResult::Stopped;
                     }
-                    let r = process_image(&ctx2, &p2, worker_id, &disposal);
+                    let r = process_image(&ctx2, &p2, worker_id, &disposal, &opts);
                     if let Some(s) = &ctx2.slots {
                         s.release(1);
                     }
@@ -209,6 +224,30 @@ impl Engine {
                     if let Some(note) = note {
                         log = Some(format!("[Images] Skipped {display}: {note}"));
                     }
+                }
+                ImageResult::Renamed { to, content } => {
+                    inner.run.skipped_larger += 1;
+                    inner.history.add_image(&to, mode);
+                    if let Some((hash, size)) = content {
+                        inner.history.add_content(hash, size, mode);
+                    }
+                    remembered = true;
+                    log = Some(format!("[Images] Renamed {display} to {} (its real format)", to.file_name().unwrap_or_default().to_string_lossy()));
+                }
+                ImageResult::Duplicate { before, kept, content, replaced } => {
+                    inner.run.compressed += 1;
+                    inner.space_saved_mb += before as f64 / (1024.0 * 1024.0);
+                    inner.history.add_image(&kept, mode);
+                    if let Some((hash, size)) = content {
+                        inner.history.add_content(hash, size, mode);
+                    }
+                    remembered = true;
+                    let name = kept.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                    log = Some(if replaced {
+                        format!("[Images] {display}: {name} had the same content; it now holds the smaller version and the original was removed")
+                    } else {
+                        format!("[Images] {display}: {name} already has the same content and is smaller; the original was removed")
+                    });
                 }
                 ImageResult::Skipped(why) => {
                     inner.run.skipped_larger += 1;
@@ -263,10 +302,9 @@ impl WorkDir {
     /// A work folder for a file of `size` bytes: in the temp folder, or on the file's own
     /// drive when the temp drive hasn't room for `factor` times the file (copy, candidates,
     /// output; a PDF's streams are written out decompressed).
-    fn new(path: &Path, size: u64, factor: u64, name: &str) -> Result<Self, String> {
+    fn new(path: &Path, size: u64, factor: u64, temp: &Path, name: &str) -> Result<Self, String> {
         let need = size.saturating_mul(factor).saturating_add(64 << 20);
-        let temp = std::env::temp_dir();
-        let mut places = vec![temp];
+        let mut places = vec![temp.to_path_buf()];
         if let Some(root) = volume_root(path) {
             places.push(root.join(DRIVE_WORK_DIR));
         }
@@ -300,20 +338,68 @@ impl Drop for WorkDir {
     }
 }
 
+/// The maximum-effort parts for the setting. Benchmarks can pick parts with the
+/// `MEDIAOPTI_MAX_PARTS` environment variable (comma-separated `Max` field names; test builds only).
+fn max_parts(max_effort: bool) -> image::Max {
+    if cfg!(test) {
+        if let Ok(names) = std::env::var("MEDIAOPTI_MAX_PARTS") {
+            return image::Max::from_names(&names.split(',').map(str::trim).collect::<Vec<_>>());
+        }
+    }
+    if max_effort { image::Max::chosen() } else { image::Max::default() }
+}
+
 fn content_of(path: &Path) -> Option<(ContentHash, u64)> {
     let size = std::fs::metadata(path).ok()?.len();
     Some((history::hash_file(path).ok()?, size))
 }
 
 /// Optimizes one image and, if worthwhile, replaces the original. Blocking.
-pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, disposal: &system::Disposal) -> ImageResult {
+/// Per-run settings of the CPU jobs besides the image pipeline's.
+pub(super) struct JobOpts {
+    /// Where work folders go first.
+    pub temp: PathBuf,
+    /// Rename pictures whose extension doesn't match their format.
+    pub fix_ext: bool,
+}
+
+/// Whether `existing` holds the same content as the original (`src`, its private copy):
+/// the same picture, the same decoded audio, a CBZ with the CBR's files, else the same bytes.
+fn same_content(ctx: &image::Ctx, kind: image::Kind, src: &Path, existing: &Path, work: &Path) -> Result<bool, RunError> {
+    let copy = work.join(format!("existing.{}", args::ext_lower(existing)));
+    if std::fs::copy(existing, &copy).is_err() {
+        return Ok(false);
+    }
+    match args::ext_lower(existing).as_str() {
+        "flac" => {
+            let want = crate::audio::audio_hash(ctx, src)?;
+            Ok(want.is_some() && crate::audio::audio_hash(ctx, &copy)? == want)
+        }
+        "cbz" if kind == image::Kind::Cbr => crate::archive::same_as_folder(ctx, &work.join("x"), &copy, work),
+        _ if image::real_picture_ext(&copy).is_some() && image::real_picture_ext(src).is_some() => image::same_picture(ctx, src, &copy),
+        _ => Ok(history::hash_file(src).ok().is_some_and(|h| history::hash_file(&copy).ok() == Some(h))),
+    }
+}
+
+/// Optimizes one image (or audio file, document) and, if worthwhile, replaces the original.
+/// Conversions and extension fixes save under the new name; if that name is taken by a file
+/// with the same content, the smaller of the two is kept (the other and the original go
+/// as `disposal` says), else the new file gets a number ("a (2).png"). Blocking.
+pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, disposal: &system::Disposal, opts: &JobOpts) -> ImageResult {
     static NEXT_JOB: AtomicU64 = AtomicU64::new(0);
     let Some(named) = image::kind_of(path) else {
         return ImageResult::Skipped("not an image".into());
     };
-    // A misnamed picture (a JPEG called .png) is optimized as what it is, and keeps its name.
+    let ext = args::ext_lower(path);
+    // A misnamed picture (a JPEG called .png) is optimized as what it is.
     let pictures = [image::Kind::Png, image::Kind::Jpg, image::Kind::Gif];
     let kind = if pictures.contains(&named) { image::sniff_picture(path).filter(|k| pictures.contains(k)).unwrap_or(named) } else { named };
+    // ...and renamed to its real format if asked (also WebP and BMP: renamed, not optimized).
+    let fix_to = if opts.fix_ext && matches!(named, image::Kind::Png | image::Kind::Jpg | image::Kind::Gif | image::Kind::Bmp) {
+        image::real_picture_ext(path).filter(|real| !image::ext_is(real, &ext))
+    } else {
+        None
+    };
     let Some(state) = file_state(path) else {
         return ImageResult::Failed("could not read the file".into());
     };
@@ -326,12 +412,11 @@ pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, dispo
     }
     let job = NEXT_JOB.fetch_add(1, Ordering::Relaxed);
     let factor = if kind == image::Kind::Pdf { 16 } else { 4 };
-    let workdir = match WorkDir::new(path, state.0, factor, &format!("mediaopti-img-{}-{job}", std::process::id())) {
+    let workdir = match WorkDir::new(path, state.0, factor, &opts.temp, &format!("mediaopti-img-{}-{job}", std::process::id())) {
         Ok(w) => w,
         Err(why) => return ImageResult::Skipped(why),
     };
     let work = workdir.path.clone();
-    let ext = args::ext_lower(path);
     // ASCII name: some tools can't open Unicode paths. A misnamed picture's copy gets its
     // real extension (tools pick the format from it).
     let src = work.join(format!("orig.{}", if kind == named { ext.as_str() } else { image::ext_of(kind) }));
@@ -345,25 +430,45 @@ pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, dispo
         Err(RunError::Cancelled) => return ImageResult::Stopped,
         Err(RunError::Failed(err)) => return ImageResult::Failed(err),
     };
-    let Some(best) = result.best else {
-        return ImageResult::Kept { content: content_of(path), note: result.note };
-    };
-    let after = std::fs::metadata(&best).map_or(before, |m| m.len());
     // At least 0.5% smaller. Audio also counts 64 KiB: cover art is a small part of a
     // song, but its saving is lossless and verified, and adds up over a music library.
     let min_gain = if kind.is_audio() { (before / 200).min(AUDIO_MIN_GAIN) } else { before / 200 };
-    if before.saturating_sub(after) < min_gain.max(1) {
-        return ImageResult::Kept { content: content_of(path), note: None };
+    let smaller = result.best.as_ref().map(|b| (b.clone(), std::fs::metadata(b).map_or(before, |m| m.len()))).filter(|(_, after)| before.saturating_sub(*after) >= min_gain.max(1));
+    // The new name: a conversion's (only when it is smaller), or the real format's.
+    let new_ext = match (&smaller, result.new_ext) {
+        (Some(_), Some(e)) => Some(e),
+        (_, Some(_)) => None, // a conversion that isn't smaller isn't made
+        (_, None) => fix_to,
+    };
+    if smaller.is_none() && new_ext.is_none() {
+        return ImageResult::Kept { content: content_of(path), note: result.note };
     }
     if file_state(path) != Some(state) {
         return ImageResult::Skipped("it changed while it was being optimized (it will be processed next time)".into());
     }
-    // A conversion (WAV -> FLAC) saves under the new extension, never over another file.
-    let target = result.new_ext.map_or_else(|| path.to_path_buf(), |e| path.with_extension(e));
-    // Claimed atomically: a.bmp and a.tga running at once can't both become a.png.
-    if target != path && system::claim_new_name(&target).is_err() {
-        let name = target.file_name().unwrap_or_default().to_string_lossy().into_owned();
-        return ImageResult::Kept { content: content_of(path), note: Some(format!("{name} already exists, kept the original")) };
+    let mut target = new_ext.map_or_else(|| path.to_path_buf(), |e| path.with_extension(e));
+    // The new name is claimed atomically (a.bmp and a.tga running at once can't both become
+    // a.png). If a file has it already: the same content keeps the smaller copy, other content
+    // makes this one "a (2).png".
+    if target != path {
+        let mut tries = 0;
+        while system::claim_new_name(&target).is_err() {
+            tries += 1;
+            if tries == 1 {
+                let same = match same_content(ctx, kind, &src, &target, &work) {
+                    Ok(s) => s,
+                    Err(RunError::Cancelled) => return ImageResult::Stopped,
+                    Err(RunError::Failed(e)) => return ImageResult::Failed(e),
+                };
+                if same {
+                    return keep_smaller_copy(path, &target, smaller.as_ref(), before, disposal, worker_id);
+                }
+            }
+            if tries > 20 {
+                return ImageResult::Kept { content: content_of(path), note: Some("no free name for the converted file".into()) };
+            }
+            target = system::unused_name(&target);
+        }
     }
     let claimed = (target != path).then(|| target.clone());
     let unclaim = || {
@@ -372,10 +477,20 @@ pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, dispo
         }
     };
 
+    let Some((best, after)) = smaller else {
+        // Only renamed (the extension fixed, nothing smaller): the file itself moves.
+        return match std::fs::rename(path, &target) {
+            Ok(()) => ImageResult::Renamed { to: target.clone(), content: content_of(&target) },
+            Err(err) => {
+                unclaim();
+                ImageResult::Failed(format!("could not rename it: {err}"))
+            }
+        };
+    };
     // The new version goes next to the original first (same volume), then replaces it.
     let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    let new_ext = result.new_ext.map_or(ext, str::to_string);
-    let sibling = path.with_file_name(format!("{stem}.mediaopti.i{worker_id}.{new_ext}"));
+    let out_ext = args::ext_lower(&target);
+    let sibling = path.with_file_name(format!("{stem}.mediaopti.i{worker_id}.{out_ext}"));
     let attrs = match std::fs::metadata(path) {
         Ok(m) => system::OriginalAttributes::from_metadata(&m),
         Err(err) => {
@@ -398,6 +513,42 @@ pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, dispo
     ImageResult::Smaller { before, after, lossy, content: content_of(&target), renamed }
 }
 
+/// `existing` (the new name's current file) has the same content as `path`: keeps the smaller
+/// of `existing` and the new version (`smaller`, if there is one); the original and the other
+/// copy go as `disposal` says.
+fn keep_smaller_copy(path: &Path, existing: &Path, smaller: Option<&(PathBuf, u64)>, before: u64, disposal: &system::Disposal, worker_id: u32) -> ImageResult {
+    let theirs = std::fs::metadata(existing).map_or(u64::MAX, |m| m.len());
+    match smaller {
+        Some((best, after)) if *after < theirs => {
+            // Ours is smaller: it replaces the existing copy, then the original goes.
+            let stem = existing.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            let sibling = existing.with_file_name(format!("{stem}.mediaopti.i{worker_id}.{}", args::ext_lower(existing)));
+            let attrs = std::fs::metadata(path).map(|m| system::OriginalAttributes::from_metadata(&m));
+            if let Err(err) = std::fs::copy(best, &sibling) {
+                let _ = system::remove_file_if_exists(&sibling);
+                return ImageResult::Failed(format!("could not write next to the original: {err}"));
+            }
+            if let Err(err) = super::replace_original(&sibling, existing, existing, &disposal.for_sibling(existing)) {
+                return ImageResult::Failed(err);
+            }
+            if let Ok(a) = attrs {
+                let _ = system::restore_attributes(existing, &a);
+            }
+            match system::dispose(path, disposal) {
+                Ok(()) => ImageResult::Duplicate { before: before + theirs - after, kept: existing.to_path_buf(), content: content_of(existing), replaced: true },
+                Err(err) => ImageResult::Failed(format!("{} now has the smaller version, but the original could not be removed: {err}", existing.display())),
+            }
+        }
+        _ if theirs <= smaller.map_or(before, |s| s.1) => match system::dispose(path, disposal) {
+            Ok(()) => ImageResult::Duplicate { before, kept: existing.to_path_buf(), content: content_of(existing), replaced: false },
+            Err(err) => ImageResult::Failed(format!("could not remove it (same content as {}): {err}", existing.display())),
+        },
+        // Same content, but the existing copy is bigger than the original and nothing new
+        // was made: leave both.
+        _ => ImageResult::Kept { content: content_of(path), note: Some(format!("{} has the same content but is bigger; both kept", existing.display())) },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -417,12 +568,12 @@ mod tests {
             eprintln!("skipping: needs a temp drive with less free space than D:");
             return;
         }
-        let w = WorkDir::new(file, size, 4, "mediaopti-img-test-0").expect("fits on D:");
+        let w = WorkDir::new(file, size, 4, &std::env::temp_dir(), "mediaopti-img-test-0").expect("fits on D:");
         assert!(w.path.starts_with(r"D:\.mediaopti-temp"), "{}", w.path.display());
         #[cfg(windows)]
         assert!(std::os::windows::fs::MetadataExt::file_attributes(&std::fs::metadata(r"D:\.mediaopti-temp").unwrap()) & 0x2 != 0, "hidden");
         // A second one doesn't fit on either drive while the first holds its reservation.
-        assert!(WorkDir::new(file, d_free / 4, 4, "mediaopti-img-test-1").is_err());
+        assert!(WorkDir::new(file, d_free / 4, 4, &std::env::temp_dir(), "mediaopti-img-test-1").is_err());
         drop(w);
         assert!(!Path::new(r"D:\.mediaopti-temp").exists(), "removed when empty");
     }

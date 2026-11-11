@@ -275,6 +275,57 @@ fn repack(ctx: &Ctx, kind: Kind, src: &Path, work: &Path) -> Result<Optimized, E
     Ok(Optimized::found(Some(out), vec![label("zip-repack", n_img, &steps)]))
 }
 
+/// Whether a CBZ holds the same files as an extracted CBR folder: the same names, each file
+/// identical or (pictures) the same picture. A CBZ made earlier from that CBR passes.
+pub fn same_as_folder(ctx: &Ctx, dir: &Path, cbz: &Path, work: &Path) -> Result<bool, RunError> {
+    let mut on_disk = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if let Ok(rel) = p.strip_prefix(dir) {
+                on_disk.push(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    let Ok(mut z) = File::open(cbz).map(BufReader::new).map_err(|_| ()).and_then(|f| ZipArchive::new(f).map_err(|_| ())) else { return Ok(false) };
+    let mut names: Vec<String> = Vec::new();
+    for i in 0..z.len() {
+        let Ok(f) = z.by_index(i) else { return Ok(false) };
+        if !f.is_dir() {
+            names.push(f.name().unwrap_or_default().to_string());
+        }
+    }
+    on_disk.sort();
+    let mut sorted = names.clone();
+    sorted.sort();
+    if on_disk != sorted {
+        return Ok(false);
+    }
+    let cmp = work.join("cmp");
+    let _ = std::fs::create_dir_all(&cmp);
+    for name in names {
+        let Ok(mut f) = z.by_name(&name) else { return Ok(false) };
+        let mut data = Vec::new();
+        if f.read_to_end(&mut data).is_err() {
+            return Ok(false);
+        }
+        let orig = dir.join(&name);
+        if std::fs::read(&orig).is_ok_and(|o| crc32(&o) == crc32(&data)) {
+            continue;
+        }
+        let Some(kind) = image_kind(&name) else { return Ok(false) };
+        let copy = cmp.join(format!("page.{}", image::ext_of(kind)));
+        let same = std::fs::write(&copy, &data).is_ok() && image::same_picture(ctx, &orig, &copy)?;
+        if !same {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn crc32(data: &[u8]) -> u32 {
     crc32fast::hash(data)
 }
@@ -424,7 +475,7 @@ mod tests {
             parallel: false,
             timeout: Duration::from_secs(120),
             gate: crate::image::tools::Gate::default(),
-            max: false,
+            max: crate::image::Max::default(),
             slots: None,
         })
     }

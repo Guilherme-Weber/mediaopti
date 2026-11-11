@@ -86,6 +86,8 @@ fn opts(encoder: &str, concurrency: f64) -> RawOptions {
         convert: Some(0),
         lossy_docs: Some(0),
         effort: None,
+        temp_dir: None,
+        fix_ext: None,
     }
 }
 
@@ -406,10 +408,10 @@ fn historical_problem_files_are_handled() {
     // Accented name: processed in place and remembered.
     assert!(videos.join("Vídeo Ação.MP4").exists(), "{logs}");
     assert!(logs.contains("Saved") && logs.contains("Vídeo Ação.MP4"), "{logs}");
-    // Existing target: the original .mov is kept and the unrelated .mp4 untouched.
-    assert!(videos.join("dup.mov").exists(), "{logs}");
+    // Existing target with other content: the new version gets a number, the unrelated .mp4
+    // stays untouched.
+    assert!(!videos.join("dup.mov").exists() && videos.join("dup (2).mp4").exists(), "{logs}");
     assert_eq!(std::fs::read(videos.join("dup.mp4")).unwrap(), b"not really a video");
-    assert!(logs.contains("Target dup.mp4 already exists"), "{logs}");
     // No temp files left anywhere.
     let leftovers: Vec<_> = walkdir::WalkDir::new(&videos).into_iter().filter_map(Result::ok)
         .filter(|e| e.file_name().to_string_lossy().contains(".mediaopti.")).collect();
@@ -628,7 +630,9 @@ fn bench_folder() {
     let effort = std::env::var("MEDIAOPTI_BENCH_EFFORT").ok().and_then(|e| e.parse().ok());
     // MEDIAOPTI_BENCH_CONVERT=1: conversions on (BMP/TGA -> PNG, WAV -> FLAC, CBR -> CBZ).
     let convert = std::env::var("MEDIAOPTI_BENCH_CONVERT").ok().and_then(|e| e.parse().ok());
-    let raw = || RawOptions { images: Some(2), effort, convert: convert.or(Some(0)), ..opts("av1_nvenc", 2.0) };
+    // MEDIAOPTI_BENCH_DOCS=1: visually lossless PDF images.
+    let docs = std::env::var("MEDIAOPTI_BENCH_DOCS").ok().and_then(|e| e.parse().ok());
+    let raw = || RawOptions { images: Some(2), effort, convert: convert.or(Some(0)), lossy_docs: docs.or(Some(0)), ..opts("av1_nvenc", 2.0) };
     let t = std::time::Instant::now();
     rt.block_on(async {
         engine.apply_options(raw());
@@ -730,6 +734,10 @@ fn wav_becomes_flac_only_when_safe() {
     make(&ff, &[&tone[..], &["-c:a", "pcm_f32le"]].concat(), &float);
     make(&ff, &[&tone[..], &["-c:a", "pcm_s24le"]].concat(), &taken);
     std::fs::write(media.join("taken.flac"), b"someone else's file").unwrap();
+    // A FLAC of the same audio, poorly compressed: the new one replaces it.
+    let same = media.join("same.wav");
+    make(&ff, &[&tone[..], &["-c:a", "pcm_s16le"]].concat(), &same);
+    make(&ff, &["-i", same.to_str().unwrap(), "-c:a", "flac", "-compression_level", "0"], &media.join("same.flac"));
     let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_577_836_800);
     std::fs::File::options().write(true).open(&pcm).unwrap()
         .set_times(std::fs::FileTimes::new().set_modified(old)).unwrap();
@@ -749,7 +757,7 @@ fn wav_becomes_flac_only_when_safe() {
         engine.clone().run_batch(raw()).await;
     });
     let logs = rec.logs.lock().unwrap().join("\n");
-    assert_eq!(engine.snapshot().compressed_this_run, 1, "{logs}");
+    assert_eq!(engine.snapshot().compressed_this_run, 3, "{logs}");
     let flac = media.join("pcm.flac");
     assert!(!pcm.exists() && flac.exists(), "{logs}");
     assert_eq!(std::fs::metadata(&flac).unwrap().modified().unwrap(), old, "date not kept");
@@ -759,7 +767,65 @@ fn wav_becomes_flac_only_when_safe() {
     };
     assert_eq!(decode(&flac), decode(&root.join("media (originals)").join("pcm.wav")), "samples changed");
     assert!(float.exists(), "float WAV must stay");
-    assert!(taken.exists() && std::fs::read(media.join("taken.flac")).unwrap() == b"someone else's file", "{logs}");
+    // Another file had the name: the conversion gets a number, that file is untouched.
+    assert!(std::fs::read(media.join("taken.flac")).unwrap() == b"someone else's file", "{logs}");
+    assert!(!taken.exists() && media.join("taken (2).flac").exists(), "{logs}");
+    // The same audio under the name: one FLAC stays (the smaller), the WAV went to the backup.
+    assert!(!same.exists() && media.join("same.flac").exists(), "{logs}");
+    assert!(!media.join("same (2).flac").exists(), "{logs}");
+    assert_eq!(decode(&media.join("same.flac")), decode(&root.join("media (originals)").join("same.wav")));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Same name, same or other content (pictures and a GIF + MP4), and wrong extensions fixed.
+#[test]
+fn same_names_and_wrong_extensions() {
+    let Some(ff) = ffmpeg() else {
+        eprintln!("skipping: bundled ffmpeg not found");
+        return;
+    };
+    let tools = crate::image::tools::Tools::discover(ff.clone(), &std::env::temp_dir());
+    if !["oxipng", "ssimulacra2", "djpeg"].iter().all(|t| tools.has(t)) {
+        eprintln!("skipping: image tools not found");
+        return;
+    }
+    let root = test_dir("samename");
+    let media = root.join("media");
+    std::fs::create_dir_all(&media).unwrap();
+    let pic = |src: &str, extra: &[&str], out: &str| {
+        let mut a = vec!["-f", "lavfi", "-i", src, "-frames:v", "1"];
+        a.extend(extra);
+        make(&ff, &a, &media.join(out));
+    };
+    // sky: the same picture as an uncompressed PNG already exists -> one sky.png stays.
+    pic("testsrc=s=320x240", &[], "sky.bmp");
+    pic("testsrc=s=320x240", &["-compression_level", "0"], "sky.png");
+    // other: a different picture has the name -> "other (2).png".
+    pic("testsrc=s=320x240", &[], "other.bmp");
+    pic("mandelbrot=s=320x240", &[], "other.png");
+    // Wrong extensions: a JPEG called .png, a WebP called .jpg.
+    pic("testsrc2=s=320x240", &["-q:v", "2", "-f", "mjpeg"], "photo.png");
+    pic("testsrc2=s=320x240", &["-c:v", "libwebp", "-f", "webp"], "web.jpg");
+    // anim.gif and anim.mp4 made from it: the same video -> one anim.mp4 stays.
+    make(&ff, &["-f", "lavfi", "-i", "testsrc=s=320x240:r=10:d=3", "-vf", "split[a][b];[a]palettegen[p];[b][p]paletteuse"], &media.join("anim.gif"));
+    make(&ff, &["-i", media.join("anim.gif").to_str().unwrap(), "-fps_mode", "passthrough", "-c:v", "libx264", "-qp", "0", "-pix_fmt", "yuv444p"], &media.join("anim.mp4"));
+
+    let rt = runtime();
+    let (engine, rec) = new_engine(&rt, &root, ff.clone());
+    let raw = || RawOptions { originals: Some(2), convert: Some(1), images: Some(1), fix_ext: Some(1), ..opts("av1_nvenc", 1.0) };
+    rt.block_on(async {
+        engine.apply_options(raw());
+        engine.load_dir(media.clone()).await;
+        engine.clone().run_batch(raw()).await;
+    });
+    let logs = rec.logs.lock().unwrap().join("\n");
+    let names: std::collections::BTreeSet<String> =
+        std::fs::read_dir(&media).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    println!("{logs}");
+    let want = ["anim.mp4", "other (2).png", "other.png", "photo.jpg", "sky.png", "web.webp"];
+    assert_eq!(names, want.iter().map(ToString::to_string).collect(), "{logs}");
+    let backup = root.join("media (originals)");
+    assert!(backup.join("sky.bmp").exists() && backup.join("other.bmp").exists() && backup.join("anim.gif").exists(), "{logs}");
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -789,6 +855,8 @@ fn real_folder_run() {
         convert: Some(1),
         lossy_docs: Some(1),
         effort: None,
+        temp_dir: None,
+        fix_ext: None,
     };
     let t = std::time::Instant::now();
     rt.block_on(async {

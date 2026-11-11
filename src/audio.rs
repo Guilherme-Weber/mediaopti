@@ -135,7 +135,7 @@ fn write_with_tail(out: &Path, head: &[u8], src: &Path, at: u64) -> io::Result<(
 }
 
 /// SHA-256 of the decoded audio (first audio stream, 32-bit samples: exact for any FLAC).
-fn audio_hash(ctx: &Ctx, path: &Path) -> Result<Option<[u8; 32]>, RunError> {
+pub(crate) fn audio_hash(ctx: &Ctx, path: &Path) -> Result<Option<[u8; 32]>, RunError> {
     let args = crate::os_args!["-v", "error", "-i", path, "-map", "0:a:0", "-f", "s32le", "-"];
     let ran = tools::run(&ctx.tools.ffmpeg, args, None, Capture::Hash, audio_timeout(ctx, path), &ctx.gate)?;
     Ok(ran.hash.filter(|_| ran.success))
@@ -253,7 +253,7 @@ fn vendor(blocks: &[(u8, Vec<u8>)]) -> &[u8] {
 /// flac's encoding settings (imageopti's: `-e` at max effort).
 fn flac_level(ctx: &Ctx) -> Vec<std::ffi::OsString> {
     let mut a = crate::os_args!["-8", "-p", "-A", "subdivide_tukey(5)"];
-    if ctx.max {
+    if ctx.max.flac_e {
         a.push("-e".into());
     }
     a
@@ -262,7 +262,7 @@ fn flac_level(ctx: &Ctx) -> Vec<std::ffi::OsString> {
 /// Time allowed to encode or decode `path`: the usual limit, or more for big files (a
 /// hi-res album as one file can take a long time at `-8 -p -e`).
 fn audio_timeout(ctx: &Ctx, path: &Path) -> std::time::Duration {
-    let bytes_per_sec: u64 = if ctx.max { 256 * 1024 } else { 1024 * 1024 };
+    let bytes_per_sec: u64 = if ctx.max.flac_e { 256 * 1024 } else { 1024 * 1024 };
     let size = std::fs::metadata(path).map_or(0, |m| m.len());
     ctx.timeout.max(std::time::Duration::from_secs(size / bytes_per_sec))
 }
@@ -286,7 +286,7 @@ pub fn worth_trying(ctx: &Ctx, kind: Kind, path: &Path) -> bool {
     let has_art = |data: &[u8]| data.len() >= MIN_ART && sniff(data).is_some();
     match kind {
         Kind::Flac => flac_read(path).ok().flatten().is_some_and(|f| {
-            ((ctx.max || !is_modern(&f)) && ctx.tools.has("flac"))
+            ((ctx.max.flac_all || !is_modern(&f)) && ctx.tools.has("flac"))
                 || f.blocks.iter().any(|(t, b)| *t == PICTURE && picture_parse(b).is_some_and(|p| has_art(p.data)))
         }),
         Kind::Mp3 => mp3_tag(path).ok().flatten().is_some_and(|tag| {
@@ -559,7 +559,7 @@ fn flac(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, AudioError> {
 
     // 2) re-encoding: worthwhile only for files from older or other encoders (any at max).
     // flac would drop an ID3v1 or APE tag appended after the audio (the art path copies it).
-    if (ctx.max || !is_modern(&orig)) && !tag_at_end(src)? {
+    if (ctx.max.flac_all || !is_modern(&orig)) && !tag_at_end(src)? {
         if let Some(flac) = ctx.tools.get("flac") {
             let out = work.join("enc.flac");
             let mut args = flac_level(ctx);
@@ -569,7 +569,7 @@ fn flac(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, AudioError> {
                 let size = std::fs::metadata(&out).map_or(u64::MAX, |m| m.len());
                 if size < best_size && flac_encode_ok(ctx, reference_audio(ctx, src, &mut orig_audio)?, &best, &out)? {
                     best = out;
-                    steps.push(if ctx.max { "flac-8pe" } else { "flac-8p" }.to_string());
+                    steps.push(if ctx.max.flac_e { "flac-8pe" } else { "flac-8p" }.to_string());
                 }
             }
         }
@@ -791,7 +791,7 @@ mod tests {
             parallel: false,
             timeout: Duration::from_secs(120),
             gate: crate::image::tools::Gate::default(),
-            max: false,
+            max: crate::image::Max::default(),
             slots: None,
         })
     }

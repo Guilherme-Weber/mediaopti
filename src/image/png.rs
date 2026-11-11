@@ -31,6 +31,15 @@ impl PngInfo {
 }
 
 /// Reads the chunk list without loading image data.
+/// Width x height of a PNG in pixels, from its IHDR.
+pub fn pixels(path: &Path) -> Option<u64> {
+    let mut head = [0u8; 24];
+    std::fs::File::open(path).ok()?.read_exact(&mut head).ok()?;
+    (&head[..8] == SIGNATURE && &head[12..16] == b"IHDR").then(|| {
+        u64::from(u32::from_be_bytes(head[16..20].try_into().unwrap())) * u64::from(u32::from_be_bytes(head[20..24].try_into().unwrap()))
+    })
+}
+
 /// Where a PNG ends (just after its IEND chunk); `None` if damaged.
 pub fn end_of_image(d: &[u8]) -> Option<usize> {
     if d.get(..8)? != SIGNATURE {

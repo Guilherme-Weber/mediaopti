@@ -77,6 +77,10 @@ pub struct Options {
     /// imageopti's "max" level for the CPU files: every tool at its highest setting (slow,
     /// a little smaller). It doesn't redo files already processed at the normal level.
     pub max_effort: bool,
+    /// Where CPU jobs keep their work files (`None`: the system temp folder).
+    pub temp_dir: Option<PathBuf>,
+    /// Rename pictures whose extension doesn't match their format (a JPEG named .png).
+    pub fix_ext: bool,
 }
 
 impl Default for Options {
@@ -93,7 +97,9 @@ impl Default for Options {
             images: ImageMode::Lossy,
             convert: true,
             lossy_docs: true,
-            max_effort: false,
+            max_effort: true,
+            temp_dir: None,
+            fix_ext: false,
         }
     }
 }
@@ -118,6 +124,10 @@ pub struct RawOptions {
     pub lossy_docs: Option<u32>,
     /// 1 = normal effort, 2 = maximum effort.
     pub effort: Option<u32>,
+    /// Folder for work files; empty = the system temp folder.
+    pub temp_dir: Option<String>,
+    /// 1 = rename misnamed pictures to their real format.
+    pub fix_ext: Option<u32>,
 }
 
 impl Options {
@@ -165,7 +175,9 @@ impl Options {
             },
             convert: raw.convert.map_or(d.convert, |c| c != 0),
             lossy_docs: raw.lossy_docs.map_or(d.lossy_docs, |c| c != 0),
-            max_effort: raw.effort.map_or(d.max_effort, |e| e == 2),
+            max_effort: raw.effort.filter(|e| matches!(e, 1 | 2)).map_or(d.max_effort, |e| e == 2),
+            temp_dir: raw.temp_dir.filter(|t| !t.trim().is_empty()).map(PathBuf::from),
+            fix_ext: raw.fix_ext.map_or(d.fix_ext, |f| f != 0),
         }
     }
 }
@@ -360,8 +372,11 @@ mod tests {
             convert: None,
             lossy_docs: None,
             effort: Some(5),
+            temp_dir: Some("  ".into()),
+            fix_ext: None,
         });
-        assert!(!o.max_effort, "normal effort by default");
+        assert!(o.max_effort, "maximum effort by default");
+        assert!(o.temp_dir.is_none() && !o.fix_ext);
         assert!(o.convert, "conversions on by default");
         assert_eq!(o.images, ImageMode::Lossy, "images: visually lossless by default");
         assert_eq!(o.crf, 23);

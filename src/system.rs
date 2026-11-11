@@ -440,6 +440,29 @@ pub fn release_claim(path: &Path) {
     }
 }
 
+impl Disposal {
+    /// The same disposal for another file in the same folder (a backup goes next to the
+    /// original's backup).
+    pub fn for_sibling(&self, other: &Path) -> Disposal {
+        match self {
+            Disposal::MoveTo(dest) => Disposal::MoveTo(dest.with_file_name(other.file_name().unwrap_or_default())),
+            d => d.clone(),
+        }
+    }
+}
+
+/// Recycles, moves or deletes a file as `disposal` says (a duplicate being removed).
+pub fn dispose(path: &Path, disposal: &Disposal) -> std::io::Result<()> {
+    match disposal {
+        Disposal::RecycleBin => {
+            clear_readonly(path);
+            recycle(path)
+        }
+        Disposal::MoveTo(dest) => move_file(path, dest).map(drop),
+        Disposal::Delete => remove_file_if_exists(path),
+    }
+}
+
 /// `path`, or `path` with " (2)", " (3)"... before the extension if it exists.
 pub fn unused_name(path: &Path) -> std::path::PathBuf {
     if !path.exists() {

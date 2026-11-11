@@ -68,8 +68,12 @@ const PDFS: &[(u32, &str)] = &[
     (0, "Lossless only"),
 ];
 const EFFORTS: &[(u32, &str)] = &[
-    (1, "Normal (benchmarked tools)"),
-    (2, "Maximum (much slower, a little smaller)"),
+    (2, "Maximum (recommended)"),
+    (1, "Normal (faster)"),
+];
+const FIX_EXT: &[(u32, &str)] = &[
+    (0, "Keep file names"),
+    (1, "Rename to the real format"),
 ];
 const QUALITY_CHECK: &[(u32, &str)] = &[
     (93, "VMAF 93 (recommended)"),
@@ -101,6 +105,10 @@ struct Prefs {
     lossy_docs: u32,
     /// 1 = normal, 2 = maximum effort for images, audio and documents.
     effort: u32,
+    /// Folder for work files; empty = the system temp folder.
+    temp_dir: String,
+    /// 1 = rename misnamed pictures (a JPEG called .png) to their real format.
+    fix_ext: u32,
 }
 
 impl Default for Prefs {
@@ -117,7 +125,9 @@ impl Default for Prefs {
             images: 2,
             convert: 1,
             lossy_docs: 1,
-            effort: 1,
+            effort: 2,
+            temp_dir: String::new(),
+            fix_ext: 0,
         }
     }
 }
@@ -158,6 +168,8 @@ impl Prefs {
             convert: CONVERSIONS[pick(w.get_convert_index(), CONVERSIONS.len())].0,
             lossy_docs: PDFS[pick(w.get_pdf_index(), PDFS.len())].0,
             effort: EFFORTS[pick(w.get_effort_index(), EFFORTS.len())].0,
+            temp_dir: w.get_temp_dir().into(),
+            fix_ext: FIX_EXT[pick(w.get_fix_ext_index(), FIX_EXT.len())].0,
         }
     }
 
@@ -177,6 +189,8 @@ impl Prefs {
         w.set_convert_index(position(CONVERSIONS, &self.convert, &d.convert));
         w.set_pdf_index(position(PDFS, &self.lossy_docs, &d.lossy_docs));
         w.set_effort_index(position(EFFORTS, &self.effort, &d.effort));
+        w.set_temp_dir(self.temp_dir.as_str().into());
+        w.set_fix_ext_index(position(FIX_EXT, &self.fix_ext, &d.fix_ext));
     }
 
     fn to_raw(&self) -> RawOptions {
@@ -193,6 +207,8 @@ impl Prefs {
             convert: Some(self.convert),
             lossy_docs: Some(self.lossy_docs),
             effort: Some(self.effort),
+            temp_dir: Some(self.temp_dir.clone()),
+            fix_ext: Some(self.fix_ext),
         }
     }
 }
@@ -612,6 +628,8 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
     window.set_images_options(labels(IMAGES));
     window.set_convert_options(labels(CONVERSIONS));
     window.set_pdf_options(labels(PDFS));
+    window.set_fix_ext_options(labels(FIX_EXT));
+    window.set_system_temp(std::env::temp_dir().to_string_lossy().trim_end_matches('\\').into());
     window.set_effort_options(labels(EFFORTS));
     let prefs = Prefs::load(&prefs_path);
     prefs.apply_to_window(&window);
@@ -733,6 +751,26 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
         let engine = engine.clone();
         let weak = window.as_weak();
         let prefs_path = prefs_path.clone();
+        window.on_choose_temp_folder({
+            let engine = engine.clone();
+            let weak = window.as_weak();
+            let prefs_path = prefs_path.clone();
+            move || {
+                let Some(w) = weak.upgrade() else { return };
+                let handle = w.window().window_handle();
+                let Some(dir) = rfd::FileDialog::new()
+                    .set_title("Choose the folder for temporary files")
+                    .set_parent(&handle)
+                    .pick_folder()
+                else {
+                    return;
+                };
+                w.set_temp_dir(dir.to_string_lossy().as_ref().into());
+                let prefs = Prefs::from_window(&w);
+                prefs.save(&prefs_path);
+                engine.apply_options_in_background(prefs.to_raw());
+            }
+        });
         window.on_choose_backup_folder(move || {
             let Some(w) = weak.upgrade() else { return };
             let handle = w.window().window_handle();

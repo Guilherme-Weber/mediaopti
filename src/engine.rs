@@ -697,8 +697,11 @@ impl Engine {
 
         let scan_dir = dir.clone();
         // A backup folder inside the scanned folder must not be scanned (or optimized again).
-        let exclude = self.lock().backup_root();
-        let scan = self.rt.spawn_blocking(move || scan_folder(&scan_dir, exclude.as_deref())).await;
+        let (exclude, temp) = {
+            let inner = self.lock();
+            (inner.backup_root(), inner.options.temp_dir.clone())
+        };
+        let scan = self.rt.spawn_blocking(move || scan_folder(&scan_dir, exclude.as_deref(), temp.as_deref())).await;
 
         match scan {
             Ok(result) => {
@@ -1459,22 +1462,39 @@ impl Engine {
             input.with_file_name(format!("{stem}{ext}"))
         };
 
-        // Claimed atomically: x.mkv and x.avi running at once can't both become x.mp4.
+        // Claimed atomically: x.mkv and x.avi running at once can't both become x.mp4. If a
+        // file has that name already: the same video (VMAF, same length) keeps the smaller
+        // copy; another video makes this one "x (2).mp4".
+        let mut final_target = final_target;
         let claimed = final_target != input;
-        let t = final_target.clone();
-        if claimed && self.blocking(move || system::claim_new_name(&t)).await.is_err() {
-            self.remember(&input, &input).await;
-            self.lock().run.skipped_larger += 1;
-            self.log_remove(&tmp);
-            self.log(format!(
-                "[Worker {worker_id}] Target {} already exists; kept original {display}",
-                final_target
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default()
-            ));
-            self.send_state(false);
-            return Outcome::Skipped;
+        let mut tries = 0;
+        if claimed {
+            loop {
+                let t = final_target.clone();
+                if self.blocking(move || system::claim_new_name(&t)).await.is_ok() {
+                    break;
+                }
+                tries += 1;
+                if tries == 1 {
+                    match self.same_video(&input, &final_target, attempt.diag.duration_sec).await {
+                        Err(Stopped) => {
+                            self.log_remove(&tmp);
+                            return Outcome::Stopped;
+                        }
+                        Ok(true) => return self.keep_smaller_video(worker_id, &input, &final_target, &tmp, &display, in_size).await,
+                        Ok(false) => {}
+                    }
+                }
+                if tries > 20 {
+                    self.remember(&input, &input).await;
+                    self.lock().run.skipped_larger += 1;
+                    self.log_remove(&tmp);
+                    self.log(format!("[Worker {worker_id}] No free name for the new version of {display}; kept the original"));
+                    self.send_state(false);
+                    return Outcome::Skipped;
+                }
+                final_target = system::unused_name(&final_target);
+            }
         }
 
         let path = input.clone();
@@ -1690,6 +1710,92 @@ impl Engine {
                     self.log_remove(tmp);
                     return finish(self, best, &notes).await;
                 }
+            }
+        }
+    }
+
+    /// Duration in seconds of a media file, from ffmpeg's report.
+    async fn probe_duration(&self, path: &Path) -> Option<f64> {
+        let mut cmd = tokio::process::Command::new(&self.ffmpeg_path);
+        cmd.args(["-hide_banner", "-i"]).arg(path).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true);
+        system::configure_background_command(&mut cmd, true);
+        let out = cmd.output().await.ok()?;
+        let text = String::from_utf8_lossy(&out.stderr);
+        let d = text.split("Duration: ").nth(1)?.split(',').next()?.trim();
+        let mut secs = 0.0;
+        for part in d.split(':') {
+            secs = secs * 60.0 + part.parse::<f64>().ok()?;
+        }
+        Some(secs)
+    }
+
+    /// Whether `existing` is the same video as `original`: about the same length and VMAF at
+    /// or above the quality floor (worst 5%: floor - 5). `Err` if Stop was pressed.
+    async fn same_video(&self, original: &Path, existing: &Path, duration_sec: f64) -> Result<bool, Stopped> {
+        let theirs = self.probe_duration(existing).await;
+        let close = |d: f64| duration_sec > 0.0 && (d - duration_sec).abs() <= (duration_sec * 0.02).max(0.5);
+        if !theirs.is_some_and(close) {
+            return Ok(false);
+        }
+        let floor = self.lock().options.vmaf_floor.unwrap_or(93.0);
+        Ok(match self.measure_vmaf(original, existing, duration_sec, None).await? {
+            Ok((vmaf, worst)) => vmaf >= floor && worst >= floor - 5.0,
+            Err(_) => false,
+        })
+    }
+
+    /// `existing` already holds the same video as `input`: the smaller of it and the new
+    /// encode (`tmp`) stays under its name; the original and the other copy go as the
+    /// replaced-originals setting says.
+    async fn keep_smaller_video(self: &Arc<Self>, worker_id: u32, input: &Path, existing: &Path, tmp: &Path, display: &str, in_size: f64) -> Outcome {
+        let disposal = self.lock().disposal_for(input);
+        let (input_c, existing_c, tmp_c) = (input.to_path_buf(), existing.to_path_buf(), tmp.to_path_buf());
+        let result = self
+            .blocking(move || -> Result<(bool, f64), String> {
+                let theirs = std::fs::metadata(&existing_c).map_err(|e| e.to_string())?.len();
+                let ours = std::fs::metadata(&tmp_c).map_err(|e| e.to_string())?.len();
+                let replaced = ours < theirs;
+                if replaced {
+                    let attrs = std::fs::metadata(&input_c).map(|m| OriginalAttributes::from_metadata(&m));
+                    replace_original(&tmp_c, &existing_c, &existing_c, &disposal.for_sibling(&existing_c))?;
+                    if let Ok(a) = attrs {
+                        let _ = system::restore_attributes(&existing_c, &a);
+                    }
+                } else {
+                    let _ = system::remove_file_if_exists(&tmp_c);
+                }
+                system::dispose(&input_c, &disposal).map_err(|e| format!("could not remove the original: {e}"))?;
+                let freed = if replaced { (theirs - ours) as f64 } else { 0.0 };
+                Ok((replaced, freed))
+            })
+            .await;
+        let name = existing.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        match result {
+            Ok((replaced, freed)) => {
+                self.remember(existing, existing).await;
+                {
+                    let mut inner = self.lock();
+                    inner.run.compressed += 1;
+                    inner.space_saved_mb += (in_size + freed) / (1024.0 * 1024.0);
+                }
+                self.log(if replaced {
+                    format!("[Worker {worker_id}] {display}: {name} was the same video; it now holds the smaller new version and the original was removed")
+                } else {
+                    format!("[Worker {worker_id}] {display}: {name} is the same video and smaller; the original was removed")
+                });
+                self.send_state(false);
+                Outcome::Processed
+            }
+            Err(err) => {
+                self.log_remove(tmp);
+                {
+                    let mut inner = self.lock();
+                    inner.failed.insert(input.to_path_buf());
+                    inner.run.failed += 1;
+                }
+                self.log(format!("[Worker {worker_id}] {display}: {err}"));
+                self.send_state(true);
+                Outcome::Failed
             }
         }
     }
@@ -2103,11 +2209,12 @@ struct ScanResult {
 /// Recursively finds videos (skipping hidden folders like the old glob did), deletes leftover
 /// temp files and sorts the queue by size, largest first. File sizes come from the directory
 /// listing itself (on Windows `DirEntry::metadata` needs no extra system call).
-fn scan_folder(dir: &Path, exclude: Option<&Path>) -> ScanResult {
+fn scan_folder(dir: &Path, exclude: Option<&Path>, temp: Option<&Path>) -> ScanResult {
     let mut messages = Vec::new();
     let mut cleaned_orphans = 0;
     // Work folders of runs that were killed or crashed.
     let mut stale = vec![std::env::temp_dir()];
+    stale.extend(temp.map(Path::to_path_buf));
     stale.extend(images::volume_root(dir).map(|r| r.join(images::DRIVE_WORK_DIR)));
     let cleaned_work: usize = stale.iter().map(|d| system::clean_stale_work(d)).sum();
     if cleaned_work > 0 {

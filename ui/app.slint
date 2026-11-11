@@ -280,6 +280,10 @@ export component AppWindow inherits Window {
     in property <[string]> pdf-options;
     in-out property <int> pdf-index;
     in property <[string]> effort-options;
+    in property <[string]> fix-ext-options;
+    in-out property <int> fix-ext-index;
+    in-out property <string> temp-dir;
+    in property <string> system-temp;
     in-out property <int> effort-index;
 
     callback choose-folder();
@@ -291,6 +295,7 @@ export component AppWindow inherits Window {
     callback open-logs();
     callback settings-changed();
     callback choose-backup-folder();
+    callback choose-temp-folder();
 
     // Incremented by Rust after new log lines arrive; the log view scrolls to the end.
     in property <int> log-revision;
@@ -492,9 +497,17 @@ export component AppWindow inherits Window {
                     SettingField {
                         glyph: "\u{E945}";
                         label: "Effort";
-                        hint: "Maximum tries every tool at its highest setting (much slower).";
+                        hint: "Maximum: the tools and settings that pay off; slower.";
                         model: root.effort-options;
                         current-index <=> root.effort-index;
+                        changed => { root.settings-changed(); }
+                    }
+                    SettingField {
+                        glyph: "\u{E8AC}";
+                        label: "Wrong extensions";
+                        hint: "A JPEG named .png becomes .jpg (may break saved web pages).";
+                        model: root.fix-ext-options;
+                        current-index <=> root.fix-ext-index;
                         changed => { root.settings-changed(); }
                     }
                 }
@@ -522,6 +535,27 @@ export component AppWindow inherits Window {
                     text: "Use default";
                     clicked => {
                         root.backup-dir = "";
+                        root.settings-changed();
+                    }
+                }
+            }
+            HorizontalLayout {
+                spacing: 12px;
+                Glyph { glyph: "\u{E8B7}"; font-size: 13px; color: Theme.text-tertiary; width: 14px; }
+                Text {
+                    text: "Temporary files go to " + (root.temp-dir != "" ? root.temp-dir : root.system-temp)
+                        + " (a drive short on space uses a hidden folder on the file's own drive).";
+                    font-size: 13px;
+                    color: Theme.text-secondary;
+                    vertical-alignment: center;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                }
+                LinkText { text: "Change folder…"; clicked => { root.choose-temp-folder(); } }
+                if root.temp-dir != "": LinkText {
+                    text: "Use default";
+                    clicked => {
+                        root.temp-dir = "";
                         root.settings-changed();
                     }
                 }
