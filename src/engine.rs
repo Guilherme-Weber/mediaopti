@@ -261,6 +261,15 @@ impl Inner {
         }
     }
 
+    /// Whether the settings let the CPU workers take this file: conversions (WAV) follow the
+    /// conversions option, everything else (images, cover art) the image option.
+    fn cpu_job_enabled(&self, file: &Path) -> bool {
+        match image::kind_of(file) {
+            Some(k) if k.is_conversion() => self.options.convert,
+            _ => self.options.images != ImageMode::Off,
+        }
+    }
+
     /// Content-history request for a file under the current settings.
     fn want(&self, file: &Path, size: u64) -> history::Want {
         if !self.is_image_job(file, size) {
@@ -310,8 +319,8 @@ impl Inner {
             if is_generated_name(file) {
                 generated += 1;
             } else if self.is_image_job(file, size) {
-                if self.options.images == ImageMode::Off {
-                    // Not remembered: they may be optimized once images are switched on.
+                if !self.cpu_job_enabled(file) {
+                    // Not remembered: they may be optimized once switched on.
                     if args::is_gif(file) {
                         small_gifs += 1;
                     }

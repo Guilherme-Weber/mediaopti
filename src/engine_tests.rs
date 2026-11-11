@@ -83,6 +83,7 @@ fn opts(encoder: &str, concurrency: f64) -> RawOptions {
         gif_min_mb: Some(0),
         vmaf_floor: Some(0),
         images: Some(0),
+        convert: Some(0),
     }
 }
 
@@ -701,6 +702,61 @@ fn originals_go_to_a_mirrored_backup_folder() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// WAV -> FLAC: integer PCM becomes a .flac with the original's date (the WAV goes to the
+/// backup folder); float PCM stays; a WAV whose .flac name is taken stays. With
+/// conversions off, WAVs are not queued at all.
+#[test]
+fn wav_becomes_flac_only_when_safe() {
+    let Some(ff) = ffmpeg() else {
+        eprintln!("skipping: bundled ffmpeg not found");
+        return;
+    };
+    if !crate::image::tools::Tools::discover(ff.clone(), &std::env::temp_dir()).has("flac") {
+        eprintln!("skipping: flac not found");
+        return;
+    }
+    let root = test_dir("wav");
+    let media = root.join("media");
+    std::fs::create_dir_all(&media).unwrap();
+    let tone = ["-f", "lavfi", "-i", "sine=frequency=440:duration=3"];
+    let (pcm, float, taken) = (media.join("pcm.wav"), media.join("float.wav"), media.join("taken.wav"));
+    make(&ff, &[&tone[..], &["-c:a", "pcm_s16le"]].concat(), &pcm);
+    make(&ff, &[&tone[..], &["-c:a", "pcm_f32le"]].concat(), &float);
+    make(&ff, &[&tone[..], &["-c:a", "pcm_s24le"]].concat(), &taken);
+    std::fs::write(media.join("taken.flac"), b"someone else's file").unwrap();
+    let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_577_836_800);
+    std::fs::File::options().write(true).open(&pcm).unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(old)).unwrap();
+    let pcm_before = std::fs::read(&pcm).unwrap();
+
+    let rt = runtime();
+    let (off, _) = new_engine(&rt, &root, ff.clone());
+    off.apply_options(opts("av1_nvenc", 1.0));
+    rt.block_on(off.load_dir(media.clone()));
+    assert_eq!(off.snapshot().pending_files, 0, "conversions off: no WAV queued");
+
+    let (engine, rec) = new_engine(&rt, &root, ff.clone());
+    let raw = || RawOptions { originals: Some(2), convert: Some(1), ..opts("av1_nvenc", 1.0) };
+    rt.block_on(async {
+        engine.apply_options(raw());
+        engine.load_dir(media.clone()).await;
+        engine.clone().run_batch(raw()).await;
+    });
+    let logs = rec.logs.lock().unwrap().join("\n");
+    assert_eq!(engine.snapshot().compressed_this_run, 1, "{logs}");
+    let flac = media.join("pcm.flac");
+    assert!(!pcm.exists() && flac.exists(), "{logs}");
+    assert_eq!(std::fs::metadata(&flac).unwrap().modified().unwrap(), old, "date not kept");
+    assert_eq!(std::fs::read(root.join("media (originals)").join("pcm.wav")).unwrap(), pcm_before);
+    let decode = |p: &Path| {
+        std::process::Command::new(&ff).args(["-v", "error", "-i"]).arg(p).args(["-f", "s32le", "-"]).output().unwrap().stdout
+    };
+    assert_eq!(decode(&flac), decode(&root.join("media (originals)").join("pcm.wav")), "samples changed");
+    assert!(float.exists(), "float WAV must stay");
+    assert!(taken.exists() && std::fs::read(media.join("taken.flac")).unwrap() == b"someone else's file", "{logs}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Real run, in place, on a folder of copies: `MEDIAOPTI_REAL_DIR=<folder>
 /// MEDIAOPTI_REAL_DATA=<history folder> cargo test --release real_folder_run -- --ignored
 /// --nocapture`. Originals go to "<folder> (originals)". Never point it at real files.
@@ -724,6 +780,7 @@ fn real_folder_run() {
         gif_min_mb: Some(1),
         vmaf_floor: Some(93),
         images: Some(2),
+        convert: Some(1),
     };
     let t = std::time::Instant::now();
     rt.block_on(async {

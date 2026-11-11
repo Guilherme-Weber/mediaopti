@@ -59,6 +59,10 @@ const IMAGES: &[(u32, &str)] = &[
     (1, "Lossless only (pixel-identical)"),
     (0, "Don't process images"),
 ];
+const CONVERSIONS: &[(u32, &str)] = &[
+    (1, "WAV → FLAC (lossless)"),
+    (0, "Keep file formats"),
+];
 const QUALITY_CHECK: &[(u32, &str)] = &[
     (93, "VMAF 93 (recommended)"),
     (95, "VMAF 95 (stricter)"),
@@ -83,6 +87,8 @@ struct Prefs {
     gif_min_mb: u32,
     vmaf_floor: u32,
     images: u32,
+    /// 1 = lossless format conversions (WAV -> FLAC), 0 = keep formats.
+    convert: u32,
 }
 
 impl Default for Prefs {
@@ -97,6 +103,7 @@ impl Default for Prefs {
             gif_min_mb: 1,
             vmaf_floor: 93,
             images: 2,
+            convert: 1,
         }
     }
 }
@@ -134,6 +141,7 @@ impl Prefs {
             gif_min_mb: GIFS[pick(w.get_gifs_index(), GIFS.len())].0,
             vmaf_floor: QUALITY_CHECK[pick(w.get_check_index(), QUALITY_CHECK.len())].0,
             images: IMAGES[pick(w.get_images_index(), IMAGES.len())].0,
+            convert: CONVERSIONS[pick(w.get_convert_index(), CONVERSIONS.len())].0,
         }
     }
 
@@ -150,6 +158,7 @@ impl Prefs {
         w.set_gifs_index(position(GIFS, &self.gif_min_mb, &d.gif_min_mb));
         w.set_check_index(position(QUALITY_CHECK, &self.vmaf_floor, &d.vmaf_floor));
         w.set_images_index(position(IMAGES, &self.images, &d.images));
+        w.set_convert_index(position(CONVERSIONS, &self.convert, &d.convert));
     }
 
     fn to_raw(&self) -> RawOptions {
@@ -163,6 +172,7 @@ impl Prefs {
             gif_min_mb: Some(self.gif_min_mb),
             vmaf_floor: Some(self.vmaf_floor),
             images: Some(self.images),
+            convert: Some(self.convert),
         }
     }
 }
@@ -553,6 +563,7 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
     window.set_gifs_options(labels(GIFS));
     window.set_check_options(labels(QUALITY_CHECK));
     window.set_images_options(labels(IMAGES));
+    window.set_convert_options(labels(CONVERSIONS));
     let prefs = Prefs::load(&prefs_path);
     prefs.apply_to_window(&window);
     engine.apply_options(prefs.to_raw());

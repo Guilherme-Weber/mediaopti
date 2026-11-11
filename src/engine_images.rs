@@ -31,6 +31,8 @@ pub(super) enum ImageResult {
         /// A lossy encoder won (quality search labels look like `beeim-quantizer=81`).
         lossy: bool,
         content: Option<(ContentHash, u64)>,
+        /// Converted: the new file's path (the original's name is gone).
+        renamed: Option<PathBuf>,
     },
     /// Nothing smaller (or not a valid image): remembered so it is not retried.
     Kept {
@@ -173,11 +175,15 @@ impl Engine {
                 remembered = true;
             };
             match result {
-                ImageResult::Smaller { before, after, lossy, content } => {
+                ImageResult::Smaller { before, after, lossy, content, renamed } => {
                     inner.run.compressed += 1;
                     inner.run.images_lossy += usize::from(lossy);
                     inner.space_saved_mb += (before - after) as f64 / (1024.0 * 1024.0);
                     remember(&mut inner, content);
+                    if let Some(new) = renamed {
+                        inner.history.add_image(&new, mode);
+                        log = Some(format!("[Images] Converted {display} to {}", new.file_name().unwrap_or_default().to_string_lossy()));
+                    }
                 }
                 ImageResult::Kept { content, note } => {
                     inner.run.skipped_larger += 1;
@@ -270,10 +276,17 @@ pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, dispo
     if file_state(path) != Some(state) {
         return ImageResult::Skipped("it changed while it was being optimized (it will be processed next time)".into());
     }
+    // A conversion (WAV -> FLAC) saves under the new extension, never over another file.
+    let target = result.new_ext.map_or_else(|| path.to_path_buf(), |e| path.with_extension(e));
+    if target != path && target.exists() {
+        let name = target.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        return ImageResult::Kept { content: content_of(path), note: Some(format!("{name} already exists, kept the original")) };
+    }
 
     // The new version goes next to the original first (same volume), then replaces it.
     let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    let sibling = path.with_file_name(format!("{stem}.mediaopti.i{worker_id}.{ext}"));
+    let new_ext = result.new_ext.map_or(ext, str::to_string);
+    let sibling = path.with_file_name(format!("{stem}.mediaopti.i{worker_id}.{new_ext}"));
     let attrs = match std::fs::metadata(path) {
         Ok(m) => system::OriginalAttributes::from_metadata(&m),
         Err(err) => return ImageResult::Failed(err.to_string()),
@@ -282,10 +295,11 @@ pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, dispo
         let _ = system::remove_file_if_exists(&sibling);
         return ImageResult::Failed(format!("could not write next to the original: {err}"));
     }
-    if let Err(err) = super::replace_original(&sibling, path, path, disposal) {
+    if let Err(err) = super::replace_original(&sibling, &target, path, disposal) {
         return ImageResult::Failed(err);
     }
-    let _ = system::restore_attributes(path, &attrs);
+    let _ = system::restore_attributes(&target, &attrs);
     let lossy = result.steps.iter().any(|s| s.contains('='));
-    ImageResult::Smaller { before, after, lossy, content: content_of(path) }
+    let renamed = (target != path).then(|| target.clone());
+    ImageResult::Smaller { before, after, lossy, content: content_of(&target), renamed }
 }

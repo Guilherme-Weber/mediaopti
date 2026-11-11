@@ -1,4 +1,5 @@
-//! Audio (FLAC, MP3), ported from imageopti's `handle_flac` and `handle_mp3`.
+//! Audio (FLAC, MP3, WAV), ported from imageopti's `handle_flac`, `handle_mp3` and
+//! `handle_wav`.
 //!
 //! - **Cover art**: embedded pictures (FLAC PICTURE blocks, ID3v2 APIC frames) are optimized
 //!   by the image pipeline (pixel-identical, or SSIMULACRA2 >= 93 in lossy mode). Everything
@@ -6,6 +7,8 @@
 //! - **FLAC re-encoding** (`-8 -p -A subdivide_tukey(5)`): only for files from encoders older
 //!   than libFLAC 1.4, accepted only when the decoded audio, the tags and the CUESHEET,
 //!   APPLICATION and PICTURE blocks are unchanged.
+//! - **WAV -> FLAC** (a conversion: the extension changes): integer PCM only, accepted when
+//!   the FLAC decodes to the same samples with the same channels, rate and bit depth.
 //!
 //! Audio data is streamed, never read into memory whole (hi-res albums can be huge).
 
@@ -28,6 +31,7 @@ pub fn optimize(ctx: &Ctx, kind: Kind, src: &Path, work: &Path) -> Result<Optimi
     let r = match kind {
         Kind::Flac => flac(ctx, src, work),
         Kind::Mp3 => mp3(ctx, src, work),
+        Kind::Wav => wav(ctx, src, work),
         _ => unreachable!("not audio"),
     };
     match r {
@@ -55,7 +59,7 @@ impl From<io::Error> for AudioError {
 }
 
 fn skip(why: &str) -> Result<Optimized, AudioError> {
-    Ok(Optimized { best: None, steps: Vec::new(), note: Some(why.to_string()) })
+    Ok(Optimized::skipped(why))
 }
 
 /// PNG or JPEG by signature.
@@ -270,8 +274,96 @@ pub fn worth_trying(ctx: &Ctx, kind: Kind, path: &Path) -> bool {
         Kind::Mp3 => mp3_tag(path).ok().flatten().is_some_and(|tag| {
             id3_frames(&tag.body, tag.ver).iter().any(|(id, b)| *id == b"APIC" && apic_data_start(b).is_some_and(|i| has_art(&b[i..])))
         }),
+        Kind::Wav => ctx.tools.has("flac") && wav_format(path).ok().flatten().is_some(),
         _ => true,
     }
+}
+
+// ---------------------------------------------------------------- WAV -> FLAC
+
+/// The layout of a WAV's samples: what a FLAC of it must declare.
+#[derive(Debug, PartialEq, Eq)]
+struct PcmFormat {
+    channels: u32,
+    sample_rate: u32,
+    bits: u32,
+}
+
+/// The format of a RIFF WAV holding integer PCM (plain or WAVE_FORMAT_EXTENSIBLE), which
+/// FLAC stores losslessly; `None` for anything else (float, ADPCM, RF64...).
+fn wav_format(path: &Path) -> io::Result<Option<PcmFormat>> {
+    let mut f = BufReader::new(File::open(path)?);
+    let mut head = [0u8; 12];
+    if read_full(&mut f, &mut head)? != 12 || &head[..4] != b"RIFF" || &head[8..] != b"WAVE" {
+        return Ok(None);
+    }
+    // Chunks before "fmt " are rare and small; give up after a few.
+    for _ in 0..16 {
+        let mut ch = [0u8; 8];
+        if read_full(&mut f, &mut ch)? != 8 {
+            return Ok(None);
+        }
+        let len = u32::from_le_bytes(ch[4..].try_into().unwrap());
+        if &ch[..4] != b"fmt " {
+            f.seek_relative(i64::from(len) + i64::from(len & 1))?;
+            continue;
+        }
+        if !(16..=1024).contains(&len) {
+            return Ok(None);
+        }
+        let mut b = vec![0u8; len as usize];
+        if read_full(&mut f, &mut b)? != b.len() {
+            return Ok(None);
+        }
+        let le16 = |i: usize| u32::from(u16::from_le_bytes([b[i], b[i + 1]]));
+        let tag = if le16(0) == 0xfffe && b.len() >= 26 { le16(24) } else { le16(0) };
+        let fmt = PcmFormat {
+            channels: le16(2),
+            sample_rate: u32::from_le_bytes(b[4..8].try_into().unwrap()),
+            bits: le16(14),
+        };
+        let ok = tag == 1 && (1..=8).contains(&fmt.channels) && (4..=32).contains(&fmt.bits) && fmt.sample_rate > 0;
+        return Ok(ok.then_some(fmt));
+    }
+    Ok(None)
+}
+
+/// Channels, sample rate and bits per sample from a FLAC's STREAMINFO.
+fn flac_format(f: &Flac) -> Option<PcmFormat> {
+    let b = f.blocks.first().filter(|b| b.0 == 0)?.1.get(10..14)?;
+    let v = u32::from_be_bytes(b.try_into().ok()?);
+    Some(PcmFormat { sample_rate: v >> 12, channels: ((v >> 9) & 7) + 1, bits: ((v >> 4) & 31) + 1 })
+}
+
+/// Integer PCM WAV -> FLAC, keeping the other RIFF chunks (`--keep-foreign-metadata`) when
+/// flac can. Accepted only when the FLAC decodes to the same samples, in the same format.
+fn wav(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, AudioError> {
+    let Some(flac) = ctx.tools.get("flac") else { return skip("flac is missing") };
+    let Some(format) = wav_format(src)? else {
+        return skip("not integer PCM (float, ADPCM or another codec): not convertible losslessly");
+    };
+    let out = work.join("out.flac");
+    let mut encoded = false;
+    for keep in [true, false] {
+        let mut args = crate::os_args!["-8", "-p", "-A", "subdivide_tukey(5)"];
+        if keep {
+            args.push("--keep-foreign-metadata-if-present".into());
+        }
+        args.extend(crate::os_args!["--verify", "--silent", "-f", "-o", &out, src]);
+        if tools::run(flac, args, Some(work), Capture::None, ctx.timeout, &ctx.cancel)?.success && out.is_file() {
+            encoded = true;
+            break;
+        }
+    }
+    if !encoded {
+        return skip("flac could not encode it");
+    }
+    let same_format = flac_read(&out)?.as_ref().and_then(flac_format).is_some_and(|f| f == format);
+    let reference = audio_hash(ctx, src)?;
+    if !same_format || reference.is_none() || audio_hash(ctx, &out)? != reference {
+        return skip("the FLAC does not decode to the same audio: kept as WAV");
+    }
+    Ok(Optimized { new_ext: Some("flac"), ..Optimized::found(Some(out), vec!["wav->flac".into()]) })
 }
 
 fn flac(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, AudioError> {
@@ -327,7 +419,7 @@ fn flac(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, AudioError> {
         }
     }
     let best = (best != src).then_some(best);
-    Ok(Optimized { best, steps, note: None })
+    Ok(Optimized::found(best, steps))
 }
 
 /// The new file has the same blocks except for picture data, the same audio bytes, and
@@ -400,7 +492,7 @@ fn mp3_tag(path: &Path) -> io::Result<Option<Id3>> {
 
 fn mp3(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, AudioError> {
     let Some(Id3 { head, ver, body: tag }) = mp3_tag(src)? else {
-        return Ok(Optimized { best: None, steps: Vec::new(), note: None }); // no plain ID3v2.3/2.4 tag
+        return Ok(Optimized::nothing()); // no plain ID3v2.3/2.4 tag
     };
     let tag_end = 10 + tag.len() as u64;
 
@@ -430,7 +522,7 @@ fn mp3(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, AudioError> {
         }
     }
     if n_art == 0 {
-        return Ok(Optimized { best: None, steps: Vec::new(), note: None });
+        return Ok(Optimized::nothing());
     }
     let mut new_tag = Vec::with_capacity(tag.len());
     for (fid, fflags, body) in &frames {
@@ -453,7 +545,7 @@ fn mp3(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, AudioError> {
         && mp3_frames_match(&tag, &new_tag, ver);
     let best = ok.then_some(out);
     let steps = if ok { vec![art_label(n_art, &art_steps)] } else { Vec::new() };
-    Ok(Optimized { best, steps, note: None })
+    Ok(Optimized::found(best, steps))
 }
 
 /// Offset of the picture data in an APIC frame body:

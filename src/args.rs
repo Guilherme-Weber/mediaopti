@@ -68,6 +68,9 @@ pub struct Options {
     /// Added to the CQ/CRF for the quality-checked retry (0 for the normal encode).
     pub cq_boost: u32,
     pub images: ImageMode,
+    /// Lossless format conversions (WAV -> FLAC; later BMP/TGA -> PNG, CBR -> CBZ). They
+    /// change the file extension.
+    pub convert: bool,
 }
 
 impl Default for Options {
@@ -82,6 +85,7 @@ impl Default for Options {
             vmaf_floor: Some(93.0),
             cq_boost: 0,
             images: ImageMode::Lossy,
+            convert: true,
         }
     }
 }
@@ -100,6 +104,8 @@ pub struct RawOptions {
     pub vmaf_floor: Option<u32>,
     /// 0 = off, 1 = lossless, 2 = lossy (visually lossless).
     pub images: Option<u32>,
+    /// 0 = keep file formats, 1 = lossless conversions.
+    pub convert: Option<u32>,
 }
 
 impl Options {
@@ -145,6 +151,7 @@ impl Options {
                 Some(2) => ImageMode::Lossy,
                 _ => d.images,
             },
+            convert: raw.convert.map_or(d.convert, |c| c != 0),
         }
     }
 }
@@ -336,7 +343,9 @@ mod tests {
             gif_min_mb: Some(3),
             vmaf_floor: Some(50),
             images: Some(7),
+            convert: None,
         });
+        assert!(o.convert, "conversions on by default");
         assert_eq!(o.images, ImageMode::Lossy, "images: visually lossless by default");
         assert_eq!(o.crf, 23);
         assert_eq!(o.preset, "slow");

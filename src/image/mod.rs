@@ -31,11 +31,18 @@ pub enum Kind {
     /// Audio: cover art and re-encoding, see [`crate::audio`].
     Flac,
     Mp3,
+    /// Converted to FLAC (integer PCM only), when conversions are on.
+    Wav,
 }
 
 impl Kind {
     pub fn is_audio(self) -> bool {
-        matches!(self, Kind::Flac | Kind::Mp3)
+        matches!(self, Kind::Flac | Kind::Mp3 | Kind::Wav)
+    }
+
+    /// Converted to another format (the extension changes): only with the conversions option.
+    pub fn is_conversion(self) -> bool {
+        matches!(self, Kind::Wav)
     }
 }
 
@@ -48,6 +55,7 @@ pub fn kind_of(path: &Path) -> Option<Kind> {
         "gif" => Some(Kind::Gif),
         "flac" => Some(Kind::Flac),
         "mp3" => Some(Kind::Mp3),
+        "wav" => Some(Kind::Wav),
         _ => None,
     }
 }
@@ -73,6 +81,22 @@ pub struct Optimized {
     pub steps: Vec<String>,
     /// Why the file was not processed, if it wasn't.
     pub note: Option<String>,
+    /// The result is another format, saved with this extension (e.g. WAV -> "flac").
+    pub new_ext: Option<&'static str>,
+}
+
+impl Optimized {
+    pub fn found(best: Option<PathBuf>, steps: Vec<String>) -> Self {
+        Self { best, steps, note: None, new_ext: None }
+    }
+
+    pub fn nothing() -> Self {
+        Self::found(None, Vec::new())
+    }
+
+    pub fn skipped(why: &str) -> Self {
+        Self { note: Some(why.to_string()), ..Self::nothing() }
+    }
 }
 
 /// Content-history mode for images, compatible with imageopti's history.
@@ -185,7 +209,7 @@ pub fn optimize(ctx: &Ctx, kind: Kind, src: &Path, work: &Path) -> Result<Optimi
         return crate::audio::optimize(ctx, kind, src, work);
     }
     let ver = Verifier::new(ctx, kind, src);
-    let skip = |why: &str| Ok(Optimized { best: None, steps: Vec::new(), note: Some(why.to_string()) });
+    let skip = |why: &str| Ok(Optimized::skipped(why));
     match kind {
         Kind::Png if ver.png.is_none() => return skip("not a PNG"),
         Kind::Jpg if ver.segs.is_none() => return skip("not a JPEG"),
@@ -200,7 +224,7 @@ pub fn optimize(ctx: &Ctx, kind: Kind, src: &Path, work: &Path) -> Result<Optimi
             c.write_to("gifsicle", "gifsicle", |i, o| crate::os_args!["-O3", "--no-warnings", "-o", o, i], &mut check, None)?;
             c
         }
-        Kind::Flac | Kind::Mp3 => unreachable!("audio is handled above"),
+        Kind::Flac | Kind::Mp3 | Kind::Wav => unreachable!("audio is handled above"),
     };
     if ctx.lossy && ctx.tools.has("ssimulacra2") {
         match kind {
@@ -210,7 +234,7 @@ pub fn optimize(ctx: &Ctx, kind: Kind, src: &Path, work: &Path) -> Result<Optimi
         }
     }
     let best = (chain.best != src).then_some(chain.best);
-    Ok(Optimized { best, steps: chain.steps, note: None })
+    Ok(Optimized::found(best, chain.steps))
 }
 
 /// Lossless PNG chain; `restore_from` is where dropped chunks are copied back from.

@@ -275,6 +275,8 @@ export component AppWindow inherits Window {
     in-out property <string> backup-dir;
     in property <[string]> images-options;
     in-out property <int> images-index;
+    in property <[string]> convert-options;
+    in-out property <int> convert-index;
 
     callback choose-folder();
     callback start();
@@ -461,6 +463,16 @@ export component AppWindow inherits Window {
                         hint: "Recycle Bin or backup folder: restorable.";
                         model: root.originals-options;
                         current-index <=> root.originals-index;
+                        changed => { root.settings-changed(); }
+                    }
+                }
+                Row {
+                    SettingField {
+                        glyph: "\u{E8AB}";
+                        label: "Conversions";
+                        hint: "Lossless and verified. The file extension changes.";
+                        model: root.convert-options;
+                        current-index <=> root.convert-index;
                         changed => { root.settings-changed(); }
                     }
                 }
