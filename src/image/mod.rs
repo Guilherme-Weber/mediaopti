@@ -35,6 +35,9 @@ pub enum Kind {
     Wav,
     /// Ogg Vorbis, repacked losslessly by OptiVorbis.
     Ogg,
+    /// Converted to PNG (pixel-identical), when conversions are on.
+    Bmp,
+    Tga,
 }
 
 impl Kind {
@@ -44,7 +47,7 @@ impl Kind {
 
     /// Converted to another format (the extension changes): only with the conversions option.
     pub fn is_conversion(self) -> bool {
-        matches!(self, Kind::Wav)
+        matches!(self, Kind::Wav | Kind::Bmp | Kind::Tga)
     }
 }
 
@@ -59,6 +62,8 @@ pub fn kind_of(path: &Path) -> Option<Kind> {
         "mp3" => Some(Kind::Mp3),
         "wav" => Some(Kind::Wav),
         "ogg" => Some(Kind::Ogg),
+        "bmp" => Some(Kind::Bmp),
+        "tga" => Some(Kind::Tga),
         _ => None,
     }
 }
@@ -211,6 +216,9 @@ pub fn optimize(ctx: &Ctx, kind: Kind, src: &Path, work: &Path) -> Result<Optimi
     if kind.is_audio() {
         return crate::audio::optimize(ctx, kind, src, work);
     }
+    if matches!(kind, Kind::Bmp | Kind::Tga) {
+        return to_png(ctx, kind, src, work);
+    }
     let ver = Verifier::new(ctx, kind, src);
     let skip = |why: &str| Ok(Optimized::skipped(why));
     match kind {
@@ -227,7 +235,7 @@ pub fn optimize(ctx: &Ctx, kind: Kind, src: &Path, work: &Path) -> Result<Optimi
             c.write_to("gifsicle", "gifsicle", |i, o| crate::os_args!["-O3", "--no-warnings", "-o", o, i], &mut check, None)?;
             c
         }
-        Kind::Flac | Kind::Mp3 | Kind::Wav | Kind::Ogg => unreachable!("audio is handled above"),
+        Kind::Flac | Kind::Mp3 | Kind::Wav | Kind::Ogg | Kind::Bmp | Kind::Tga => unreachable!("handled above"),
     };
     if ctx.lossy && ctx.tools.has("ssimulacra2") {
         match kind {
@@ -238,6 +246,68 @@ pub fn optimize(ctx: &Ctx, kind: Kind, src: &Path, work: &Path) -> Result<Optimi
     }
     let best = (chain.best != src).then_some(chain.best);
     Ok(Optimized::found(best, chain.steps))
+}
+
+/// BMP and TGA files bigger than this are left alone (their alpha plane is read into memory).
+const TO_PNG_MAX: u64 = 256 * 1024 * 1024;
+
+/// Whether a BMP/TGA stores more than 8 bits per channel (BMP bit count or TGA pixel depth
+/// above 32, e.g. 64-bit BMP). `None` if the header isn't one.
+fn more_than_8_bits(kind: Kind, path: &Path) -> Option<bool> {
+    let mut head = [0u8; 30];
+    std::io::Read::read_exact(&mut std::fs::File::open(path).ok()?, &mut head).ok()?;
+    match kind {
+        Kind::Bmp if &head[..2] == b"BM" => Some(u16::from_le_bytes([head[28], head[29]]) > 32),
+        Kind::Tga => Some(head[16] > 32),
+        _ => None,
+    }
+}
+
+/// BMP/TGA -> PNG (pixel-identical), then the normal PNG pipeline. An alpha channel that is
+/// all 0 (junk that viewers ignore) or all 255 (opaque) is dropped.
+fn to_png(ctx: &Ctx, kind: Kind, src: &Path, work: &Path) -> Result<Optimized, RunError> {
+    if std::fs::metadata(src).map_or(true, |m| m.len() > TO_PNG_MAX) {
+        return Ok(Optimized::skipped("too large to convert"));
+    }
+    let Some(deep) = more_than_8_bits(kind, src) else { return Ok(Optimized::skipped("not a BMP/TGA image")) };
+    let ffmpeg = &ctx.tools.ffmpeg;
+    let decode = |args: Vec<OsString>, capture: Capture| -> Result<Option<tools::Ran>, RunError> {
+        let mut a = crate::os_args!["-v", "error", "-i", src, "-frames:v", "1"];
+        a.extend(args);
+        let ran = tools::run(ffmpeg, a, None, capture, ctx.timeout, &ctx.cancel)?;
+        Ok(ran.success.then_some(ran))
+    };
+    // alphaextract fails on images without an alpha channel.
+    let alpha_plane = decode(crate::os_args!["-vf", "alphaextract", "-f", "rawvideo", "-pix_fmt", "gray", "-"], Capture::Bytes)?;
+    let alpha = alpha_plane.is_some_and(|a| !a.stdout.is_empty() && !a.stdout.iter().all(|&v| v == a.stdout[0] && (v == 0 || v == 255)));
+    let png = work.join("conv.png");
+    // Without alpha, ffmpeg picks the PNG layout (palette, grey, RGB).
+    let layout = if alpha { "rgba|rgba64be" } else { "pal8|gray|gray16be|rgb24|rgb48be" };
+    let args = crate::os_args!["-vf", format!("format=pix_fmts={layout}"), "-y", &png];
+    if decode(args, Capture::None)?.is_none() || !png.is_file() {
+        return Ok(Optimized::skipped("could not convert it to PNG"));
+    }
+    // Compared at the source's depth: at 16 bits per channel for deep sources (so lost
+    // precision is caught), else at 8 (expanding 5-bit RGB555 straight to 16 bits rounds
+    // differently from going through 8, a false mismatch).
+    let fmt = match (alpha, deep) {
+        (true, true) => "rgba64le",
+        (true, false) => "rgba",
+        (false, true) => "rgb48le",
+        (false, false) => "rgb24",
+    };
+    let hash = |p: &Path| -> Result<Option<[u8; 32]>, RunError> {
+        let a = crate::os_args!["-v", "error", "-i", p, "-frames:v", "1", "-pix_fmt", fmt, "-f", "rawvideo", "-"];
+        let ran = tools::run(ffmpeg, a, None, Capture::Hash, ctx.timeout, &ctx.cancel)?;
+        Ok(ran.hash.filter(|_| ran.success))
+    };
+    let reference = hash(src)?;
+    if reference.is_none() || hash(&png)? != reference {
+        return Ok(Optimized::skipped("the PNG is not pixel-identical: kept"));
+    }
+    let r = optimize(ctx, Kind::Png, &png, work)?;
+    let steps = std::iter::once("to-png".to_string()).chain(r.steps).collect();
+    Ok(Optimized { new_ext: Some("png"), ..Optimized::found(Some(r.best.unwrap_or(png)), steps) })
 }
 
 /// Lossless PNG chain; `restore_from` is where dropped chunks are copied back from.
@@ -577,5 +647,47 @@ mod tests {
             }
             let _ = std::fs::remove_dir_all(&work);
         }
+    }
+
+    /// BMP/TGA -> PNG: 24-bit, opaque 32-bit (alpha dropped), palette, and real alpha all
+    /// convert pixel-identically (checked here independently, at 16 bits per channel).
+    #[test]
+    fn bmp_and_tga_become_identical_pngs() {
+        let Some(t) = tools() else {
+            eprintln!("skipping: image tools not found");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("mo-topng-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ff = t.ffmpeg.clone();
+        let src = "mandelbrot=s=320x240,trim=end_frame=1";
+        let cases: [(&str, &[&str], &str); 4] = [
+            ("rgb.bmp", &["-pix_fmt", "bgr24"], "rgb48le"),
+            ("opaque.bmp", &["-pix_fmt", "bgra"], "rgb48le"),
+            ("pal.bmp", &["-vf", "split[a][b];[a]palettegen[p];[b][p]paletteuse", "-pix_fmt", "pal8"], "rgb48le"),
+            ("alpha.tga", &["-vf", "format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='X'", "-pix_fmt", "bgra"], "rgba64le"),
+        ];
+        for (name, args, fmt) in cases {
+            let file = dir.join(name);
+            let mut a = vec!["-f", "lavfi", "-i", src, "-frames:v", "1"];
+            a.extend_from_slice(args);
+            make(&ff, &a, &file);
+            let work = dir.join(format!("w-{name}"));
+            std::fs::create_dir_all(&work).unwrap();
+            let kind = kind_of(&file).unwrap();
+            // Strict alpha: by default the PNG chain may recolour fully transparent pixels
+            // (invisible), which the exact comparison below would flag.
+            let c = Ctx { strict_alpha: true, ..ctx(t.clone(), false) };
+            let r = optimize(&c, kind, &file, &work).unwrap();
+            assert_eq!(r.new_ext, Some("png"), "{name}: {:?}", r.note);
+            let best = r.best.unwrap();
+            let raw = |p: &Path| {
+                std::process::Command::new(&ff).args(["-v", "error", "-i"]).arg(p).args(["-pix_fmt", fmt, "-f", "rawvideo", "-"]).output().unwrap().stdout
+            };
+            assert_eq!(raw(&file), raw(&best), "{name}: pixels changed");
+            println!("{name}: {} -> {} {:?}", size(&file).unwrap(), size(&best).unwrap(), r.steps);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
