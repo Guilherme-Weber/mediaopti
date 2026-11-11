@@ -486,6 +486,8 @@ fn lossy_png(ctx: &Ctx, work: &Path, src: &Path, chain: &mut Chain, ver: &Verifi
     let _ = std::fs::create_dir_all(&lw);
     let strip = ctx.strip;
     // beeim -quantizer won the benchmark (36% at >= 93 on photos, vs 27% for pingo).
+    // -predicter is tried after it and wins on some photos (Kodak: 5 of 24, up to 5.6
+    // points more); the other beeim/pingo lossy modes never beat both.
     let inplace = |tag: &'static str, tool: &'static str, args: fn(u32, &Path) -> Vec<OsString>| -> Encoder {
         let lw = lw.clone();
         Box::new(move |n| {
@@ -500,6 +502,7 @@ fn lossy_png(ctx: &Ctx, work: &Path, src: &Path, chain: &mut Chain, ver: &Verifi
     let mut methods: Vec<(&str, u32, u32, Encoder)> = Vec::new();
     if ctx.tools.has("beeim") {
         methods.push(("beeim-quantizer", 1, 100, inplace("bq", "beeim", |n, o| crate::os_args![format!("-quantizer={n}"), "-force", o])));
+        methods.push(("beeim-predicter", 1, 100, inplace("bp", "beeim", |n, o| crate::os_args![format!("-predicter={n}"), "-force", o])));
     } else if ctx.tools.has("pingo") {
         methods.push(("pingo-quality", 50, 100, inplace("pq", "pingo", |n, o| crate::os_args![format!("-quality={n}"), "-nostrip", "-quiet", o])));
     }
