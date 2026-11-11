@@ -67,6 +67,10 @@ const PDFS: &[(u32, &str)] = &[
     (1, "Visually lossless images (pages checked)"),
     (0, "Lossless only"),
 ];
+const EFFORTS: &[(u32, &str)] = &[
+    (1, "Normal (benchmarked tools)"),
+    (2, "Maximum (much slower, a little smaller)"),
+];
 const QUALITY_CHECK: &[(u32, &str)] = &[
     (93, "VMAF 93 (recommended)"),
     (95, "VMAF 95 (stricter)"),
@@ -95,6 +99,8 @@ struct Prefs {
     convert: u32,
     /// 1 = visually lossless PDF images, 0 = lossless only.
     lossy_docs: u32,
+    /// 1 = normal, 2 = maximum effort for images, audio and documents.
+    effort: u32,
 }
 
 impl Default for Prefs {
@@ -111,6 +117,7 @@ impl Default for Prefs {
             images: 2,
             convert: 1,
             lossy_docs: 1,
+            effort: 1,
         }
     }
 }
@@ -150,6 +157,7 @@ impl Prefs {
             images: IMAGES[pick(w.get_images_index(), IMAGES.len())].0,
             convert: CONVERSIONS[pick(w.get_convert_index(), CONVERSIONS.len())].0,
             lossy_docs: PDFS[pick(w.get_pdf_index(), PDFS.len())].0,
+            effort: EFFORTS[pick(w.get_effort_index(), EFFORTS.len())].0,
         }
     }
 
@@ -168,6 +176,7 @@ impl Prefs {
         w.set_images_index(position(IMAGES, &self.images, &d.images));
         w.set_convert_index(position(CONVERSIONS, &self.convert, &d.convert));
         w.set_pdf_index(position(PDFS, &self.lossy_docs, &d.lossy_docs));
+        w.set_effort_index(position(EFFORTS, &self.effort, &d.effort));
     }
 
     fn to_raw(&self) -> RawOptions {
@@ -183,6 +192,7 @@ impl Prefs {
             images: Some(self.images),
             convert: Some(self.convert),
             lossy_docs: Some(self.lossy_docs),
+            effort: Some(self.effort),
         }
     }
 }
@@ -297,6 +307,22 @@ fn format_duration(d: std::time::Duration) -> String {
     } else {
         format!("{}:{:02}", s / 60, s % 60)
     }
+}
+
+/// Rough time left from the share done so far: "about 3 h 20 min", or nothing while too
+/// early to tell. (Files run largest first, so early estimates run high.)
+fn format_eta(elapsed: std::time::Duration, fraction: f64) -> Option<String> {
+    if fraction < 0.02 || fraction >= 1.0 || elapsed.as_secs() < 60 {
+        return None;
+    }
+    let left = (elapsed.as_secs_f64() * (1.0 - fraction) / fraction) as u64;
+    let m = left.div_ceil(60);
+    Some(match m {
+        0..=1 => "about a minute".to_string(),
+        2..=59 => format!("about {m} min"),
+        60..=1439 => format!("about {} h {:02} min", m / 60, m % 60),
+        _ => format!("about {} days {} h", m / 1440, m / 60 % 24),
+    })
 }
 
 /// "1 video" / "3 videos"
@@ -428,11 +454,14 @@ impl Controller {
         // While processing, the worker rows name the files; this line gives the time.
         w.set_current_file(if processing {
             let elapsed = format_duration(self.clock.elapsed());
-            let left = plural(s.run_total.saturating_sub(s.completed_this_run), "file", "files");
+            let mut left = plural(s.run_total.saturating_sub(s.completed_this_run), "file", "files") + " left";
+            if let Some(eta) = format_eta(self.clock.elapsed(), fraction) {
+                left = format!("{left} ({eta})");
+            }
             match s.status {
-                Status::Paused => format!("Paused · {elapsed} elapsed · {left} left"),
+                Status::Paused => format!("Paused · {elapsed} elapsed · {left}"),
                 Status::Stopping => "Stopping…".to_string(),
-                _ => format!("{elapsed} elapsed · {left} left"),
+                _ => format!("{elapsed} elapsed · {left}"),
             }
             .into()
         } else {
@@ -470,6 +499,14 @@ impl Controller {
                 meta: format!("{} CPU workers busy", s.images_active).into(),
                 progress: s.images_done_this_run as f32 / total as f32,
             });
+            // Long single files (a big comic, a long FLAC) would otherwise look stuck.
+            for (name, secs) in &s.slow_jobs {
+                workers.push(WorkerRow {
+                    title: format!("CPU · {name}").into(),
+                    meta: format!("running for {}", format_duration(std::time::Duration::from_secs(*secs))).into(),
+                    progress: 0.0,
+                });
+            }
         }
         sync_model(&self.worker_model, workers);
 
@@ -575,6 +612,7 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
     window.set_images_options(labels(IMAGES));
     window.set_convert_options(labels(CONVERSIONS));
     window.set_pdf_options(labels(PDFS));
+    window.set_effort_options(labels(EFFORTS));
     let prefs = Prefs::load(&prefs_path);
     prefs.apply_to_window(&window);
     engine.apply_options(prefs.to_raw());

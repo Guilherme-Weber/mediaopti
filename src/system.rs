@@ -131,6 +131,99 @@ pub fn set_process_suspended(child: &tokio::process::Child, suspended: bool) -> 
     false
 }
 
+/// [`set_process_suspended`] for a `std::process::Child` (image and audio tools).
+pub fn set_std_process_suspended(child: &std::process::Child, suspended: bool) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        let h = child.as_raw_handle();
+        // SAFETY: `h` is the live process handle owned by `child` (full access rights).
+        let status = unsafe {
+            if suspended {
+                NtSuspendProcess(h as _)
+            } else {
+                NtResumeProcess(h as _)
+            }
+        };
+        status >= 0
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (child, suspended);
+        false
+    }
+}
+
+/// Free space (for this user) on the drive holding `path`.
+pub fn free_space(path: &Path) -> Option<u64> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let mut free = 0u64;
+        // SAFETY: `wide` is NUL-terminated; the out pointer is valid for the call.
+        let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, std::ptr::null_mut(), std::ptr::null_mut()) };
+        (ok != 0).then_some(free)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// Whether a process with this id is running.
+pub fn process_alive(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+        use windows_sys::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+        // SAFETY: plain Win32 calls; the handle is closed before returning.
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h.is_null() {
+                return false;
+            }
+            let mut code = 0u32;
+            let alive = GetExitCodeProcess(h, &mut code) != 0 && code == STILL_ACTIVE as u32;
+            CloseHandle(h);
+            alive
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+/// Removes work folders and files (`mediaopti-img-<pid>-<n>`, `mediaopti-vmaf-<pid>-<n>.json`)
+/// left in `dir` by runs that were killed or crashed. Only names of that exact shape whose
+/// process is gone are touched. Returns how many were removed.
+pub fn clean_stale_work(dir: &Path) -> usize {
+    let Ok(entries) = fs::read_dir(dir) else { return 0 };
+    let me = std::process::id();
+    let mut removed = 0;
+    for e in entries.filter_map(Result::ok) {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let pid = ["mediaopti-img-", "mediaopti-vmaf-"].iter().find_map(|p| {
+            let rest = name.strip_prefix(p)?;
+            let (pid, tail) = rest.split_once('-')?;
+            let tail = tail.strip_suffix(".json").unwrap_or(tail);
+            (!tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit())).then_some(pid.parse::<u32>().ok()?)
+        });
+        let Some(pid) = pid else { continue };
+        if pid == me || process_alive(pid) {
+            continue;
+        }
+        let path = e.path();
+        let gone = if path.is_dir() { fs::remove_dir_all(&path) } else { remove_file_if_exists(&path) };
+        removed += usize::from(gone.is_ok());
+    }
+    removed
+}
+
 /// Hides the console window. Encoders run at below-normal priority: the desktop stays
 /// responsive, but unlike idle priority the encode doesn't stall completely while
 /// something else (a game, a build) keeps the CPU busy.
@@ -413,13 +506,19 @@ pub fn replace_file_with_retry(
     }
 }
 
-/// Dates and the read-only flag of the original file, restored on the recompressed copy.
+/// Dates and attributes (read-only, hidden, system, not indexed) of the original file,
+/// restored on the recompressed copy.
 pub struct OriginalAttributes {
     pub created: Option<SystemTime>,
     pub accessed: Option<SystemTime>,
     pub modified: Option<SystemTime>,
     pub readonly: bool,
+    /// Hidden, system and not-content-indexed flags (Windows file attributes).
+    pub flags: u32,
 }
+
+/// FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED.
+const KEPT_FLAGS: u32 = 0x2 | 0x4 | 0x2000;
 
 impl OriginalAttributes {
     pub fn from_metadata(meta: &fs::Metadata) -> Self {
@@ -428,6 +527,10 @@ impl OriginalAttributes {
             accessed: meta.accessed().ok(),
             modified: meta.modified().ok(),
             readonly: meta.permissions().readonly(),
+            #[cfg(windows)]
+            flags: std::os::windows::fs::MetadataExt::file_attributes(meta) & KEPT_FLAGS,
+            #[cfg(not(windows))]
+            flags: 0,
         }
     }
 }
@@ -455,6 +558,16 @@ pub fn restore_attributes(path: &Path, attrs: &OriginalAttributes) -> std::io::R
         let mut perms = fs::metadata(path)?.permissions();
         perms.set_readonly(true);
         fs::set_permissions(path, perms)?;
+    }
+    #[cfg(windows)]
+    if attrs.flags != 0 {
+        use std::os::windows::ffi::OsStrExt;
+        let current = std::os::windows::fs::MetadataExt::file_attributes(&fs::metadata(path)?);
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        // SAFETY: `wide` is NUL-terminated and lives through the call.
+        if unsafe { windows_sys::Win32::Storage::FileSystem::SetFileAttributesW(wide.as_ptr(), current | attrs.flags) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
     }
     Ok(())
 }
@@ -589,11 +702,14 @@ mod tests {
             accessed: Some(old),
             modified: Some(old),
             readonly: true,
+            flags: KEPT_FLAGS & !0x4, // hidden + not indexed
         };
         restore_attributes(&path, &attrs).unwrap();
         let meta = std::fs::metadata(&path).unwrap();
         assert_eq!(meta.modified().unwrap(), old);
         assert!(meta.permissions().readonly());
+        #[cfg(windows)]
+        assert_eq!(std::os::windows::fs::MetadataExt::file_attributes(&meta) & KEPT_FLAGS, 0x2 | 0x2000, "hidden and not-indexed kept");
         remove_file_if_exists(&path).unwrap();
         assert!(!path.exists());
     }
@@ -628,6 +744,28 @@ mod tests {
         }
         assert_eq!(fs::read_to_string(&backup).unwrap(), "original 1");
         assert_eq!(fs::read_to_string(backup.with_file_name("clip (2).mp4")).unwrap(), "original 2");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_work_folders_of_dead_runs_are_removed() {
+        let dir = std::env::temp_dir().join(format!("mo-stale-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let me = std::process::id();
+        // 4294967 is far above any real process id on Windows.
+        let dead = ["mediaopti-img-4294967-3", "mediaopti-vmaf-4294967-0.json"];
+        let kept = [format!("mediaopti-img-{me}-1"), "mediaopti-img-4294967-x".into(), "mediaopti-img-notes".into(), "my-mediaopti-img-4294967-3".into()];
+        for d in dead.iter().map(|s| (*s).to_string()).chain(kept.iter().cloned()) {
+            if d.ends_with(".json") {
+                fs::write(dir.join(&d), b"{}").unwrap();
+            } else {
+                fs::create_dir_all(dir.join(&d).join("sub")).unwrap();
+            }
+        }
+        assert_eq!(clean_stale_work(&dir), 2);
+        assert!(dead.iter().all(|d| !dir.join(d).exists()));
+        assert!(kept.iter().all(|d| dir.join(d).exists()), "only dead runs' exact names are removed");
         let _ = fs::remove_dir_all(&dir);
     }
 

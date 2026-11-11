@@ -75,7 +75,9 @@ fn inner_ctx(ctx: &Ctx, kind: Kind) -> Ctx {
         lossy_docs: false,
         parallel: ctx.parallel,
         timeout: ctx.timeout,
-        cancel: ctx.cancel.clone(),
+        gate: ctx.gate.clone(),
+        max: ctx.max,
+        slots: ctx.slots.clone(),
     }
 }
 
@@ -104,6 +106,63 @@ fn optimize_entry(ictx: &Ctx, kind: Kind, data: &[u8], work: &Path) -> Result<Op
     let result = r.best.and_then(|b| std::fs::read(b).ok()).filter(|b| b.len() < data.len()).map(|b| (b, r.steps));
     let _ = std::fs::remove_dir_all(work);
     Ok(result)
+}
+
+/// Pictures read ahead and optimized together: at most this many, or this many bytes.
+const BATCH_IMAGES: usize = 32;
+const BATCH_BYTES: u64 = 256 * 1024 * 1024;
+/// Free commit needed per extra page optimized in parallel.
+const PAGE_COMMIT: u64 = 1024 * 1024 * 1024;
+
+/// One picture of a batch: its index in the archive, kind and bytes.
+type Page = (usize, Kind, Vec<u8>);
+/// A picture after optimizing: its index, bytes (smaller or the same) and steps.
+type Done = (usize, Vec<u8>, Vec<String>);
+
+/// Optimizes a batch of pictures: on this job's own thread plus the image workers' idle CPU
+/// slots (a comic's pages then use the whole CPU near the end of a run). Returns, per page,
+/// its index, bytes (optimized or not) and steps.
+fn optimize_pages(ictx: &Ctx, pages: Vec<Page>, work: &Path) -> Result<Vec<Done>, RunError> {
+    let mut extra = 0;
+    if let Some(slots) = &ictx.slots {
+        let commit = crate::system::memory_status().map_or(u64::MAX, |m| m.available_commit);
+        let affordable = usize::try_from(commit.saturating_sub(2 * PAGE_COMMIT) / PAGE_COMMIT).unwrap_or(usize::MAX);
+        extra = slots.borrow_idle(pages.len().saturating_sub(1).min(affordable));
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let pages: Vec<std::sync::Mutex<Option<Page>>> = pages.into_iter().map(|p| std::sync::Mutex::new(Some(p))).collect();
+    let results = std::sync::Mutex::new(Vec::with_capacity(pages.len()));
+    let failure = std::sync::Mutex::new(None);
+    std::thread::scope(|scope| {
+        for _ in 0..=extra {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(slot) = pages.get(i) else { break };
+                let Some((idx, kind, data)) = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() else { continue };
+                if failure.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some() || !ictx.gate.wait_while_paused() {
+                    failure.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert(RunError::Cancelled);
+                    break;
+                }
+                match optimize_entry(ictx, kind, &data, &work.join(format!("z{idx}"))) {
+                    Ok(better) => {
+                        let (bytes, steps) = better.unwrap_or((data, Vec::new()));
+                        results.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((idx, bytes, steps));
+                    }
+                    Err(e) => {
+                        failure.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert(e);
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    if let Some(slots) = &ictx.slots {
+        slots.release(extra);
+    }
+    if let Some(e) = failure.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner) {
+        return Err(e);
+    }
+    Ok(results.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner))
 }
 
 fn label(base: &str, n: usize, steps: &BTreeSet<String>) -> String {
@@ -163,33 +222,50 @@ fn repack(ctx: &Ctx, kind: Kind, src: &Path, work: &Path) -> Result<Optimized, E
     let mut zout = ZipWriter::new(BufWriter::new(File::create(&out)?));
     zout.set_raw_comment(zin.comment().into())?;
     let (mut expected, mut n_img, mut steps) = (Vec::new(), 0, BTreeSet::new());
-    for i in 0..zin.len() {
-        let mut f = zin.by_index(i)?;
-        let name = f.name().map(std::borrow::Cow::into_owned)?;
-        let stored = f.compression() == CompressionMethod::Stored;
-        let mut options = f.options().into_full_options().with_file_comment(f.comment());
-        if !stored {
-            options = options.compression_method(CompressionMethod::Deflated).compression_level(Some(9));
-        }
-        let mut crc = f.crc32();
-        if f.is_dir() {
-            zout.add_directory(name.clone(), options)?;
-        } else if let Some(k) = image_kind(&name).filter(|_| f.size() <= MAX_ENTRY_IMAGE) {
-            let mut data = Vec::with_capacity(f.size() as usize);
-            f.read_to_end(&mut data)?;
-            if let Some((better, s)) = optimize_entry(&ictx, k, &data, &work.join(format!("z{i}")))? {
-                data = better;
-                crc = crc32(&data);
-                n_img += 1;
-                steps.extend(s);
+    let mut start = 0;
+    while start < zin.len() {
+        // Read a batch of pictures ahead and optimize them together...
+        let (mut pages, mut bytes, mut end) = (Vec::new(), 0u64, start);
+        while end < zin.len() && pages.len() < BATCH_IMAGES && bytes < BATCH_BYTES {
+            let mut f = zin.by_index(end)?;
+            let name = f.name().map(std::borrow::Cow::into_owned)?;
+            if let Some(k) = image_kind(&name).filter(|_| !f.is_dir() && f.size() <= MAX_ENTRY_IMAGE) {
+                let mut data = Vec::with_capacity(f.size() as usize);
+                f.read_to_end(&mut data)?;
+                bytes += data.len() as u64;
+                pages.push((end, k, data));
             }
-            zout.start_file(name.clone(), options)?;
-            zout.write_all(&data)?;
-        } else {
-            zout.start_file(name.clone(), options)?;
-            io::copy(&mut f, &mut zout)?;
+            end += 1;
         }
-        expected.push(Expected { name: f.name_raw().to_vec(), crc, stored, dir: f.is_dir() });
+        let mut done: HashMap<usize, (Vec<u8>, Vec<String>)> =
+            optimize_pages(&ictx, pages, work)?.into_iter().map(|(i, b, s)| (i, (b, s))).collect();
+        // ...then write the entries of the batch in their order.
+        for i in start..end {
+            let mut f = zin.by_index(i)?;
+            let name = f.name().map(std::borrow::Cow::into_owned)?;
+            let stored = f.compression() == CompressionMethod::Stored;
+            let mut options = f.options().into_full_options().with_file_comment(f.comment());
+            if !stored {
+                options = options.compression_method(CompressionMethod::Deflated).compression_level(Some(9));
+            }
+            let mut crc = f.crc32();
+            if f.is_dir() {
+                zout.add_directory(name.clone(), options)?;
+            } else if let Some((data, s)) = done.remove(&i) {
+                if !s.is_empty() {
+                    crc = crc32(&data);
+                    n_img += 1;
+                    steps.extend(s);
+                }
+                zout.start_file(name.clone(), options)?;
+                zout.write_all(&data)?;
+            } else {
+                zout.start_file(name.clone(), options)?;
+                io::copy(&mut f, &mut zout)?;
+            }
+            expected.push(Expected { name: f.name_raw().to_vec(), crc, stored, dir: f.is_dir() });
+        }
+        start = end;
     }
     zout.finish()?.flush()?;
     let smaller = std::fs::metadata(&out)?.len() < std::fs::metadata(src)?.len();
@@ -233,7 +309,7 @@ fn safe_relative(p: &str) -> bool {
 /// lossy follows the image setting), each extracted file checked against its CRC.
 fn cbr(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, Error> {
     let Some(sz) = ctx.tools.get("7z") else { return Ok(Optimized::skipped("7-Zip is missing")) };
-    let listing = tools::run(sz, crate::os_args!["l", "-slt", "-ba", "-sccUTF-8", src], None, Capture::Bytes, ctx.timeout, &ctx.cancel)?;
+    let listing = tools::run(sz, crate::os_args!["l", "-slt", "-ba", "-sccUTF-8", src], None, Capture::Bytes, ctx.timeout, &ctx.gate)?;
     if !listing.success {
         return Ok(Optimized::skipped("7-Zip cannot read it"));
     }
@@ -263,37 +339,46 @@ fn cbr(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, Error> {
     let xdir = work.join("x");
     let mut out_arg = std::ffi::OsString::from("-o");
     out_arg.push(&xdir);
-    if !tools::run(sz, crate::os_args!["x", "-y", "-sccUTF-8", out_arg, src], None, Capture::None, ctx.timeout, &ctx.cancel)?.success {
+    if !tools::run(sz, crate::os_args!["x", "-y", "-sccUTF-8", out_arg, src], None, Capture::None, ctx.timeout, &ctx.gate)?.success {
         return Ok(Optimized::skipped("7-Zip could not extract it"));
     }
     let ictx = inner_ctx(ctx, Kind::Cbr);
     let out = work.join("out.cbz");
     let mut zout = ZipWriter::new(BufWriter::new(File::create(&out)?));
     let (mut expected, mut n_img, mut steps) = (Vec::new(), 0, BTreeSet::new());
-    for (i, e) in files.iter().enumerate() {
-        let mut data = std::fs::read(xdir.join(&e.path))?;
-        if e.crc.is_some_and(|c| c != crc32(&data)) {
-            return Ok(Optimized::skipped(&format!("an extracted file does not match its CRC: {}", e.path)));
+    let mut i = 0;
+    while i < files.len() {
+        // Read files (each checked against its CRC) until a batch of pictures is ready...
+        let (mut batch, mut bytes, mut pictures) = (Vec::new(), 0u64, 0);
+        while i < files.len() && pictures < BATCH_IMAGES && bytes < BATCH_BYTES {
+            let e = &files[i];
+            let data = std::fs::read(xdir.join(&e.path))?;
+            if e.crc.is_some_and(|c| c != crc32(&data)) {
+                return Ok(Optimized::skipped(&format!("an extracted file does not match its CRC: {}", e.path)));
+            }
+            pictures += usize::from(image_kind(&e.path).is_some());
+            bytes += data.len() as u64;
+            batch.push((i, data));
+            i += 1;
         }
-        let name = e.path.replace('\\', "/");
-        let kind = image_kind(&name);
-        if let Some(k) = kind {
-            if let Some((better, s)) = optimize_entry(&ictx, k, &data, &work.join(format!("z{i}")))? {
-                data = better;
+        // ...optimize its pictures together, then write the files in their order.
+        let (pages, others): (Vec<_>, Vec<_>) = batch.into_iter().partition(|(j, _)| image_kind(&files[*j].path).is_some());
+        let pages = pages.into_iter().filter_map(|(j, d)| Some((j, image_kind(&files[j].path)?, d))).collect();
+        let mut ready = optimize_pages(&ictx, pages, work)?;
+        ready.extend(others.into_iter().map(|(j, d)| (j, d, Vec::new())));
+        ready.sort_by_key(|r| r.0);
+        for (j, data, s) in ready {
+            let e = &files[j];
+            let name = e.path.replace('\\', "/");
+            let kind = image_kind(&name);
+            if !s.is_empty() {
                 n_img += 1;
                 steps.extend(s);
             }
+            write_cbz_entry(&mut zout, e, &name, kind.is_some(), &data)?;
+            let stored = kind.is_some() || name.to_ascii_lowercase().ends_with(".webp");
+            expected.push(Expected { name: name.into_bytes(), crc: crc32(&data), stored, dir: false });
         }
-        // Already-compressed pictures are stored; everything else deflated.
-        let stored = kind.is_some() || name.to_ascii_lowercase().ends_with(".webp");
-        let options = SimpleFileOptions::default()
-            .compression_method(if stored { CompressionMethod::Stored } else { CompressionMethod::Deflated })
-            .compression_level((!stored).then_some(9))
-            .last_modified_time(e.modified.unwrap_or_else(DateTime::default_for_write))
-            .large_file(data.len() as u64 >= u64::from(u32::MAX));
-        zout.start_file(name.clone(), options)?;
-        zout.write_all(&data)?;
-        expected.push(Expected { name: name.into_bytes(), crc: crc32(&data), stored, dir: false });
     }
     zout.finish()?.flush()?;
     if !verify(&out, &expected)? {
@@ -303,12 +388,27 @@ fn cbr(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, Error> {
     Ok(Optimized { new_ext: Some("cbz"), ..Optimized::found(Some(out), vec![step]) })
 }
 
+/// Adds one file of a CBR to the new CBZ.
+fn write_cbz_entry(zout: &mut ZipWriter<BufWriter<File>>, e: &RarEntry, name: &str, picture: bool, data: &[u8]) -> Result<(), Error> {
+    {
+        // Already-compressed pictures are stored; everything else deflated.
+        let stored = picture || name.to_ascii_lowercase().ends_with(".webp");
+        let options = SimpleFileOptions::default()
+            .compression_method(if stored { CompressionMethod::Stored } else { CompressionMethod::Deflated })
+            .compression_level((!stored).then_some(9))
+            .last_modified_time(e.modified.unwrap_or_else(DateTime::default_for_write))
+            .large_file(data.len() as u64 >= u64::from(u32::MAX));
+        zout.start_file(name, options)?;
+        zout.write_all(data)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::image::tools::Tools;
     use std::time::Duration;
-    use tokio_util::sync::CancellationToken;
 
     fn ctx() -> Option<Ctx> {
         let ffmpeg = Path::new(env!("CARGO_MANIFEST_DIR")).join("bin").join("ffmpeg.exe");
@@ -323,7 +423,9 @@ mod tests {
             lossy_docs: false,
             parallel: false,
             timeout: Duration::from_secs(120),
-            cancel: CancellationToken::new(),
+            gate: crate::image::tools::Gate::default(),
+            max: false,
+            slots: None,
         })
     }
 
@@ -397,6 +499,51 @@ mod tests {
         assert!(ok);
         let r = optimize(&c, Kind::Cbz, &enc, &dir).unwrap();
         assert!(r.best.is_none() && r.note.as_deref().is_some_and(|n| n.contains("encrypted")), "{:?}", r.note);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A comic with more pages than a batch, on borrowed CPU slots: every page optimized,
+    /// the entries in their order, and the borrowed slots given back.
+    #[test]
+    fn comic_pages_run_in_parallel() {
+        let Some(mut c) = ctx() else {
+            eprintln!("skipping: tools not found");
+            return;
+        };
+        c.lossy = false;
+        let slots = crate::image::tools::Slots::new(4);
+        assert!(slots.acquire(&c.gate), "the job's own slot");
+        c.slots = Some(slots.clone());
+        let dir = std::env::temp_dir().join(format!("mo-comic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pic = png_bytes(&c, &dir);
+        let src = dir.join("comic.cbz");
+        let mut z = ZipWriter::new(File::create(&src).unwrap());
+        let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        let pages = BATCH_IMAGES + 5;
+        for n in 0..pages {
+            z.start_file(format!("p{n:03}.png"), stored).unwrap();
+            z.write_all(&pic).unwrap();
+            z.start_file(format!("p{n:03}.txt"), stored).unwrap();
+            z.write_all(n.to_string().as_bytes()).unwrap();
+        }
+        z.finish().unwrap();
+        let work = dir.join("w");
+        std::fs::create_dir_all(&work).unwrap();
+        let r = optimize(&c, Kind::Cbz, &src, &work).unwrap();
+        let best = r.best.expect("smaller");
+        let (a, b) = (entries(&src), entries(&best));
+        assert_eq!(a.iter().map(|e| &e.0).collect::<Vec<_>>(), b.iter().map(|e| &e.0).collect::<Vec<_>>(), "order kept");
+        for (x, y) in a.iter().zip(&b) {
+            if x.0.ends_with(".png") {
+                assert_ne!(x.2, y.2, "{} not optimized", x.0);
+            } else {
+                assert_eq!(x.2, y.2, "{} changed", x.0);
+            }
+        }
+        assert!(r.steps[0].contains(&format!("[{pages} img")), "{:?}", r.steps);
+        assert_eq!(slots.borrow_idle(10), 3, "borrowed slots returned");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

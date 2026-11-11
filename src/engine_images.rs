@@ -52,6 +52,7 @@ impl Inner {
             self.image_cursor += 1;
             if !self.in_progress.contains(&candidate) && !self.failed.contains(&candidate) {
                 self.in_progress.insert(candidate.clone());
+                self.cpu_started.insert(candidate.clone(), std::time::Instant::now());
                 return Some(candidate);
             }
         }
@@ -61,7 +62,8 @@ impl Inner {
 
 impl Engine {
     /// Settings for the image pipeline under the current options.
-    pub(super) fn image_ctx(&self, options: &crate::args::Options, parallel: bool, cancel: tokio_util::sync::CancellationToken) -> image::Ctx {
+    /// `slots`: how many tools may run at once (one per worker; idle ones are borrowed).
+    pub(super) fn image_ctx(&self, options: &crate::args::Options, slots: usize, cancel: tokio_util::sync::CancellationToken) -> image::Ctx {
         image::Ctx {
             tools: self.image_tools.clone(),
             lossy: options.images == crate::args::ImageMode::Lossy,
@@ -70,9 +72,11 @@ impl Engine {
             strip: false,
             strict_alpha: false,
             lossy_docs: options.lossy_docs,
-            parallel,
+            parallel: slots > 1,
             timeout: std::time::Duration::from_secs(900),
-            cancel,
+            gate: image::tools::Gate::new(cancel, Some(self.paused.subscribe())),
+            max: options.max_effort,
+            slots: (slots > 1).then(|| image::tools::Slots::new(slots)),
         }
     }
 
@@ -82,7 +86,7 @@ impl Engine {
         let (ctx, disposal, lossy) = {
             let inner = self.lock();
             (
-                Arc::new(self.image_ctx(&inner.options, true, inner.cancel.clone())),
+                Arc::new(self.image_ctx(&inner.options, 2, inner.cancel.clone())),
                 inner.disposal_for(input),
                 inner.images_lossy(),
             )
@@ -150,7 +154,19 @@ impl Engine {
             };
             self.send_state(false);
             let (ctx2, p2) = (Arc::clone(&ctx), path.clone());
-            let result = self.blocking(move || process_image(&ctx2, &p2, worker_id, &disposal)).await;
+            let result = self
+                .blocking(move || {
+                    // A slot is free unless a big job borrowed it: then wait for it back.
+                    if ctx2.slots.as_ref().is_some_and(|s| !s.acquire(&ctx2.gate)) {
+                        return ImageResult::Stopped;
+                    }
+                    let r = process_image(&ctx2, &p2, worker_id, &disposal);
+                    if let Some(s) = &ctx2.slots {
+                        s.release(1);
+                    }
+                    r
+                })
+                .await;
             self.finish_image(&path, lossy, result);
         }
     }
@@ -163,6 +179,7 @@ impl Engine {
             let mut inner = self.lock();
             inner.images_active = inner.images_active.saturating_sub(1);
             inner.in_progress.remove(path);
+            inner.cpu_started.remove(path);
             let display = inner.display_name(path);
             if !matches!(result, ImageResult::Stopped) {
                 inner.run.completed += 1;
@@ -218,12 +235,64 @@ impl Engine {
     }
 }
 
-/// Deletes the private work folder however `process_image` returns.
-struct WorkDir(PathBuf);
+/// Kept free on a drive that holds work folders (C: is often nearly full).
+const DISK_RESERVE: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Space reserved on each drive by the jobs running now (by drive root), so several big
+/// files at once can't fill a drive between their free-space checks.
+static RESERVED: std::sync::Mutex<Vec<(PathBuf, u64)>> = std::sync::Mutex::new(Vec::new());
+
+/// The drive (or share) root of `path`, e.g. `F:\`.
+pub(super) fn volume_root(path: &Path) -> Option<PathBuf> {
+    path.ancestors().last().filter(|r| r.has_root()).map(Path::to_path_buf)
+}
+
+/// Hidden folder on a file's own drive for its work files when the temp drive is short on
+/// space (its name starts with a dot, so scans skip it).
+pub(super) const DRIVE_WORK_DIR: &str = ".mediaopti-temp";
+
+/// The private work folder of one job, deleted however `process_image` returns, with its
+/// disk-space reservation.
+struct WorkDir {
+    path: PathBuf,
+    root: PathBuf,
+    reserved: u64,
+}
+
+impl WorkDir {
+    /// A work folder for a file of `size` bytes: in the temp folder, or on the file's own
+    /// drive when the temp drive hasn't room for about 4x the file (copy, candidates, output).
+    fn new(path: &Path, size: u64, name: &str) -> Result<Self, String> {
+        let need = size.saturating_mul(4).saturating_add(64 << 20);
+        let temp = std::env::temp_dir();
+        let mut places = vec![temp];
+        if let Some(root) = volume_root(path) {
+            places.push(root.join(DRIVE_WORK_DIR));
+        }
+        let mut reserved = RESERVED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for place in places {
+            let Some(root) = volume_root(&place) else { continue };
+            let taken: u64 = reserved.iter().filter(|(r, _)| *r == root).map(|(_, n)| n).sum();
+            let fits = system::free_space(&root).is_none_or(|free| free >= taken + need + DISK_RESERVE);
+            if fits && std::fs::create_dir_all(place.join(name)).is_ok() {
+                reserved.push((root.clone(), need));
+                return Ok(Self { path: place.join(name), root, reserved: need });
+            }
+        }
+        Err("not enough free disk space for its temporary files (it will be tried next time)".into())
+    }
+}
 
 impl Drop for WorkDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        let _ = std::fs::remove_dir_all(&self.path);
+        if let Some(parent) = self.path.parent().filter(|p| p.ends_with(DRIVE_WORK_DIR)) {
+            let _ = std::fs::remove_dir(parent); // only if empty
+        }
+        let mut reserved = RESERVED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(i) = reserved.iter().position(|(r, n)| *r == self.root && *n == self.reserved) {
+            reserved.swap_remove(i);
+        }
     }
 }
 
@@ -235,9 +304,12 @@ fn content_of(path: &Path) -> Option<(ContentHash, u64)> {
 /// Optimizes one image and, if worthwhile, replaces the original. Blocking.
 pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, disposal: &system::Disposal) -> ImageResult {
     static NEXT_JOB: AtomicU64 = AtomicU64::new(0);
-    let Some(kind) = image::kind_of(path) else {
+    let Some(named) = image::kind_of(path) else {
         return ImageResult::Skipped("not an image".into());
     };
+    // A misnamed picture (a JPEG called .png) is optimized as what it is, and keeps its name.
+    let pictures = [image::Kind::Png, image::Kind::Jpg, image::Kind::Gif];
+    let kind = if pictures.contains(&named) { image::sniff_picture(path).filter(|k| pictures.contains(k)).unwrap_or(named) } else { named };
     let Some(state) = file_state(path) else {
         return ImageResult::Failed("could not read the file".into());
     };
@@ -249,12 +321,16 @@ pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, dispo
         return ImageResult::Kept { content: content_of(path), note: None };
     }
     let job = NEXT_JOB.fetch_add(1, Ordering::Relaxed);
-    let work = std::env::temp_dir().join(format!("mediaopti-img-{}-{job}", std::process::id()));
-    let _cleanup = WorkDir(work.clone());
+    let workdir = match WorkDir::new(path, state.0, &format!("mediaopti-img-{}-{job}", std::process::id())) {
+        Ok(w) => w,
+        Err(why) => return ImageResult::Skipped(why),
+    };
+    let work = workdir.path.clone();
     let ext = args::ext_lower(path);
-    // ASCII name: some tools can't open Unicode paths.
-    let src = work.join(format!("orig.{ext}"));
-    if let Err(err) = std::fs::create_dir_all(&work).and_then(|()| std::fs::copy(path, &src).map(drop)) {
+    // ASCII name: some tools can't open Unicode paths. A misnamed picture's copy gets its
+    // real extension (tools pick the format from it).
+    let src = work.join(format!("orig.{}", if kind == named { ext.as_str() } else { image::ext_of(kind) }));
+    if let Err(err) = std::fs::copy(path, &src) {
         return ImageResult::Failed(format!("could not copy it to the temp folder: {err}"));
     }
     let before = state.0;

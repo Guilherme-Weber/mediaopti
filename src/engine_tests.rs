@@ -85,6 +85,7 @@ fn opts(encoder: &str, concurrency: f64) -> RawOptions {
         images: Some(0),
         convert: Some(0),
         lossy_docs: Some(0),
+        effort: None,
     }
 }
 
@@ -623,7 +624,9 @@ fn bench_folder() {
     }
     let rt = runtime();
     let (engine, rec) = new_engine(&rt, &root, ff);
-    let raw = || RawOptions { images: Some(2), ..opts("av1_nvenc", 2.0) };
+    // MEDIAOPTI_BENCH_EFFORT=2: maximum effort.
+    let effort = std::env::var("MEDIAOPTI_BENCH_EFFORT").ok().and_then(|e| e.parse().ok());
+    let raw = || RawOptions { images: Some(2), effort, ..opts("av1_nvenc", 2.0) };
     let t = std::time::Instant::now();
     rt.block_on(async {
         engine.apply_options(raw());
@@ -783,6 +786,7 @@ fn real_folder_run() {
         images: Some(2),
         convert: Some(1),
         lossy_docs: Some(1),
+        effort: None,
     };
     let t = std::time::Instant::now();
     rt.block_on(async {

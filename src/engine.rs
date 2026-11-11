@@ -20,6 +20,8 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 use tokio_util::sync::CancellationToken;
 
 const STATE_THROTTLE: Duration = Duration::from_millis(250);
+/// CPU files running at least this long get their own progress row.
+const SLOW_JOB_SECS: u64 = 15;
 const HISTORY_SAVE_DELAY: Duration = Duration::from_secs(2);
 
 /// Memory needed before starting another ffmpeg while others run. A single 4K AV1 encode
@@ -112,6 +114,9 @@ pub struct StateDto {
     pub images_done_this_run: usize,
     /// Image workers busy right now.
     pub images_active: usize,
+    /// CPU files running for a while (a big comic, a long FLAC): name and seconds so far,
+    /// longest first.
+    pub slow_jobs: Vec<(String, u64)>,
     pub telemetry: TelemetryDto,
 }
 
@@ -128,6 +133,8 @@ struct Inner {
     image_queue: Vec<PathBuf>,
     image_cursor: usize,
     images_active: usize,
+    /// When each CPU file being processed was started.
+    cpu_started: std::collections::HashMap<PathBuf, Instant>,
     skipped_known: usize,
     skipped_generated: usize,
     skipped_small_gifs: usize,
@@ -382,6 +389,7 @@ impl Inner {
     fn reset_run_tracking(&mut self) {
         self.failed.clear();
         self.in_progress.clear();
+        self.cpu_started.clear();
         self.workers.clear();
         self.space_saved_mb = 0.0;
     }
@@ -411,6 +419,15 @@ impl Inner {
             })
             .collect();
 
+        let mut slow_jobs: Vec<(String, u64)> = self
+            .cpu_started
+            .iter()
+            .map(|(p, t)| (self.display_name(p), t.elapsed().as_secs()))
+            .filter(|(_, secs)| *secs >= SLOW_JOB_SECS)
+            .collect();
+        slow_jobs.sort_by_key(|j| std::cmp::Reverse(j.1));
+        slow_jobs.truncate(4);
+
         StateDto {
             status: self.status,
             dir: self.dir.as_ref().map(|d| d.to_string_lossy().into_owned()),
@@ -429,6 +446,7 @@ impl Inner {
             images_total_this_run: self.run.images_total,
             images_done_this_run: self.run.images_done,
             images_active: self.images_active,
+            slow_jobs,
             telemetry: TelemetryDto {
                 total_fps: total_fps.round() as i64,
                 total_speed: round1(total_speed),
@@ -465,6 +483,7 @@ impl Engine {
                 image_queue: Vec::new(),
                 image_cursor: 0,
                 images_active: 0,
+                cpu_started: std::collections::HashMap::new(),
                 skipped_known: 0,
                 skipped_generated: 0,
                 skipped_small_gifs: 0,
@@ -844,13 +863,26 @@ impl Engine {
             // decoding (and their memory) while there are videos to encode.
             let cores = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
             let spare = cores.saturating_sub(2);
-            let workers = if videos > 0 { spare / 2 } else { spare }.clamp(1, images);
-            let ctx = Arc::new(self.image_ctx(&options, workers > 1, cancel));
+            let slots = if videos > 0 { spare / 2 } else { spare }.max(1);
+            let workers = slots.min(images);
+            // Slots beyond the worker count stay idle for big jobs (comic pages) to borrow.
+            let ctx = Arc::new(self.image_ctx(&options, slots, cancel));
             self.log(format!(
                 "Starting {images} images | {} | {workers} CPU workers",
                 if ctx.lossy { "visually lossless (SSIMULACRA2 >= 93)" } else { "lossless" }
             ));
             self.log(self.image_tools.summary());
+            // Keeps "running for" of long CPU files current when nothing else updates the window.
+            let engine = Arc::clone(&self);
+            self.rt.spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    if !engine.lock().working {
+                        break;
+                    }
+                    engine.send_state(false);
+                }
+            });
             for id in 1..=workers as u32 {
                 let engine = Arc::clone(&self);
                 let ctx = Arc::clone(&ctx);
@@ -1371,7 +1403,8 @@ impl Engine {
                     return Outcome::Stopped;
                 }
                 Retry::Accepted { boost, vmaf, worst } => {
-                    out_size = std::fs::metadata(&tmp).map_or(in_size, |m| m.len() as f64);
+                    let t = tmp.clone();
+                    out_size = self.blocking(move || std::fs::metadata(t).map_or(in_size, |m| m.len() as f64)).await;
                     self.log(format!(
                         "[Worker {worker_id}] Quality retry for {display}: +{boost} CQ, {:.0}% of the original, VMAF {vmaf:.1} (worst 5%: {worst:.1})",
                         out_size / in_size * 100.0
@@ -1428,7 +1461,8 @@ impl Engine {
             return Outcome::Skipped;
         }
 
-        if file_state(&input) != source_state {
+        let path = input.clone();
+        if self.blocking(move || file_state(&path)).await != source_state {
             self.lock().run.skipped_larger += 1;
             self.log_remove(&tmp);
             self.log(format!(
@@ -1522,16 +1556,18 @@ impl Engine {
         let mut tried = [false; STEPS.len()];
         let mut stepped_back = false;
         let mut notes: Vec<String> = Vec::new();
-        let finish = |engine: &Self, best: Option<(u32, f64, f64)>, notes: &[String]| -> Retry {
-            match best {
-                Some((boost, vmaf, worst)) => match std::fs::rename(&keep, tmp) {
+        let finish = |engine: &Arc<Self>, best: Option<(u32, f64, f64)>, notes: &[String]| {
+            let (engine, keep, tmp, notes) = (Arc::clone(engine), keep.clone(), tmp.to_path_buf(), notes.join("; "));
+            async move {
+                let Some((boost, vmaf, worst)) = best else { return Retry::Rejected(notes) };
+                let k = keep.clone();
+                match engine.blocking(move || std::fs::rename(&k, &tmp)).await {
                     Ok(()) => Retry::Accepted { boost, vmaf, worst },
                     Err(err) => {
                         engine.log_remove(&keep);
                         Retry::Rejected(format!("could not keep the retry output: {err}"))
                     }
-                },
-                None => Retry::Rejected(notes.join("; ")),
+                }
             }
         };
         loop {
@@ -1549,10 +1585,11 @@ impl Engine {
                 _ => {
                     notes.push(format!("the +{boost} encode failed"));
                     self.log_remove(tmp);
-                    return finish(self, best, &notes);
+                    return finish(self, best, &notes).await;
                 }
             }
-            let size = std::fs::metadata(tmp).map_or(f64::MAX, |m| m.len() as f64);
+            let t = tmp.to_path_buf();
+            let size = self.blocking(move || std::fs::metadata(t).map_or(f64::MAX, |m| m.len() as f64)).await;
             if size >= in_size * 0.99 {
                 notes.push(format!("+{boost}: still {:.0}% of the original", size / in_size * 100.0));
                 self.log_remove(tmp);
@@ -1560,7 +1597,7 @@ impl Engine {
                     k += 1;
                     continue;
                 }
-                return finish(self, best, &notes);
+                return finish(self, best, &notes).await;
             }
             self.reset_worker(worker_id, format!("{display} (measuring quality at +{boost})"));
             self.send_state(false);
@@ -1598,10 +1635,12 @@ impl Engine {
             }
             match measured {
                 Ok((vmaf, worst)) if vmaf >= floor && worst >= floor - 5.0 => {
-                    if let Err(err) = system::remove_file_if_exists(&keep).and_then(|()| std::fs::rename(tmp, &keep)) {
+                    let (kp, t) = (keep.clone(), tmp.to_path_buf());
+                    let kept = self.blocking(move || system::remove_file_if_exists(&kp).and_then(|()| std::fs::rename(&t, &kp))).await;
+                    if let Err(err) = kept {
                         notes.push(format!("could not keep the +{boost} output: {err}"));
                         self.log_remove(tmp);
-                        return finish(self, best, &notes);
+                        return finish(self, best, &notes).await;
                     }
                     best = Some((boost, vmaf, worst));
                     self.log(format!(
@@ -1612,7 +1651,7 @@ impl Engine {
                         k += 1;
                         continue;
                     }
-                    return finish(self, best, &notes);
+                    return finish(self, best, &notes).await;
                 }
                 Ok((vmaf, worst)) => {
                     notes.push(format!("+{boost}: VMAF {vmaf:.1} (worst 5%: {worst:.1}) is below {floor:.0}"));
@@ -1622,12 +1661,12 @@ impl Engine {
                         k -= 1;
                         continue;
                     }
-                    return finish(self, best, &notes);
+                    return finish(self, best, &notes).await;
                 }
                 Err(why) => {
                     notes.push(format!("the quality could not be measured: {why}"));
                     self.log_remove(tmp);
-                    return finish(self, best, &notes);
+                    return finish(self, best, &notes).await;
                 }
             }
         }
@@ -1693,26 +1732,50 @@ impl Engine {
                 .stderr(Stdio::piped())
                 .kill_on_drop(true);
             system::configure_background_command(&mut cmd, true);
-            let child = match cmd.spawn() {
+            let mut child = match cmd.spawn() {
                 Ok(child) => child,
                 Err(err) => return Ok(Err(format!("could not start ffmpeg: {err}"))),
             };
             system::assign_to_kill_on_exit_job(&child);
-            // Dropping the future on Stop drops the child, which kills it (kill_on_drop).
-            let output = tokio::select! {
-                o = child.wait_with_output() => o,
-                _ = cancel.cancelled() => {
-                    let _ = system::remove_file_if_exists(&log_dir.join(&log_name));
-                    return Err(Stopped);
+            let stderr = child.stderr.take();
+            let err_task = self.rt.spawn(async move {
+                let mut text = Vec::new();
+                if let Some(mut e) = stderr {
+                    let _ = e.read_to_end(&mut text).await;
+                }
+                text
+            });
+            // Pause suspends the measurement like an encode; returning on Stop drops the
+            // child, which kills it (kill_on_drop).
+            let mut pause_rx = self.paused.subscribe();
+            let mut suspended = false;
+            let status = loop {
+                let pause = *pause_rx.borrow_and_update();
+                if pause != suspended && system::set_process_suspended(&child, pause) {
+                    suspended = pause;
+                }
+                tokio::select! {
+                    s = child.wait() => break s,
+                    changed = pause_rx.changed() => {
+                        if changed.is_err() {
+                            break child.wait().await;
+                        }
+                    }
+                    _ = cancel.cancelled() => {
+                        drop(child);
+                        let _ = system::remove_file_if_exists(&log_dir.join(&log_name));
+                        return Err(Stopped);
+                    }
                 }
             };
+            let stderr = err_task.await.unwrap_or_default();
             let log_path = log_dir.join(&log_name);
             let parsed = std::fs::read_to_string(&log_path).ok().and_then(|t| vmaf_frame_scores(&t));
             let _ = system::remove_file_if_exists(&log_path);
-            match (output, parsed) {
-                (Ok(o), Some(frames)) if o.status.success() && !frames.is_empty() => scores.extend(frames),
-                (Ok(o), _) => {
-                    let err = String::from_utf8_lossy(&o.stderr);
+            match (status, parsed) {
+                (Ok(s), Some(frames)) if s.success() && !frames.is_empty() => scores.extend(frames),
+                (Ok(_), _) => {
+                    let err = String::from_utf8_lossy(&stderr);
                     let line = err.lines().find(|l| !l.trim().is_empty()).unwrap_or("no frames scored");
                     return Ok(Err(line.trim().to_string()));
                 }
@@ -2021,6 +2084,13 @@ struct ScanResult {
 fn scan_folder(dir: &Path, exclude: Option<&Path>) -> ScanResult {
     let mut messages = Vec::new();
     let mut cleaned_orphans = 0;
+    // Work folders of runs that were killed or crashed.
+    let mut stale = vec![std::env::temp_dir()];
+    stale.extend(images::volume_root(dir).map(|r| r.join(images::DRIVE_WORK_DIR)));
+    let cleaned_work: usize = stale.iter().map(|d| system::clean_stale_work(d)).sum();
+    if cleaned_work > 0 {
+        messages.push(format!("Removed {cleaned_work} leftover work folder(s) from an earlier run that did not finish"));
+    }
     let mut unreadable = 0;
     let mut with_sizes = Vec::new();
     let mut static_gifs = HashSet::new();

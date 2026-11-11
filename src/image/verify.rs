@@ -50,14 +50,14 @@ impl<'a> Verifier<'a> {
             args.extend(crate::os_args!["-f", "apng"]);
         }
         args.extend(crate::os_args!["-i", path, "-map", "0:v:0", "-pix_fmt", self.pix_fmt(), "-f", format, "-"]);
-        let ran = tools::run(&self.ctx.tools.ffmpeg, args, None, capture, self.ctx.timeout, &self.ctx.cancel)?;
+        let ran = tools::run(&self.ctx.tools.ffmpeg, args, None, capture, self.ctx.timeout, &self.ctx.gate)?;
         Ok(ran.success.then_some(ran))
     }
 
     fn signature_of(&self, path: &Path) -> Result<Option<Vec<u8>>, RunError> {
         if self.kind == Kind::Jpg {
             if let Some(djpeg) = self.ctx.tools.get("djpeg") {
-                let ran = tools::run(djpeg, crate::os_args![path], None, Capture::Hash, self.ctx.timeout, &self.ctx.cancel)?;
+                let ran = tools::run(djpeg, crate::os_args![path], None, Capture::Hash, self.ctx.timeout, &self.ctx.gate)?;
                 if ran.success {
                     let mut sig = b"djpeg:".to_vec();
                     sig.extend(ran.hash.unwrap_or_default());

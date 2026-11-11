@@ -279,6 +279,8 @@ export component AppWindow inherits Window {
     in-out property <int> convert-index;
     in property <[string]> pdf-options;
     in-out property <int> pdf-index;
+    in property <[string]> effort-options;
+    in-out property <int> effort-index;
 
     callback choose-folder();
     callback start();
@@ -483,6 +485,16 @@ export component AppWindow inherits Window {
                         hint: "Text and drawings never change; every page is rendered and compared.";
                         model: root.pdf-options;
                         current-index <=> root.pdf-index;
+                        changed => { root.settings-changed(); }
+                    }
+                }
+                Row {
+                    SettingField {
+                        glyph: "\u{E945}";
+                        label: "Effort";
+                        hint: "Images, audio and documents. Maximum tries every tool at its highest setting; files already done stay done.";
+                        model: root.effort-options;
+                        current-index <=> root.effort-index;
                         changed => { root.settings-changed(); }
                     }
                 }

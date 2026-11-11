@@ -74,6 +74,9 @@ pub struct Options {
     /// PDF images may be re-encoded lossily (SSIMULACRA2 >= 93, every page rendered and
     /// checked), when images are visually lossless too. Text and vectors are never touched.
     pub lossy_docs: bool,
+    /// imageopti's "max" level for the CPU files: every tool at its highest setting (slow,
+    /// a little smaller). It doesn't redo files already processed at the normal level.
+    pub max_effort: bool,
 }
 
 impl Default for Options {
@@ -90,6 +93,7 @@ impl Default for Options {
             images: ImageMode::Lossy,
             convert: true,
             lossy_docs: true,
+            max_effort: false,
         }
     }
 }
@@ -112,6 +116,8 @@ pub struct RawOptions {
     pub convert: Option<u32>,
     /// 0 = PDFs lossless only, 1 = visually lossless PDF images.
     pub lossy_docs: Option<u32>,
+    /// 1 = normal effort, 2 = maximum effort.
+    pub effort: Option<u32>,
 }
 
 impl Options {
@@ -159,6 +165,7 @@ impl Options {
             },
             convert: raw.convert.map_or(d.convert, |c| c != 0),
             lossy_docs: raw.lossy_docs.map_or(d.lossy_docs, |c| c != 0),
+            max_effort: raw.effort.map_or(d.max_effort, |e| e == 2),
         }
     }
 }
@@ -352,7 +359,9 @@ mod tests {
             images: Some(7),
             convert: None,
             lossy_docs: None,
+            effort: Some(5),
         });
+        assert!(!o.max_effort, "normal effort by default");
         assert!(o.convert, "conversions on by default");
         assert_eq!(o.images, ImageMode::Lossy, "images: visually lossless by default");
         assert_eq!(o.crf, 23);

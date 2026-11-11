@@ -30,7 +30,7 @@ const MIN_LOSSY_QUALITY: f64 = 85.0;
 
 fn qpdf(ctx: &Ctx, args: Vec<OsString>, capture: Capture) -> Result<tools::Ran, RunError> {
     let program = ctx.tools.get("qpdf").ok_or_else(|| RunError::Failed("qpdf is missing".into()))?;
-    tools::run(program, args, None, capture, ctx.timeout, &ctx.cancel)
+    tools::run(program, args, None, capture, ctx.timeout, &ctx.gate)
 }
 
 fn size(p: &Path) -> u64 {
@@ -150,7 +150,7 @@ fn pages_look_same(ctx: &Ctx, a: &Path, b: &Path, work: &Path) -> Result<bool, R
             return Ok(false);
         }
         let args = crate::os_args!["draw", "-q", "-r", "96", "-o", dir.join("p%05d.png"), p];
-        if !tools::run(mutool, args, None, Capture::None, ctx.timeout * 2, &ctx.cancel)?.success {
+        if !tools::run(mutool, args, None, Capture::None, ctx.timeout * 2, &ctx.gate)?.success {
             return Ok(false);
         }
         let mut files: Vec<PathBuf> = std::fs::read_dir(&dir).map_or_else(|_| Vec::new(), |d| d.filter_map(|e| e.ok().map(|e| e.path())).collect());
@@ -214,7 +214,7 @@ fn reencoders<'a>(ctx: &'a Ctx, lw: &Path, pnm: &Path, keep: &jpeg::Segments) ->
 
 fn djpeg_hash(ctx: &Ctx, p: &Path) -> Result<Option<[u8; 32]>, RunError> {
     let Some(djpeg) = ctx.tools.get("djpeg") else { return Ok(None) };
-    let ran = tools::run(djpeg, crate::os_args![p], None, Capture::Hash, ctx.timeout, &ctx.cancel)?;
+    let ran = tools::run(djpeg, crate::os_args![p], None, Capture::Hash, ctx.timeout, &ctx.gate)?;
     Ok(ran.hash.filter(|_| ran.success))
 }
 
@@ -289,7 +289,7 @@ fn optimize_images(ctx: &Ctx, src: &Path, work: &Path, lossy: bool) -> Result<Op
                 }
             }
             let ref_jpg = lw.join("ref.jpg"); // extracted streams have no extension; scorers want one
-            let quality_ok = jpeg::quality(&file).is_none_or(|q| q >= MIN_LOSSY_QUALITY);
+            let quality_ok = ctx.max || jpeg::quality(&file).is_none_or(|q| q >= MIN_LOSSY_QUALITY);
             if lossy && file_size >= MIN_LOSSY_JPEG && quality_ok && std::fs::copy(&file, &ref_jpg).is_ok() {
                 let pnm = lw.join("dec.pnm");
                 if image::run(ctx, "djpeg", crate::os_args!["-outfile", &pnm, &ref_jpg], &lw)? {
@@ -369,7 +369,6 @@ mod tests {
     use super::*;
     use crate::image::tools::Tools;
     use std::time::Duration;
-    use tokio_util::sync::CancellationToken;
 
     fn ctx(lossy: bool) -> Option<Ctx> {
         let ffmpeg = Path::new(env!("CARGO_MANIFEST_DIR")).join("bin").join("ffmpeg.exe");
@@ -385,7 +384,9 @@ mod tests {
             lossy_docs: lossy,
             parallel: false,
             timeout: Duration::from_secs(300),
-            cancel: CancellationToken::new(),
+            gate: crate::image::tools::Gate::default(),
+            max: false,
+            slots: None,
         })
     }
 

@@ -4,9 +4,9 @@
 //! - **Cover art**: embedded pictures (FLAC PICTURE blocks, ID3v2 APIC frames) are optimized
 //!   by the image pipeline (pixel-identical, or SSIMULACRA2 >= 93 in lossy mode). Everything
 //!   else (audio frames, tags, other blocks) is copied byte for byte and checked to be.
-//! - **FLAC re-encoding** (`-8 -p -A subdivide_tukey(5)`): only for files from encoders older
-//!   than libFLAC 1.4, accepted only when the decoded audio, the tags and the CUESHEET,
-//!   APPLICATION and PICTURE blocks are unchanged.
+//! - **FLAC re-encoding** (`-8 -p -A subdivide_tukey(5)`, plus `-e` at max effort): only for
+//!   files from encoders older than libFLAC 1.4 (every file at max effort), accepted only when
+//!   the decoded audio, the tags and the CUESHEET, APPLICATION and PICTURE blocks are unchanged.
 //! - **WAV -> FLAC** (a conversion: the extension changes): integer PCM only, accepted when
 //!   the FLAC decodes to the same samples with the same channels, rate and bit depth.
 //!
@@ -137,7 +137,7 @@ fn write_with_tail(out: &Path, head: &[u8], src: &Path, at: u64) -> io::Result<(
 /// SHA-256 of the decoded audio (first audio stream, 32-bit samples: exact for any FLAC).
 fn audio_hash(ctx: &Ctx, path: &Path) -> Result<Option<[u8; 32]>, RunError> {
     let args = crate::os_args!["-v", "error", "-i", path, "-map", "0:a:0", "-f", "s32le", "-"];
-    let ran = tools::run(&ctx.tools.ffmpeg, args, None, Capture::Hash, ctx.timeout, &ctx.cancel)?;
+    let ran = tools::run(&ctx.tools.ffmpeg, args, None, Capture::Hash, audio_timeout(ctx, path), &ctx.gate)?;
     Ok(ran.hash.filter(|_| ran.success))
 }
 
@@ -250,6 +250,23 @@ fn vendor(blocks: &[(u8, Vec<u8>)]) -> &[u8] {
         .unwrap_or_default()
 }
 
+/// flac's encoding settings (imageopti's: `-e` at max effort).
+fn flac_level(ctx: &Ctx) -> Vec<std::ffi::OsString> {
+    let mut a = crate::os_args!["-8", "-p", "-A", "subdivide_tukey(5)"];
+    if ctx.max {
+        a.push("-e".into());
+    }
+    a
+}
+
+/// Time allowed to encode or decode `path`: the usual limit, or more for big files (a
+/// hi-res album as one file can take a long time at `-8 -p -e`).
+fn audio_timeout(ctx: &Ctx, path: &Path) -> std::time::Duration {
+    let bytes_per_sec: u64 = if ctx.max { 256 * 1024 } else { 1024 * 1024 };
+    let size = std::fs::metadata(path).map_or(0, |m| m.len());
+    ctx.timeout.max(std::time::Duration::from_secs(size / bytes_per_sec))
+}
+
 /// The decoded-audio hash of `src`, computed on first use (`None` if it can't be decoded).
 fn reference_audio(ctx: &Ctx, src: &Path, slot: &mut Option<Option<[u8; 32]>>) -> Result<Option<[u8; 32]>, RunError> {
     if slot.is_none() {
@@ -269,7 +286,7 @@ pub fn worth_trying(ctx: &Ctx, kind: Kind, path: &Path) -> bool {
     let has_art = |data: &[u8]| data.len() >= MIN_ART && sniff(data).is_some();
     match kind {
         Kind::Flac => flac_read(path).ok().flatten().is_some_and(|f| {
-            (!is_modern(&f) && ctx.tools.has("flac"))
+            ((ctx.max || !is_modern(&f)) && ctx.tools.has("flac"))
                 || f.blocks.iter().any(|(t, b)| *t == PICTURE && picture_parse(b).is_some_and(|p| has_art(p.data)))
         }),
         Kind::Mp3 => mp3_tag(path).ok().flatten().is_some_and(|tag| {
@@ -362,7 +379,7 @@ fn decoded(ctx: &Ctx, path: &Path, end_sample: Option<u64>) -> Result<Option<([u
         args.extend(crate::os_args!["-af", format!("atrim=end_sample={n}")]);
     }
     args.extend(crate::os_args!["-f", "f32le", "-"]);
-    let ran = tools::run(&ctx.tools.ffmpeg, args, None, Capture::Hash, ctx.timeout, &ctx.cancel)?;
+    let ran = tools::run(&ctx.tools.ffmpeg, args, None, Capture::Hash, ctx.timeout, &ctx.gate)?;
     Ok(ran.hash.filter(|_| ran.success).map(|h| (h, ran.stdout_len)))
 }
 
@@ -371,7 +388,7 @@ fn ogg(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, AudioError> {
     let Some(optivorbis) = ctx.tools.get("optivorbis") else { return skip("optivorbis is missing") };
     let Some(info) = ogg_info(src)? else { return skip("not a single Vorbis stream (Opus, FLAC, video or chained Ogg): skipped") };
     let out = work.join("out.ogg");
-    let ran = tools::run(optivorbis, crate::os_args!["-q", src, &out], Some(work), Capture::None, ctx.timeout, &ctx.cancel)?;
+    let ran = tools::run(optivorbis, crate::os_args!["-q", src, &out], Some(work), Capture::None, ctx.timeout, &ctx.gate)?;
     let smaller = ran.success && std::fs::metadata(&out).is_ok_and(|m| m.len() < std::fs::metadata(src).map_or(0, |s| s.len()));
     if !smaller || ogg_info(&out)?.as_ref() != Some(&info) {
         return Ok(Optimized::nothing());
@@ -456,12 +473,12 @@ fn wav(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, AudioError> {
     let out = work.join("out.flac");
     let mut encoded = false;
     for keep in [true, false] {
-        let mut args = crate::os_args!["-8", "-p", "-A", "subdivide_tukey(5)"];
+        let mut args = flac_level(ctx);
         if keep {
             args.push("--keep-foreign-metadata-if-present".into());
         }
         args.extend(crate::os_args!["--verify", "--silent", "-f", "-o", &out, src]);
-        if tools::run(flac, args, Some(work), Capture::None, ctx.timeout, &ctx.cancel)?.success && out.is_file() {
+        if tools::run(flac, args, Some(work), Capture::None, audio_timeout(ctx, src), &ctx.gate)?.success && out.is_file() {
             encoded = true;
             break;
         }
@@ -512,19 +529,18 @@ fn flac(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, AudioError> {
         }
     }
 
-    // 2) re-encoding: worthwhile only for files from older or other encoders.
-    if !is_modern(&orig) {
+    // 2) re-encoding: worthwhile only for files from older or other encoders (any at max).
+    if ctx.max || !is_modern(&orig) {
         if let Some(flac) = ctx.tools.get("flac") {
             let out = work.join("enc.flac");
-            let args = crate::os_args![
-                "-8", "-p", "-A", "subdivide_tukey(5)", "--verify", "--silent", "-f", "-o", &out, &best
-            ];
-            let ran = tools::run(flac, args, Some(work), Capture::None, ctx.timeout, &ctx.cancel)?;
+            let mut args = flac_level(ctx);
+            args.extend(crate::os_args!["--verify", "--silent", "-f", "-o", &out, &best]);
+            let ran = tools::run(flac, args, Some(work), Capture::None, audio_timeout(ctx, src), &ctx.gate)?;
             if ran.success {
                 let size = std::fs::metadata(&out).map_or(u64::MAX, |m| m.len());
                 if size < best_size && flac_encode_ok(ctx, reference_audio(ctx, src, &mut orig_audio)?, &best, &out)? {
                     best = out;
-                    steps.push("flac-8p".to_string());
+                    steps.push(if ctx.max { "flac-8pe" } else { "flac-8p" }.to_string());
                 }
             }
         }
@@ -611,8 +627,12 @@ fn mp3(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, AudioError> {
     let mut i = 0;
     while i + 10 <= tag.len() && tag[i..i + 4] != [0, 0, 0, 0] {
         let fs = if ver == 4 { syncsafe(&tag[i + 4..i + 8]) } else { u32::from_be_bytes(tag[i + 4..i + 8].try_into().unwrap()) } as usize;
-        if fs == 0 || i + 10 + fs > tag.len() {
-            return skip("damaged ID3 tag: skipped");
+        // Frame ids are A-Z/0-9; v2.4 sizes are syncsafe (some taggers write plain sizes,
+        // which would be misread here). Anything unusual is left alone.
+        let id_ok = tag[i..i + 4].iter().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit());
+        let size_ok = ver != 4 || tag[i + 4..i + 8].iter().all(|b| b & 0x80 == 0);
+        if fs == 0 || i + 10 + fs > tag.len() || !id_ok || !size_ok {
+            return skip("unusual or damaged ID3 tag: skipped");
         }
         frames.push((&tag[i..i + 4], &tag[i + 8..i + 10], tag[i + 10..i + 10 + fs].to_vec()));
         i += 10 + fs;
@@ -716,7 +736,6 @@ mod tests {
     use super::*;
     use crate::image::tools::Tools;
     use std::time::Duration;
-    use tokio_util::sync::CancellationToken;
 
     fn ctx() -> Option<Ctx> {
         let ffmpeg = Path::new(env!("CARGO_MANIFEST_DIR")).join("bin").join("ffmpeg.exe");
@@ -731,7 +750,9 @@ mod tests {
             lossy_docs: false,
             parallel: false,
             timeout: Duration::from_secs(120),
-            cancel: CancellationToken::new(),
+            gate: crate::image::tools::Gate::default(),
+            max: false,
+            slots: None,
         })
     }
 
