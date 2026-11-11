@@ -50,6 +50,26 @@ pub(super) enum ImageResult {
     Stopped,
 }
 
+/// A batch's CPU settings: the image pipeline's for pictures and documents, and the same
+/// with the audio setting's lossiness for audio files (their cover art). Both share the CPU
+/// slots and Stop/Pause.
+pub(super) struct CpuCtx {
+    pub image: image::Ctx,
+    pub audio: image::Ctx,
+    pub slots: usize,
+}
+
+impl CpuCtx {
+    pub(super) fn new(image: image::Ctx, options: &crate::args::Options, slots: usize) -> Self {
+        let audio = image::Ctx { lossy: options.audio == crate::args::ImageMode::Lossy, ..image.clone() };
+        Self { image, audio, slots }
+    }
+
+    fn for_file(&self, path: &Path) -> &image::Ctx {
+        if image::kind_of(path).is_some_and(image::Kind::is_audio) { &self.audio } else { &self.image }
+    }
+}
+
 impl Inner {
     /// The CPU jobs' settings under the current options (a chosen temp folder that is gone
     /// falls back to the system one).
@@ -89,7 +109,7 @@ impl Engine {
             parallel: slots > 1,
             timeout: std::time::Duration::from_secs(900),
             gate: image::tools::Gate::new(cancel, Some(self.paused.subscribe())),
-            max: max_parts(options.max_effort),
+            max: max_parts(),
             slots: (slots > 1).then(|| image::tools::Slots::new(slots)),
         }
     }
@@ -151,31 +171,39 @@ impl Engine {
         }
     }
 
-    pub(super) async fn run_image_worker(self: Arc<Self>, worker_id: u32, ctx: Arc<image::Ctx>) {
+    pub(super) async fn run_image_worker(self: Arc<Self>, worker_id: u32, cpu: Arc<CpuCtx>) {
         loop {
             let cancel = self.lock().cancel.clone();
             if !self.wait_while_paused(&cancel).await || !self.wait_for_image_memory(&cancel).await {
+                self.lock().cpu_ids.remove(&worker_id);
                 break;
             }
             let (path, lossy, disposal, opts) = {
                 let mut inner = self.lock();
                 if !inner.working || inner.stop_requested {
+                    inner.cpu_ids.remove(&worker_id);
                     break;
                 }
-                let Some(path) = inner.claim_image() else { break };
+                // Leaving in the same lock as the empty check: files added later start a
+                // new worker.
+                let Some(path) = inner.claim_image() else {
+                    inner.cpu_ids.remove(&worker_id);
+                    break;
+                };
                 inner.images_active += 1;
                 let disposal = inner.disposal_for(&path);
-                (path, inner.images_lossy(), disposal, inner.job_opts())
+                (path.clone(), inner.lossy_for(&path), disposal, inner.job_opts())
             };
             self.send_state(false);
-            let (ctx2, p2) = (Arc::clone(&ctx), path.clone());
+            let (cpu2, p2) = (Arc::clone(&cpu), path.clone());
             let result = self
                 .blocking(move || {
+                    let ctx2 = cpu2.for_file(&p2);
                     // A slot is free unless a big job borrowed it: then wait for it back.
                     if ctx2.slots.as_ref().is_some_and(|s| !s.acquire(&ctx2.gate)) {
                         return ImageResult::Stopped;
                     }
-                    let r = process_image(&ctx2, &p2, worker_id, &disposal, &opts);
+                    let r = process_image(ctx2, &p2, worker_id, &disposal, &opts);
                     if let Some(s) = &ctx2.slots {
                         s.release(1);
                     }
@@ -338,15 +366,15 @@ impl Drop for WorkDir {
     }
 }
 
-/// The maximum-effort parts for the setting. Benchmarks can pick parts with the
+/// The maximum-effort parts in use. Benchmarks can pick parts with the
 /// `MEDIAOPTI_MAX_PARTS` environment variable (comma-separated `Max` field names; test builds only).
-fn max_parts(max_effort: bool) -> image::Max {
+fn max_parts() -> image::Max {
     if cfg!(test) {
         if let Ok(names) = std::env::var("MEDIAOPTI_MAX_PARTS") {
             return image::Max::from_names(&names.split(',').map(str::trim).collect::<Vec<_>>());
         }
     }
-    if max_effort { image::Max::chosen() } else { image::Max::default() }
+    image::Max::chosen()
 }
 
 fn content_of(path: &Path) -> Option<(ContentHash, u64)> {

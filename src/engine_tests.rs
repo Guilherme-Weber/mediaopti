@@ -85,7 +85,7 @@ fn opts(encoder: &str, concurrency: f64) -> RawOptions {
         images: Some(0),
         convert: Some(0),
         lossy_docs: Some(0),
-        effort: None,
+        audio: Some(0),
         temp_dir: None,
         fix_ext: None,
     }
@@ -626,13 +626,11 @@ fn bench_folder() {
     }
     let rt = runtime();
     let (engine, rec) = new_engine(&rt, &root, ff);
-    // MEDIAOPTI_BENCH_EFFORT=2: maximum effort.
-    let effort = std::env::var("MEDIAOPTI_BENCH_EFFORT").ok().and_then(|e| e.parse().ok());
     // MEDIAOPTI_BENCH_CONVERT=1: conversions on (BMP/TGA -> PNG, WAV -> FLAC, CBR -> CBZ).
     let convert = std::env::var("MEDIAOPTI_BENCH_CONVERT").ok().and_then(|e| e.parse().ok());
     // MEDIAOPTI_BENCH_DOCS=1: visually lossless PDF images.
     let docs = std::env::var("MEDIAOPTI_BENCH_DOCS").ok().and_then(|e| e.parse().ok());
-    let raw = || RawOptions { images: Some(2), effort, convert: convert.or(Some(0)), lossy_docs: docs.or(Some(0)), ..opts("av1_nvenc", 2.0) };
+    let raw = || RawOptions { images: Some(2), audio: Some(2), convert: convert.or(Some(0)), lossy_docs: docs.or(Some(0)), ..opts("av1_nvenc", 2.0) };
     let t = std::time::Instant::now();
     rt.block_on(async {
         engine.apply_options(raw());
@@ -750,14 +748,15 @@ fn wav_becomes_flac_only_when_safe() {
     assert_eq!(off.snapshot().pending_files, 0, "conversions off: no WAV queued");
 
     let (engine, rec) = new_engine(&rt, &root, ff.clone());
-    let raw = || RawOptions { originals: Some(2), convert: Some(1), ..opts("av1_nvenc", 1.0) };
+    let raw = || RawOptions { originals: Some(2), convert: Some(1), audio: Some(1), ..opts("av1_nvenc", 1.0) };
     rt.block_on(async {
         engine.apply_options(raw());
         engine.load_dir(media.clone()).await;
         engine.clone().run_batch(raw()).await;
     });
     let logs = rec.logs.lock().unwrap().join("\n");
-    assert_eq!(engine.snapshot().compressed_this_run, 3, "{logs}");
+    // pcm and taken converted, same.flac re-encoded (an old encoder), same.wav a duplicate.
+    assert_eq!(engine.snapshot().compressed_this_run, 4, "{logs}");
     let flac = media.join("pcm.flac");
     assert!(!pcm.exists() && flac.exists(), "{logs}");
     assert_eq!(std::fs::metadata(&flac).unwrap().modified().unwrap(), old, "date not kept");
@@ -854,7 +853,7 @@ fn real_folder_run() {
         images: Some(2),
         convert: Some(1),
         lossy_docs: Some(1),
-        effort: None,
+        audio: Some(2),
         temp_dir: None,
         fix_ext: None,
     };
@@ -873,4 +872,56 @@ fn real_folder_run() {
         t.elapsed().as_secs_f64(), s.completed_this_run, s.images_done_this_run,
         s.compressed_this_run, s.skipped_larger_this_run, s.failed_this_run, s.space_saved_mb
     );
+}
+
+/// Dropped files and folders: added to what is loaded (the start folder becomes their common
+/// folder), and added to a running batch, whose new CPU files start a worker of their own.
+#[test]
+fn dropped_items_join_the_queue() {
+    let Some(ff) = ffmpeg() else {
+        eprintln!("skipping: bundled ffmpeg not found");
+        return;
+    };
+    let tools = crate::image::tools::Tools::discover(ff.clone(), &std::env::temp_dir());
+    if !tools.has("oxipng") {
+        eprintln!("skipping: oxipng not found");
+        return;
+    }
+    let root = test_dir("drop");
+    let (a, b, c) = (root.join("media").join("a"), root.join("media").join("b"), root.join("later"));
+    for d in [&a, &b, &c] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    lossless_video(&ff, 4, "1280x720", &a.join("clip.mp4"));
+    let png = |dir: &Path, name: &str| make(&ff, &["-f", "lavfi", "-i", "testsrc=s=200x150", "-frames:v", "1", "-compression_level", "0"], &dir.join(name));
+    png(&b, "one.png");
+    png(&c, "two.png");
+    png(&c, "three.png");
+
+    let rt = runtime();
+    let (engine, rec) = new_engine(&rt, &root, ff.clone());
+    let raw = || RawOptions { images: Some(1), ..opts("av1_nvenc", 1.0) };
+    engine.apply_options(raw());
+    rt.block_on(async {
+        engine.load_dir(a.clone()).await;
+        assert_eq!(engine.snapshot().pending_files, 1);
+        // Idle: a folder and a single file are added; the start folder becomes "media".
+        engine.load_items(vec![b.clone(), a.join("clip.mp4")], true).await;
+        let s = engine.snapshot();
+        assert_eq!(s.pending_files, 2, "the video once, plus one.png");
+        assert_eq!(s.dir.as_deref(), Some(root.join("media").to_string_lossy().as_ref()));
+
+        // Running (only a video worker so far): later/ is added; a CPU worker starts for it.
+        let run = tokio::spawn(engine.clone().run_batch(raw()));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        engine.load_items(vec![c.clone()], true).await;
+        run.await.unwrap();
+    });
+    let logs = rec.logs.lock().unwrap().join("\n");
+    let s = engine.snapshot();
+    assert!(logs.contains("Added to the queue: 0 videos and 2 images"), "{logs}");
+    assert_eq!(s.completed_this_run, 4, "{logs}");
+    assert_eq!(s.failed_this_run, 0, "{logs}");
+    assert_eq!(s.compressed_this_run, 4, "{logs}");
+    let _ = std::fs::remove_dir_all(&root);
 }

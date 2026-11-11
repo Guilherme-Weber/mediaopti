@@ -111,14 +111,17 @@ The **Images** setting chooses:
 - **Lossless only:** pixel-identical results only.
 - **Don't process images.**
 
-The **Effort** setting chooses **Maximum** (default) or **Normal**. Maximum adds only what paid off
-when each of imageopti's "max" steps was measured alone on random files from a real library: ECT
-after oxipng for PNG (`-9` under 2 megapixels, `-6` above). On 80 real PNGs it saved 2.79% instead
-of 2.57%, and on the Kodak photos 37.05% instead of 36.85%, for about 45% more time on PNGs. The other
-steps gained nothing measurable or too little for their time (oxipng `-o max`, pingo as a lossy
-PNG method, ECT `-9` and pingo for JPEG, lossy re-encoding of JPEGs below quality 90, PDF JPEGs
-below quality 85, re-encoding FLACs from libFLAC 1.4+, and flac `-e`), so they are not used. Files
-already processed are not redone.
+Every run uses the "maximum" effort that paid off when each of imageopti's "max" steps was
+measured alone on random files from a real library: ECT after oxipng for PNG (`-9` under 2
+megapixels, `-6` above). On 80 real PNGs it saved 2.79% instead of 2.57%, and on the Kodak photos
+37.05% instead of 36.85%, for about 45% more time on PNGs. The other steps gained nothing
+measurable or too little for their time (oxipng `-o max`, pingo as a lossy PNG method, ECT `-9`
+and pingo for JPEG, lossy re-encoding of JPEGs below quality 90, PDF JPEGs below quality 85,
+re-encoding FLACs from libFLAC 1.4+, and flac `-e`), so they are not used.
+
+The **Audio** setting is separate from Images: FLAC, MP3, Ogg and WAV files can be switched off,
+processed losslessly, or have their cover art made visually lossless (the sound itself never
+changes).
 
 **Wrong extensions** (off by default) renames pictures whose extension doesn't match their format,
 for example a JPEG called `.png` becomes `.jpg` (and a WebP called `.jpg` becomes `.webp`). It can
@@ -169,7 +172,8 @@ suspends the image, audio, and document tools that are running.
 ## Usage
 
 1. Extract the release zip and run `mediaopti.exe`.
-2. Choose a folder.
+2. Choose a folder, or drag files and folders onto the window (several at once; they are added to
+   what is loaded, and during a run to the running queue).
 3. Pick the settings: encoder, jobs, quality, speed, the *If not smaller* check, GIF handling, and
    what happens to replaced originals.
 4. Click **Start**. Use **Pause/Resume** or **Stop** at any time.

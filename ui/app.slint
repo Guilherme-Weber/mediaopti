@@ -184,6 +184,26 @@ component SettingField inherits VerticalLayout {
     Text { text: root.hint; font-size: 12px; color: Theme.text-tertiary; wrap: word-wrap; }
 }
 
+// Heading of a group of settings, with a thin rule.
+component GroupLabel inherits HorizontalLayout {
+    in property <string> text;
+    spacing: 10px;
+    padding-top: 4px;
+    Text { text: root.text; font-size: 12px; font-weight: 600; color: Theme.accent; vertical-alignment: center; }
+    VerticalLayout {
+        alignment: center;
+        horizontal-stretch: 1;
+        Rectangle { height: 1px; background: Theme.subtle-fill; }
+    }
+}
+
+// Keeps a lone setting at half width (same column sizing as SettingField).
+component EmptyField inherits Rectangle {
+    preferred-width: 200px;
+    min-width: 0px;
+    horizontal-stretch: 1;
+}
+
 // One figure inside the metrics card: icon + label, value underneath.
 component MetricCell inherits VerticalLayout {
     in property <Metric> metric;
@@ -279,12 +299,14 @@ export component AppWindow inherits Window {
     in-out property <int> convert-index;
     in property <[string]> pdf-options;
     in-out property <int> pdf-index;
-    in property <[string]> effort-options;
+    in property <[string]> audio-options;
+    in-out property <int> audio-index;
+    // A file is being dragged over the window.
+    in property <bool> drop-hover;
     in property <[string]> fix-ext-options;
     in-out property <int> fix-ext-index;
     in-out property <string> temp-dir;
     in property <string> system-temp;
-    in-out property <int> effort-index;
 
     callback choose-folder();
     callback start();
@@ -396,10 +418,11 @@ export component AppWindow inherits Window {
             }
         }
 
-        // ---- encoding settings
+        // ---- settings, grouped by what they apply to
         if root.show-options: Card {
-            gap: 16px;
-            SectionTitle { glyph: "\u{E713}"; text: "Encoding settings"; }
+            gap: 14px;
+            SectionTitle { glyph: "\u{E713}"; text: "Settings"; }
+            GroupLabel { text: "Videos"; }
             GridLayout {
                 spacing-horizontal: 24px;
                 spacing-vertical: 16px;
@@ -457,13 +480,57 @@ export component AppWindow inherits Window {
                         changed => { root.settings-changed(); }
                     }
                 }
+            }
+            GroupLabel { text: "Images and documents"; }
+            GridLayout {
+                spacing-horizontal: 24px;
+                spacing-vertical: 16px;
                 Row {
                     SettingField {
                         glyph: "\u{EB9F}";
                         label: "Images";
-                        hint: "PNG, JPEG, small GIFs, and cover art in FLAC and MP3 files, on the CPU.";
+                        hint: "PNG, JPEG, GIF, BMP/TGA, and the pictures in comics and Office files.";
                         model: root.images-options;
                         current-index <=> root.images-index;
+                        changed => { root.settings-changed(); }
+                    }
+                    SettingField {
+                        glyph: "\u{EA90}";
+                        label: "PDF";
+                        hint: "Text and drawings never change; every page is rendered and compared.";
+                        model: root.pdf-options;
+                        current-index <=> root.pdf-index;
+                        changed => { root.settings-changed(); }
+                    }
+                }
+            }
+            GroupLabel { text: "Audio"; }
+            GridLayout {
+                spacing-horizontal: 24px;
+                spacing-vertical: 16px;
+                Row {
+                    SettingField {
+                        glyph: "\u{E8D6}";
+                        label: "Audio";
+                        hint: "FLAC, MP3, Ogg and WAV. The sound itself never changes; this sets the cover art.";
+                        model: root.audio-options;
+                        current-index <=> root.audio-index;
+                        changed => { root.settings-changed(); }
+                    }
+                    EmptyField { }
+                }
+            }
+            GroupLabel { text: "Files"; }
+            GridLayout {
+                spacing-horizontal: 24px;
+                spacing-vertical: 16px;
+                Row {
+                    SettingField {
+                        glyph: "\u{E8AB}";
+                        label: "Conversions";
+                        hint: "Lossless and verified. The file extension changes.";
+                        model: root.convert-options;
+                        current-index <=> root.convert-index;
                         changed => { root.settings-changed(); }
                     }
                     SettingField {
@@ -477,32 +544,6 @@ export component AppWindow inherits Window {
                 }
                 Row {
                     SettingField {
-                        glyph: "\u{E8AB}";
-                        label: "Conversions";
-                        hint: "Lossless and verified. The file extension changes.";
-                        model: root.convert-options;
-                        current-index <=> root.convert-index;
-                        changed => { root.settings-changed(); }
-                    }
-                    SettingField {
-                        glyph: "\u{EA90}";
-                        label: "PDF";
-                        hint: "Text and drawings never change; every page is rendered and compared.";
-                        model: root.pdf-options;
-                        current-index <=> root.pdf-index;
-                        changed => { root.settings-changed(); }
-                    }
-                }
-                Row {
-                    SettingField {
-                        glyph: "\u{E945}";
-                        label: "Effort";
-                        hint: "Maximum: the tools and settings that pay off; slower.";
-                        model: root.effort-options;
-                        current-index <=> root.effort-index;
-                        changed => { root.settings-changed(); }
-                    }
-                    SettingField {
                         glyph: "\u{E8AC}";
                         label: "Wrong extensions";
                         hint: "A JPEG named .png becomes .jpg (may break saved web pages).";
@@ -510,6 +551,7 @@ export component AppWindow inherits Window {
                         current-index <=> root.fix-ext-index;
                         changed => { root.settings-changed(); }
                     }
+                    EmptyField { }
                 }
             }
             // Index 1 = "Move to a backup folder".
@@ -648,5 +690,42 @@ export component AppWindow inherits Window {
 
         if !root.show-log: Rectangle { vertical-stretch: 1; }
     }
+    }
+
+    // While files are dragged over the window: where they will go.
+    if root.drop-hover: Rectangle {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        background: #000000B0;
+        Rectangle {
+            x: 16px;
+            y: 16px;
+            width: parent.width - 32px;
+            height: parent.height - 32px;
+            border-radius: Theme.radius;
+            border-width: 2px;
+            border-color: Theme.accent;
+            background: Theme.accent.with-alpha(0.06);
+            VerticalLayout {
+                alignment: center;
+                spacing: 10px;
+                Glyph { glyph: "\u{E896}"; font-size: 40px; color: Theme.accent; }
+                Text {
+                    text: root.processing ? "Drop to add them to the running queue" : "Drop to add them to the queue";
+                    font-size: 20px;
+                    font-weight: 600;
+                    color: Theme.text;
+                    horizontal-alignment: center;
+                }
+                Text {
+                    text: "Folders are scanned with their subfolders.";
+                    font-size: 13px;
+                    color: Theme.text-secondary;
+                    horizontal-alignment: center;
+                }
+            }
+        }
     }
 }

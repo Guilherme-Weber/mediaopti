@@ -154,6 +154,27 @@ struct Inner {
     run: RunStats,
     cancel: CancellationToken,
     power: Option<PowerGuard>,
+    /// Workers of the running batch, awaited by `run_batch` (files added during a run can
+    /// start more).
+    handles: Vec<(String, tokio::task::JoinHandle<()>)>,
+    /// Ids of the video and CPU workers running now.
+    video_ids: std::collections::BTreeSet<u32>,
+    cpu_ids: std::collections::BTreeSet<u32>,
+    /// The running batch's CPU settings (made when the first CPU file needs them).
+    cpu: Option<Arc<images::CpuCtx>>,
+    fatal: Arc<AtomicBool>,
+    gpu_polling: bool,
+}
+
+/// Where a scanned file goes (see `Inner::place`).
+enum Place {
+    Generated,
+    /// Its category is switched off (`gif`: an animated GIF kept as a GIF).
+    Off { gif: bool },
+    Known,
+    Failed,
+    Cpu,
+    Video,
 }
 
 struct EmitThrottle {
@@ -271,17 +292,23 @@ impl Inner {
     /// Whether the settings let the CPU workers take this file: conversions (WAV) follow the
     /// conversions option, everything else (images, cover art) the image option.
     fn cpu_job_enabled(&self, file: &Path) -> bool {
-        match image::kind_of(file) {
-            Some(k) if k.is_conversion() => self.options.convert,
-            _ => self.options.images != ImageMode::Off,
-        }
+        let Some(kind) = image::kind_of(file) else { return false };
+        let category = if kind.is_audio() { self.options.audio } else { self.options.images };
+        category != ImageMode::Off && (!kind.is_conversion() || self.options.convert)
+    }
+
+    /// Whether `file` is processed visually lossless (its category's setting: audio files by
+    /// the audio setting, the rest by the image setting).
+    fn lossy_for(&self, file: &Path) -> bool {
+        let audio = image::kind_of(file).is_some_and(image::Kind::is_audio);
+        (if audio { self.options.audio } else { self.options.images }) == ImageMode::Lossy
     }
 
     /// Content-history request for a file under the current settings.
     fn want(&self, file: &Path, size: u64) -> history::Want {
         if !self.is_image_job(file, size) {
             history::Want::Video
-        } else if self.images_lossy() {
+        } else if self.lossy_for(file) {
             history::Want::ImageLossy
         } else {
             history::Want::ImageLossless
@@ -316,30 +343,43 @@ impl Inner {
         }
     }
 
+    /// Where a scanned file goes under the current settings and history.
+    fn place(&self, file: &Path, size: u64) -> Place {
+        if is_generated_name(file) {
+            Place::Generated
+        } else if self.is_image_job(file, size) {
+            if !self.cpu_job_enabled(file) {
+                // Not remembered: they may be optimized once switched on.
+                Place::Off { gif: args::is_gif(file) }
+            } else if self.history.contains_image(file, self.lossy_for(file)) {
+                Place::Known
+            } else if self.failed.contains(file) {
+                Place::Failed
+            } else {
+                Place::Cpu
+            }
+        } else if self.history.contains(file) {
+            Place::Known
+        } else if self.failed.contains(file) {
+            Place::Failed
+        } else {
+            Place::Video
+        }
+    }
+
     /// Rebuilds the work queues from the scanned files, history and this run's failures.
     fn rebuild_queue(&mut self) {
         let (mut queue, mut images) = (Vec::new(), Vec::new());
         let (mut known, mut generated, mut small_gifs) = (0, 0, 0);
-        let lossy = self.images_lossy();
         for (i, file) in self.files.iter().enumerate() {
             let size = self.file_sizes.get(i).copied().unwrap_or(u64::MAX);
-            if is_generated_name(file) {
-                generated += 1;
-            } else if self.is_image_job(file, size) {
-                if !self.cpu_job_enabled(file) {
-                    // Not remembered: they may be optimized once switched on.
-                    if args::is_gif(file) {
-                        small_gifs += 1;
-                    }
-                } else if self.history.contains_image(file, lossy) {
-                    known += 1;
-                } else if !self.failed.contains(file) {
-                    images.push(file.clone());
-                }
-            } else if self.history.contains(file) {
-                known += 1;
-            } else if !self.failed.contains(file) {
-                queue.push(file.clone());
+            match self.place(file, size) {
+                Place::Generated => generated += 1,
+                Place::Off { gif } => small_gifs += usize::from(gif),
+                Place::Known => known += 1,
+                Place::Failed => {}
+                Place::Cpu => images.push(file.clone()),
+                Place::Video => queue.push(file.clone()),
             }
         }
         self.pending_queue = queue;
@@ -503,6 +543,12 @@ impl Engine {
                 run: RunStats::default(),
                 cancel: CancellationToken::new(),
                 power: None,
+                handles: Vec::new(),
+                video_ids: std::collections::BTreeSet::new(),
+                cpu_ids: std::collections::BTreeSet::new(),
+                cpu: None,
+                fatal: Arc::new(AtomicBool::new(false)),
+                gpu_polling: false,
             }),
             emit: Mutex::new(EmitThrottle {
                 last_sent: None,
@@ -620,7 +666,6 @@ impl Engine {
     async fn recognise_by_content(self: &Arc<Self>, files: &[PathBuf], sizes: &[u64]) -> usize {
         let (candidates, wants): (Vec<PathBuf>, Vec<history::Want>) = {
             let inner = self.lock();
-            let lossy = inner.images_lossy();
             files
                 .iter()
                 .zip(sizes)
@@ -628,7 +673,7 @@ impl Engine {
                 .map(|(f, s)| (f, inner.want(f, *s)))
                 .filter(|(f, want)| match want {
                     history::Want::Video => !inner.history.contains(f),
-                    _ => !inner.history.contains_image(f, lossy),
+                    _ => !inner.history.contains_image(f, inner.lossy_for(f)),
                 })
                 .map(|(f, want)| (f.clone(), want))
                 .unzip()
@@ -663,110 +708,182 @@ impl Engine {
 
     // ---------------------------------------------------------------- folder selection
 
-    pub fn is_working(&self) -> bool {
-        self.lock().working
-    }
-
-    /// Selects a folder and scans it for videos.
+    /// Selects a folder and scans it (replacing what was loaded).
     pub async fn load_dir(self: &Arc<Self>, dir: PathBuf) {
-        if self.is_working() {
-            self.log("Stop processing before choosing another folder");
-            return;
-        }
         if !dir.is_dir() {
             self.log(format!("Folder not found: {}", dir.display()));
             return;
         }
+        self.load_items(vec![dir], false).await;
+    }
 
-        {
+    /// Files and folders dropped on the window: added to the running batch's queues, or to
+    /// what is loaded (the start folder becomes their common folder).
+    pub fn spawn_add_items(self: &Arc<Self>, items: Vec<PathBuf>) {
+        let engine = Arc::clone(self);
+        self.rt.spawn(async move { engine.load_items(items, true).await });
+    }
+
+    /// Scans `items` (folders and files). `add`: keep what is loaded (or queued, during a
+    /// run) and add to it; otherwise they replace it.
+    pub async fn load_items(self: &Arc<Self>, items: Vec<PathBuf>, add: bool) {
+        let items: Vec<PathBuf> = items.into_iter().filter(|p| p.exists()).collect();
+        if items.is_empty() {
+            self.log("Nothing to add (the dropped items no longer exist)");
+            return;
+        }
+        let (working, old_dir) = {
+            let inner = self.lock();
+            (inner.working, inner.dir.clone())
+        };
+        if working && !add {
+            self.log("Stop processing before choosing another folder");
+            return;
+        }
+        if !working && self.lock().status == Status::Scanning {
+            self.log("A scan is running; add the files again when it has finished");
+            return;
+        }
+        // The common folder of everything loaded: names in the window and the backup folder's
+        // layout are relative to it. During a run it stays as it was.
+        let mut all = items.clone();
+        if add {
+            all.extend(old_dir.clone());
+        }
+        let root = if working { old_dir.clone().unwrap_or_else(|| common_root(&items)) } else { common_root(&all) };
+        if !working {
             let mut inner = self.lock();
-            inner.dir = Some(dir.clone());
-            inner.files.clear();
-            inner.file_sizes.clear();
+            inner.dir = Some(root.clone());
+            if !add {
+                inner.files.clear();
+                inner.file_sizes.clear();
+                inner.static_gifs.clear();
+            }
             inner.pending_queue.clear();
             inner.queue_cursor = 0;
             inner.image_queue.clear();
             inner.image_cursor = 0;
-            inner.static_gifs.clear();
             inner.reset_run_tracking();
             inner.run = RunStats::default();
             inner.status = Status::Scanning;
         }
-        self.log(format!("Scanning {}", dir.display()));
+        let what = match items.as_slice() {
+            [one] => one.display().to_string(),
+            many => format!("{} dropped items", many.len()),
+        };
+        self.log(format!("Scanning {what}"));
         self.send_state(true);
 
-        let scan_dir = dir.clone();
         // A backup folder inside the scanned folder must not be scanned (or optimized again).
         let (exclude, temp) = {
             let inner = self.lock();
             (inner.backup_root(), inner.options.temp_dir.clone())
         };
-        let scan = self.rt.spawn_blocking(move || scan_folder(&scan_dir, exclude.as_deref(), temp.as_deref())).await;
-
-        match scan {
-            Ok(result) => {
-                for msg in &result.messages {
-                    self.log(msg.clone());
-                }
-                if result.unreadable > 0 {
-                    self.log(format!(
-                        "{} files or folders could not be read (permissions or broken links) and were skipped",
-                        result.unreadable
-                    ));
-                }
-                let recognised = self.recognise_by_content(&result.files, &result.sizes).await;
-                if recognised > 0 {
-                    self.log(format!(
-                        "{recognised} moved, renamed or copied files recognised as already processed"
-                    ));
-                }
-                let (known, generated) = {
-                    let mut inner = self.lock();
-                    inner.files = result.files;
-                    inner.file_sizes = result.sizes;
-                    inner.static_gifs = result.static_gifs;
-                    inner.reset_run_tracking();
-                    inner.rebuild_queue();
-                    inner.run = RunStats::default();
-                    inner.status = Status::Ready;
-                    (inner.skipped_known, inner.skipped_generated)
-                };
-                let found = {
-                    let inner = self.lock();
-                    format!(
-                        "Found {} files in {} ({} videos and {} images or audio files to process)",
-                        inner.files.len(),
-                        dir.display(),
-                        inner.pending_queue.len(),
-                        inner.image_queue.len()
-                    )
-                };
-                self.log(found);
-                if result.cleaned_orphans > 0 {
-                    self.log(format!(
-                        "Removed {} leftover temporary (.mediaopti) file(s)",
-                        result.cleaned_orphans
-                    ));
-                }
-                if known > 0 {
-                    self.log(format!("{known} files are already in the processed history"));
-                }
-                let small_gifs = self.lock().skipped_small_gifs;
-                if small_gifs > 0 {
-                    self.log(format!(
-                        "{small_gifs} animated GIFs are under the size limit and will stay GIFs"
-                    ));
-                }
-                if generated > 0 {
-                    self.log(format!(
-                        "{generated} generated or temporary files will be ignored"
-                    ));
-                }
-            }
+        let roots = items.clone();
+        let scan = self.rt.spawn_blocking(move || scan_folder(&roots, exclude.as_deref(), temp.as_deref())).await;
+        let result = match scan {
+            Ok(r) => r,
             Err(err) => {
-                self.lock().status = Status::Error;
-                self.log(format!("Could not scan folder: {err}"));
+                if !working {
+                    self.lock().status = Status::Error;
+                }
+                self.log(format!("Could not scan: {err}"));
+                self.send_state(true);
+                return;
             }
+        };
+        for msg in &result.messages {
+            self.log(msg.clone());
+        }
+        if result.unreadable > 0 {
+            self.log(format!("{} files or folders could not be read (permissions or broken links) and were skipped", result.unreadable));
+        }
+        if result.cleaned_orphans > 0 {
+            self.log(format!("Removed {} leftover temporary (.mediaopti) file(s)", result.cleaned_orphans));
+        }
+        let recognised = self.recognise_by_content(&result.files, &result.sizes).await;
+        if recognised > 0 {
+            self.log(format!("{recognised} moved, renamed or copied files recognised as already processed"));
+        }
+
+        if working {
+            // Appended to the running batch; more workers start if the queues need them.
+            let (videos, cpu) = {
+                let mut inner = self.lock();
+                let loaded: HashSet<PathBuf> = inner.files.iter().cloned().collect();
+                let (mut videos, mut cpu) = (0, 0);
+                for (file, size) in result.files.into_iter().zip(result.sizes) {
+                    if loaded.contains(&file) {
+                        continue;
+                    }
+                    if result.static_gifs.contains(&file) {
+                        inner.static_gifs.insert(file.clone());
+                    }
+                    match inner.place(&file, size) {
+                        Place::Video => {
+                            inner.pending_queue.push(file.clone());
+                            videos += 1;
+                        }
+                        Place::Cpu => {
+                            inner.image_queue.push(file.clone());
+                            cpu += 1;
+                        }
+                        _ => {}
+                    }
+                    inner.files.push(file);
+                    inner.file_sizes.push(size);
+                }
+                inner.run.total += videos + cpu;
+                inner.run.images_total += cpu;
+                if inner.working {
+                    self.spawn_workers(&mut inner);
+                }
+                (videos, cpu)
+            };
+            self.log(if videos + cpu == 0 {
+                "Nothing new to add to the queue (already processed, or switched off)".to_string()
+            } else {
+                format!("Added to the queue: {videos} videos and {cpu} images, audio or documents")
+            });
+            self.send_state(true);
+            return;
+        }
+
+        let (known, generated, small_gifs, videos, cpu, total) = {
+            let mut inner = self.lock();
+            if add {
+                let loaded: HashSet<PathBuf> = inner.files.iter().cloned().collect();
+                for (file, size) in result.files.into_iter().zip(result.sizes) {
+                    if !loaded.contains(&file) {
+                        inner.files.push(file);
+                        inner.file_sizes.push(size);
+                    }
+                }
+                inner.static_gifs.extend(result.static_gifs);
+            } else {
+                inner.files = result.files;
+                inner.file_sizes = result.sizes;
+                inner.static_gifs = result.static_gifs;
+            }
+            inner.reset_run_tracking();
+            inner.rebuild_queue();
+            inner.run = RunStats::default();
+            inner.status = Status::Ready;
+            (inner.skipped_known, inner.skipped_generated, inner.skipped_small_gifs, inner.pending_queue.len(), inner.image_queue.len(), inner.files.len())
+        };
+        self.log(format!(
+            "{} {total} files in {} ({videos} videos and {cpu} images, audio or documents to process)",
+            if add { "Now" } else { "Found" },
+            root.display()
+        ));
+        if known > 0 {
+            self.log(format!("{known} files are already in the processed history"));
+        }
+        if small_gifs > 0 {
+            self.log(format!("{small_gifs} animated GIFs are under the size limit and will stay GIFs"));
+        }
+        if generated > 0 {
+            self.log(format!("{generated} generated or temporary files will be ignored"));
         }
         self.send_state(true);
     }
@@ -855,82 +972,59 @@ impl Engine {
             return;
         }
 
-        let (videos, images, cancel) = {
+        let (videos, images) = {
             let inner = self.lock();
-            (inner.pending_queue.len(), inner.image_queue.len(), inner.cancel.clone())
+            (inner.pending_queue.len(), inner.image_queue.len())
         };
-        let mut handles = Vec::new();
-        let fatal = Arc::new(AtomicBool::new(false));
         if videos > 0 {
-            self.start_gpu_polling();
             self.log(format!(
                 "Starting {videos} videos | Encoder: {} | Workers: {} | Base CRF: {} | Preset: {}",
                 options.encoder, options.concurrency, options.crf, options.preset
             ));
-            let worker_count = (options.concurrency as usize).min(videos);
-            for id in 1..=worker_count as u32 {
-                let engine = Arc::clone(&self);
-                let fatal = Arc::clone(&fatal);
-                handles.push((format!("Worker {id}"), self.rt.spawn(async move { engine.run_worker(id, fatal).await })));
-            }
         }
         if images > 0 {
-            // Leave some CPU for the desktop, and half of the rest for the video encoders'
-            // decoding (and their memory) while there are videos to encode.
-            let cores = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
-            let spare = cores.saturating_sub(2);
-            let slots = if videos > 0 { spare / 2 } else { spare }.max(1);
-            let workers = slots.min(images);
-            // Slots beyond the worker count stay idle for big jobs (comic pages) to borrow.
-            let ctx = Arc::new(self.image_ctx(&options, slots, cancel));
             self.log(format!(
-                "Starting {images} images | {} | {workers} CPU workers",
-                if ctx.lossy { "visually lossless (SSIMULACRA2 >= 93)" } else { "lossless" }
+                "Starting {images} images and other files | images {}, audio {}",
+                mode_label(options.images),
+                mode_label(options.audio)
             ));
             self.log(self.image_tools.summary());
-            // Keeps "running for" of long CPU files current when nothing else updates the window.
-            let engine = Arc::clone(&self);
-            self.rt.spawn(async move {
-                loop {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    if !engine.lock().working {
-                        break;
-                    }
-                    engine.send_state(false);
+        }
+        // Keeps "running for" of long CPU files current when nothing else updates the window.
+        let engine = Arc::clone(&self);
+        self.rt.spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if !engine.lock().working {
+                    break;
                 }
-            });
-            for id in 1..=workers as u32 {
-                let engine = Arc::clone(&self);
-                let ctx = Arc::clone(&ctx);
-                handles.push((format!("Image worker {id}"), self.rt.spawn(async move { engine.run_image_worker(id, ctx).await })));
+                engine.send_state(false);
             }
+        });
+        {
+            let mut inner = self.lock();
+            inner.fatal = Arc::new(AtomicBool::new(false));
+            inner.cpu = None;
+            self.spawn_workers(&mut inner);
         }
         self.send_state(true);
-        for (name, handle) in handles {
-            // A worker that panicked must not vanish silently (release builds abort instead).
-            if let Err(err) = handle.await {
-                self.log(format!("[{name}] stopped unexpectedly: {err}"));
+        // Workers started later (files dropped during the run) are awaited too; the batch
+        // ends, atomically with that check, when none is left.
+        let (was_stopped, status, run, saved) = loop {
+            let next = {
+                let mut inner = self.lock();
+                let next = inner.handles.pop();
+                if next.is_none() {
+                    break self.finish_batch(&mut inner);
+                }
+                next
+            };
+            if let Some((name, handle)) = next {
+                // A worker that panicked must not vanish silently (release builds abort instead).
+                if let Err(err) = handle.await {
+                    self.log(format!("[{name}] stopped unexpectedly: {err}"));
+                }
             }
-        }
-
-        let (was_stopped, status, run, saved) = {
-            let mut inner = self.lock();
-            let was_stopped = inner.stop_requested;
-            inner.working = false;
-            inner.stop_requested = false;
-            self.paused.send_replace(false);
-            inner.power = None;
-            inner.gpu_enc = 0.0;
-            inner.gpu_vram_mb = 0.0;
-            inner.in_progress.clear();
-            inner.workers.clear();
-            inner.rebuild_queue();
-            if was_stopped {
-                inner.status = Status::Ready;
-            } else if inner.status != Status::Error {
-                inner.status = Status::Done;
-            }
-            (was_stopped, inner.status, inner.run, round1(inner.space_saved_mb))
         };
         self.flush_history();
 
@@ -948,7 +1042,7 @@ impl Engine {
             ));
             if run.images_total > 0 {
                 self.log(format!(
-                    "Images: {} processed, {} made smaller with a visually lossless (lossy) pass",
+                    "Images and other files: {} processed, {} made smaller with a visually lossless (lossy) pass",
                     run.images_done, run.images_lossy
                 ));
             }
@@ -956,19 +1050,97 @@ impl Engine {
         self.send_state(true);
     }
 
+    /// Ends a batch's bookkeeping (no worker is left). Returns what the summary needs.
+    fn finish_batch(&self, inner: &mut Inner) -> (bool, Status, RunStats, f64) {
+        {
+            let was_stopped = inner.stop_requested;
+            inner.cpu = None;
+            inner.gpu_polling = false;
+            inner.video_ids.clear();
+            inner.cpu_ids.clear();
+            inner.working = false;
+            inner.stop_requested = false;
+            self.paused.send_replace(false);
+            inner.power = None;
+            inner.gpu_enc = 0.0;
+            inner.gpu_vram_mb = 0.0;
+            inner.in_progress.clear();
+            inner.workers.clear();
+            inner.rebuild_queue();
+            if was_stopped {
+                inner.status = Status::Ready;
+            } else if inner.status != Status::Error {
+                inner.status = Status::Done;
+            }
+            (was_stopped, inner.status, inner.run, round1(inner.space_saved_mb))
+        }
+    }
+
+    /// Starts the workers the queues need: video workers up to the job count, CPU workers up
+    /// to the CPU slots (once per batch: their settings are made with the first CPU file).
+    /// Called with the lock held, at the start of a batch and when files are added to it.
+    fn spawn_workers(self: &Arc<Self>, inner: &mut Inner) {
+        let videos = inner.pending_queue.len().saturating_sub(inner.queue_cursor);
+        let cpu_files = inner.image_queue.len().saturating_sub(inner.image_cursor);
+        let want_video = (inner.options.concurrency as usize).min(videos + inner.video_ids.len());
+        while inner.video_ids.len() < want_video {
+            let id = (1..).find(|i| !inner.video_ids.contains(i)).unwrap_or(1);
+            inner.video_ids.insert(id);
+            let (engine, fatal) = (Arc::clone(self), Arc::clone(&inner.fatal));
+            inner.handles.push((format!("Worker {id}"), self.rt.spawn(async move { engine.run_worker(id, fatal).await })));
+        }
+        if videos > 0 && !inner.gpu_polling {
+            inner.gpu_polling = true;
+            self.start_gpu_polling_with(inner.cancel.clone());
+        }
+        if cpu_files == 0 {
+            return;
+        }
+        let cpu = if let Some(c) = &inner.cpu {
+            Arc::clone(c)
+        } else {
+            {
+                // Leave some CPU for the desktop, and half of the rest for the video encoders'
+                // decoding (and their memory) while there are videos to encode. Slots beyond
+                // the worker count stay idle for big jobs (comic pages) to borrow.
+                let cores = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+                let spare = cores.saturating_sub(2);
+                let slots = if videos > 0 { spare / 2 } else { spare }.max(1);
+                let c = Arc::new(images::CpuCtx::new(self.image_ctx(&inner.options, slots, inner.cancel.clone()), &inner.options, slots));
+                inner.cpu = Some(Arc::clone(&c));
+                c
+            }
+        };
+        let want_cpu = cpu.slots.min(cpu_files + inner.cpu_ids.len());
+        while inner.cpu_ids.len() < want_cpu {
+            let id = (1..).find(|i| !inner.cpu_ids.contains(i)).unwrap_or(1);
+            inner.cpu_ids.insert(id);
+            let (engine, cpu) = (Arc::clone(self), Arc::clone(&cpu));
+            inner.handles.push((format!("Image worker {id}"), self.rt.spawn(async move { engine.run_image_worker(id, cpu).await })));
+        }
+    }
+
     async fn run_worker(self: Arc<Self>, worker_id: u32, fatal: Arc<AtomicBool>) {
         loop {
             {
-                let inner = self.lock();
+                let mut inner = self.lock();
                 if !inner.working || inner.stop_requested || fatal.load(Ordering::SeqCst) {
+                    inner.video_ids.remove(&worker_id);
                     break;
                 }
             }
             match self.process_one(worker_id).await {
-                Outcome::Empty | Outcome::Stopped => break,
+                // Empty: the id was released with the empty-queue check, under one lock.
+                Outcome::Empty => break,
+                Outcome::Stopped => {
+                    self.lock().video_ids.remove(&worker_id);
+                    break;
+                }
                 Outcome::Fatal => {
                     fatal.store(true, Ordering::SeqCst);
-                    self.lock().status = Status::Error;
+                    let mut inner = self.lock();
+                    inner.status = Status::Error;
+                    inner.video_ids.remove(&worker_id);
                     break;
                 }
                 Outcome::Processed | Outcome::Skipped | Outcome::Failed => {}
@@ -1083,9 +1255,8 @@ impl Engine {
 
     /// Reads NVENC load and VRAM from one long-running `nvidia-smi -lms` process
     /// (spawning nvidia-smi for every sample cost ~50 ms of CPU each time).
-    fn start_gpu_polling(self: &Arc<Self>) {
+    fn start_gpu_polling_with(self: &Arc<Self>, cancel: CancellationToken) {
         let engine = Arc::clone(self);
-        let cancel = self.lock().cancel.clone();
         self.rt.spawn(async move {
             let mut cmd = tokio::process::Command::new("nvidia-smi");
             cmd.args([
@@ -1166,9 +1337,13 @@ impl Engine {
             if !inner.working || inner.stop_requested {
                 return Outcome::Stopped;
             }
-            inner
-                .claim_next()
-                .map(|input| (inner.display_name(&input), input))
+            let next = inner.claim_next().map(|input| (inner.display_name(&input), input));
+            if next.is_none() {
+                // Leaving now, in the same lock as the check: files added later start a
+                // new worker instead of waiting for this one.
+                inner.video_ids.remove(&worker_id);
+            }
+            next
         };
         let Some((display, input)) = claimed else {
             return Outcome::Empty;
@@ -2128,6 +2303,14 @@ impl Engine {
     }
 }
 
+fn mode_label(mode: ImageMode) -> &'static str {
+    match mode {
+        ImageMode::Off => "off",
+        ImageMode::Lossless => "lossless",
+        ImageMode::Lossy => "visually lossless (SSIMULACRA2 >= 93)",
+    }
+}
+
 /// Scales a video down to at most 1920x1080 worth of pixels (never up), even dimensions.
 const VMAF_FIT: &str = "scale=w='trunc(iw*min(1\\,sqrt(2073600/(iw*ih)))/2)*2':h='trunc(ih*min(1\\,sqrt(2073600/(iw*ih)))/2)*2':flags=bicubic";
 
@@ -2160,6 +2343,23 @@ fn summarize_vmaf(mut scores: Vec<f64>) -> Option<(f64, f64)> {
     let mean = scores.iter().sum::<f64>() / scores.len() as f64;
     let p5 = scores[(scores.len() / 20).saturating_sub(1).min(scores.len() - 1)];
     Some((mean, p5))
+}
+
+/// The deepest folder holding all `paths` (a file counts as its folder). Paths on different
+/// drives have none: the first one's folder is used.
+fn common_root(paths: &[PathBuf]) -> PathBuf {
+    let folder = |p: &PathBuf| if p.is_dir() { p.clone() } else { p.parent().map_or_else(|| p.clone(), Path::to_path_buf) };
+    let mut iter = paths.iter().map(folder);
+    let Some(mut root) = iter.next() else { return PathBuf::new() };
+    for p in iter {
+        while !p.starts_with(&root) {
+            match root.parent() {
+                Some(up) => root = up.to_path_buf(),
+                None => return paths.first().map(folder).unwrap_or_default(),
+            }
+        }
+    }
+    root
 }
 
 /// Default backup folder: next to the scanned folder, named `<folder> (originals)`.
@@ -2209,13 +2409,17 @@ struct ScanResult {
 /// Recursively finds videos (skipping hidden folders like the old glob did), deletes leftover
 /// temp files and sorts the queue by size, largest first. File sizes come from the directory
 /// listing itself (on Windows `DirEntry::metadata` needs no extra system call).
-fn scan_folder(dir: &Path, exclude: Option<&Path>, temp: Option<&Path>) -> ScanResult {
+fn scan_folder(roots: &[PathBuf], exclude: Option<&Path>, temp: Option<&Path>) -> ScanResult {
     let mut messages = Vec::new();
     let mut cleaned_orphans = 0;
     // Work folders of runs that were killed or crashed.
     let mut stale = vec![std::env::temp_dir()];
     stale.extend(temp.map(Path::to_path_buf));
-    stale.extend(images::volume_root(dir).map(|r| r.join(images::DRIVE_WORK_DIR)));
+    for root in roots {
+        stale.extend(images::volume_root(root).map(|r| r.join(images::DRIVE_WORK_DIR)));
+    }
+    stale.sort();
+    stale.dedup();
     let cleaned_work: usize = stale.iter().map(|d| system::clean_stale_work(d)).sum();
     if cleaned_work > 0 {
         messages.push(format!("Removed {cleaned_work} leftover work folder(s) from an earlier run that did not finish"));
@@ -2224,12 +2428,14 @@ fn scan_folder(dir: &Path, exclude: Option<&Path>, temp: Option<&Path>) -> ScanR
     let mut with_sizes = Vec::new();
     let mut static_gifs = HashSet::new();
 
-    let walker = walkdir::WalkDir::new(dir)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|e| {
-            e.depth() == 0 || (!e.file_name().to_string_lossy().starts_with('.') && Some(e.path()) != exclude)
-        });
+    // Folders are walked; a file given directly is its own one-entry walk.
+    let walker = roots.iter().flat_map(|root| {
+        walkdir::WalkDir::new(root)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|e| e.depth() == 0 || (!e.file_name().to_string_lossy().starts_with('.') && Some(e.path()) != exclude))
+    });
+    let mut seen = HashSet::new();
 
     for entry in walker {
         let Ok(entry) = entry else {
@@ -2238,6 +2444,9 @@ fn scan_folder(dir: &Path, exclude: Option<&Path>, temp: Option<&Path>) -> ScanR
         };
         if !entry.file_type().is_file() || !(args::is_video_file(entry.path()) || image::kind_of(entry.path()).is_some()) {
             continue;
+        }
+        if !seen.insert(entry.path().to_path_buf()) {
+            continue; // dropped twice (a folder and a file inside it)
         }
         if is_orphan_temp(entry.path()) {
             match system::remove_file_if_exists(entry.path()) {

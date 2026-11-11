@@ -67,9 +67,10 @@ const PDFS: &[(u32, &str)] = &[
     (1, "Visually lossless images (pages checked)"),
     (0, "Lossless only"),
 ];
-const EFFORTS: &[(u32, &str)] = &[
-    (2, "Maximum (recommended)"),
-    (1, "Normal (faster)"),
+const AUDIO: &[(u32, &str)] = &[
+    (2, "Cover art visually lossless (≥ 93)"),
+    (1, "Lossless only"),
+    (0, "Don't process audio"),
 ];
 const FIX_EXT: &[(u32, &str)] = &[
     (0, "Keep file names"),
@@ -103,8 +104,8 @@ struct Prefs {
     convert: u32,
     /// 1 = visually lossless PDF images, 0 = lossless only.
     lossy_docs: u32,
-    /// 1 = normal, 2 = maximum effort for images, audio and documents.
-    effort: u32,
+    /// 0 = off, 1 = lossless, 2 = cover art visually lossless.
+    audio: u32,
     /// Folder for work files; empty = the system temp folder.
     temp_dir: String,
     /// 1 = rename misnamed pictures (a JPEG called .png) to their real format.
@@ -125,7 +126,7 @@ impl Default for Prefs {
             images: 2,
             convert: 1,
             lossy_docs: 1,
-            effort: 2,
+            audio: 2,
             temp_dir: String::new(),
             fix_ext: 0,
         }
@@ -167,7 +168,7 @@ impl Prefs {
             images: IMAGES[pick(w.get_images_index(), IMAGES.len())].0,
             convert: CONVERSIONS[pick(w.get_convert_index(), CONVERSIONS.len())].0,
             lossy_docs: PDFS[pick(w.get_pdf_index(), PDFS.len())].0,
-            effort: EFFORTS[pick(w.get_effort_index(), EFFORTS.len())].0,
+            audio: AUDIO[pick(w.get_audio_index(), AUDIO.len())].0,
             temp_dir: w.get_temp_dir().into(),
             fix_ext: FIX_EXT[pick(w.get_fix_ext_index(), FIX_EXT.len())].0,
         }
@@ -188,7 +189,7 @@ impl Prefs {
         w.set_images_index(position(IMAGES, &self.images, &d.images));
         w.set_convert_index(position(CONVERSIONS, &self.convert, &d.convert));
         w.set_pdf_index(position(PDFS, &self.lossy_docs, &d.lossy_docs));
-        w.set_effort_index(position(EFFORTS, &self.effort, &d.effort));
+        w.set_audio_index(position(AUDIO, &self.audio, &d.audio));
         w.set_temp_dir(self.temp_dir.as_str().into());
         w.set_fix_ext_index(position(FIX_EXT, &self.fix_ext, &d.fix_ext));
     }
@@ -206,7 +207,7 @@ impl Prefs {
             images: Some(self.images),
             convert: Some(self.convert),
             lossy_docs: Some(self.lossy_docs),
-            effort: Some(self.effort),
+            audio: Some(self.audio),
             temp_dir: Some(self.temp_dir.clone()),
             fix_ext: Some(self.fix_ext),
         }
@@ -408,14 +409,15 @@ impl Controller {
         w.set_folder_summary(if has_folder || s.status == Status::Scanning {
             file_count_text(s).into()
         } else {
-            "Choose a folder to scan it for videos and images, including subfolders.".into()
+            "Choose a folder, or drop files and folders on this window. Subfolders are included.".into()
         });
         w.set_busy(busy);
         w.set_processing(processing);
         w.set_can_start(has_folder && !busy && s.pending_files > 0);
         w.set_stop_enabled(matches!(s.status, Status::Running | Status::Paused));
         w.set_paused(paused);
-        w.set_show_options(has_folder && !busy && s.pending_files > 0);
+        // Settings can be changed whenever nothing runs, also before choosing a folder.
+        w.set_show_options(!busy);
         w.set_show_stats(processing || has_run || s.status == Status::Error);
         w.set_show_log(processing || s.status == Status::Error || (has_run && has_logs));
         w.set_show_history(s.history_count > 0);
@@ -630,7 +632,7 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
     window.set_pdf_options(labels(PDFS));
     window.set_fix_ext_options(labels(FIX_EXT));
     window.set_system_temp(std::env::temp_dir().to_string_lossy().trim_end_matches('\\').into());
-    window.set_effort_options(labels(EFFORTS));
+    window.set_audio_options(labels(AUDIO));
     let prefs = Prefs::load(&prefs_path);
     prefs.apply_to_window(&window);
     engine.apply_options(prefs.to_raw());
@@ -785,6 +787,40 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
             let prefs = Prefs::from_window(&w);
             prefs.save(&prefs_path);
             engine.apply_options_in_background(prefs.to_raw());
+        });
+    }
+
+    // Files and folders dropped on the window are added to the queue (during a run too).
+    // Each file arrives as its own event: they are collected for a moment, then added together.
+    {
+        use slint::winit_030::{winit::event::WindowEvent, EventResult, WinitWindowAccessor};
+        let engine = engine.clone();
+        let weak = window.as_weak();
+        let dropped: Rc<std::cell::RefCell<Vec<PathBuf>>> = Rc::default();
+        let timer = Rc::new(slint::Timer::default());
+        window.window().on_winit_window_event(move |_, event| {
+            let hover = |on: bool| {
+                if let Some(w) = weak.upgrade() {
+                    w.set_drop_hover(on);
+                }
+            };
+            match event {
+                WindowEvent::HoveredFile(_) => hover(true),
+                WindowEvent::HoveredFileCancelled => hover(false),
+                WindowEvent::DroppedFile(path) => {
+                    hover(false);
+                    dropped.borrow_mut().push(path.clone());
+                    let (dropped, engine) = (dropped.clone(), engine.clone());
+                    timer.start(slint::TimerMode::SingleShot, std::time::Duration::from_millis(250), move || {
+                        let items = std::mem::take(&mut *dropped.borrow_mut());
+                        if !items.is_empty() {
+                            engine.spawn_add_items(items);
+                        }
+                    });
+                }
+                _ => {}
+            }
+            EventResult::Propagate
         });
     }
 

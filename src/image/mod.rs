@@ -245,6 +245,7 @@ impl Max {
     }
 }
 
+#[derive(Clone)]
 pub struct Ctx {
     pub tools: Tools,
     pub lossy: bool,
