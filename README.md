@@ -94,19 +94,28 @@ PNG, JPEG, and GIFs under the size limit are optimized by a separate pool of CPU
 - **GIF:** gifsicle.
 
 Every lossless step must decode to the same pixels: djpeg for JPEG, ffmpeg frame hashes for
-PNG/GIF. Only the colour hidden under fully transparent pixels may change. The colour profile,
-EXIF rotation, and metadata must survive.
+PNG/GIF (with each frame's timing). Only the colour hidden under fully transparent pixels may change.
+The colour profile, EXIF rotation, and metadata must survive. Pictures with data after their end
+(motion photos, Ultra HDR gain maps, MPO 3D pictures, appended archives) are left alone: the
+optimizers would drop that data. A misnamed picture (a JPEG called `.png`) is optimized as what it
+is and keeps its name.
 
 The **Images** setting chooses:
 
-- **Visually lossless** (default): also tries lossy encoders (beeim's quantizer for PNG; jpegli,
-  mozjpeg, and pingo for JPEG). It uses the lowest quality that keeps a
+- **Visually lossless** (default): also tries lossy encoders (beeim's quantizer and predicter for
+  PNG; jpegli, mozjpeg, and pingo for JPEG). It uses the lowest quality that keeps a
   [SSIMULACRA2](https://github.com/cloudinary/ssimulacra2) score of at least 93, the level of
   pingo/Pinga at quality 100. A lossy result must be at least 3% smaller than the lossless one.
   JPEGs saved below quality 90 are not re-encoded, because they can't get smaller at that score.
   One probe skips images that were already optimized.
 - **Lossless only:** pixel-identical results only.
 - **Don't process images.**
+
+The **Effort** setting chooses **Normal** (the benchmarked chains above) or **Maximum**, imageopti's
+"max" level: oxipng `-o max` and ECT `-9` for PNG, ECT `-9` and pingo for JPEG, pingo as another
+lossy PNG method, lossy JPEG re-encodes of every JPEG (not only those saved at quality 90 or more),
+FLAC re-encoded with `-e`, and PDF JPEGs at any quality. On the Kodak photos it saved 37.1% instead
+of 36.9%, in about twice the time. Files already processed at Normal are not redone.
 
 An image is replaced only if the result is at least 0.5% smaller. Hard links, the "changed meanwhile"
 check, the Recycle Bin, dates, and attributes work as for videos. On imageopti's test images,
@@ -118,16 +127,23 @@ The optimizers are external programs. Install them with:
 powershell -ExecutionPolicy Bypass -File scripts/fetch-tools.ps1
 ```
 
-This installs the open-source ones with [Scoop](https://scoop.sh) (found on PATH). It downloads
-cjpegli from libjxl 0.11.2, and pingo and beeim from css-ig.net. pingo and beeim are free for
+This installs the open-source ones with [Scoop](https://scoop.sh) (found on PATH): oxipng, ECT,
+mozjpeg, gifsicle, libjxl, flac, 7-Zip, qpdf, and MuPDF. It downloads cjpegli from libjxl 0.11.2,
+OptiVorbis 0.3.2, and pingo and beeim from css-ig.net. pingo and beeim are free for
 private use and may not be redistributed, so they are never bundled. mediaopti looks for the tools
 in `%APPDATA%\mediaopti\tools.json` (`{"pingo": "C:\\path\\pingo.exe"}`), a `tools` folder next
-to `mediaopti.exe`, the project's `bin` folder, and PATH. Missing tools are skipped. The tools found
+to `mediaopti.exe` (and its subfolders), the project's `bin` folder, and PATH. Missing tools are skipped. The tools found
 are listed in the log when a batch with images starts.
 
 For a very large image library, choose *Move to a backup folder* (or *Delete permanently*). The
 Recycle Bin handles only about 25–30 files per second and keeps only the most recent originals once
 it is full.
+
+Each file is worked on in a private folder in `%TEMP%`. When the temp drive has less than about
+four times the file's size free (plus 4 GB), a hidden `.mediaopti-temp` folder on the file's own
+drive is used instead. Work folders left by a run that crashed are removed at the next scan. Pages
+of a comic or document are optimized in parallel when CPU workers are idle. **Pause** also
+suspends the image, audio, and document tools that are running.
 
 ## Requirements
 
@@ -169,10 +185,10 @@ All data is stored in `%APPDATA%\mediaopti`:
    GIF size limit, and the VMAF-checked retry.
 2. Done: images (PNG/JPEG/small GIFs) in a CPU worker pool, the imageopti import, and per-mode
    image history.
-3. Audio and documents: cover art in FLAC/MP3, FLAC/Ogg repacking, WAV → FLAC, PDF/Office/EPUB/CBZ,
-   and the BMP/TGA/CBR conversions.
-4. A faster option than the Recycle Bin for huge image runs (for example a backup folder on the same
-   drive).
+3. Done: audio and documents: cover art in FLAC/MP3, FLAC/Ogg repacking, WAV → FLAC,
+   PDF/Office/EPUB/CBZ, and the BMP/TGA/CBR conversions.
+4. Done: the backup-folder option, the Effort setting, release packaging with the tools.
+   Later: a strip-metadata option.
 
 ## Development
 
@@ -215,7 +231,10 @@ cargo clippy --all-targets --locked -- -D warnings
 powershell -ExecutionPolicy Bypass -File scripts/package.ps1
 ```
 
-This produces `dist/mediaopti-<version>-win64.zip`, containing `mediaopti.exe` and `ffmpeg.exe`.
+This produces `dist/mediaopti-<version>-win64.zip`, containing `mediaopti.exe`, `ffmpeg.exe`, and
+the redistributable tools (each in `tools\<name>\` with its licence; see `THIRD-PARTY.txt`). It
+takes them from Scoop and `bin\`, so run `fetch-tools.ps1` first. pingo and beeim are never
+included; on another PC, run `fetch-tools.ps1 -NoScoop -Dest <folder>\tools` to download them.
 
 ## License
 
