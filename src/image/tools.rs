@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 /// Image optimizers used when present. ffmpeg (bundled) is always used for verification.
 pub const NAMES: &[&str] = &[
-    "beeim", "pingo", "oxipng", "ect", "jpegtran", "djpeg", "cjpeg", "cjpegli", "gifsicle", "ssimulacra2", "flac", "optivorbis",
+    "beeim", "pingo", "oxipng", "ect", "jpegtran", "djpeg", "cjpeg", "cjpegli", "gifsicle", "ssimulacra2", "flac", "optivorbis", "7z",
 ];
 
 #[derive(Clone, Debug, Default)]

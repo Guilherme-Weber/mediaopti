@@ -38,6 +38,12 @@ pub enum Kind {
     /// Converted to PNG (pixel-identical), when conversions are on.
     Bmp,
     Tga,
+    /// Office, OpenDocument and EPUB: zip repacked, pictures inside optimized losslessly.
+    Doc,
+    /// Comic book archive (zip): pictures inside follow the image setting.
+    Cbz,
+    /// Comic book archive (RAR), converted to CBZ when conversions are on.
+    Cbr,
 }
 
 impl Kind {
@@ -45,9 +51,13 @@ impl Kind {
         matches!(self, Kind::Flac | Kind::Mp3 | Kind::Wav | Kind::Ogg)
     }
 
+    pub fn is_archive(self) -> bool {
+        matches!(self, Kind::Doc | Kind::Cbz | Kind::Cbr)
+    }
+
     /// Converted to another format (the extension changes): only with the conversions option.
     pub fn is_conversion(self) -> bool {
-        matches!(self, Kind::Wav | Kind::Bmp | Kind::Tga)
+        matches!(self, Kind::Wav | Kind::Bmp | Kind::Tga | Kind::Cbr)
     }
 }
 
@@ -61,9 +71,12 @@ pub fn kind_of(path: &Path) -> Option<Kind> {
         "flac" => Some(Kind::Flac),
         "mp3" => Some(Kind::Mp3),
         "wav" => Some(Kind::Wav),
-        "ogg" => Some(Kind::Ogg),
+        "ogg" | "oga" => Some(Kind::Ogg),
         "bmp" => Some(Kind::Bmp),
         "tga" => Some(Kind::Tga),
+        "docx" | "xlsx" | "pptx" | "docm" | "xlsm" | "pptm" | "odt" | "ods" | "odp" | "odg" | "epub" => Some(Kind::Doc),
+        "cbz" => Some(Kind::Cbz),
+        "cbr" => Some(Kind::Cbr),
         _ => None,
     }
 }
@@ -216,6 +229,9 @@ pub fn optimize(ctx: &Ctx, kind: Kind, src: &Path, work: &Path) -> Result<Optimi
     if kind.is_audio() {
         return crate::audio::optimize(ctx, kind, src, work);
     }
+    if kind.is_archive() {
+        return crate::archive::optimize(ctx, kind, src, work);
+    }
     if matches!(kind, Kind::Bmp | Kind::Tga) {
         return to_png(ctx, kind, src, work);
     }
@@ -235,7 +251,7 @@ pub fn optimize(ctx: &Ctx, kind: Kind, src: &Path, work: &Path) -> Result<Optimi
             c.write_to("gifsicle", "gifsicle", |i, o| crate::os_args!["-O3", "--no-warnings", "-o", o, i], &mut check, None)?;
             c
         }
-        Kind::Flac | Kind::Mp3 | Kind::Wav | Kind::Ogg | Kind::Bmp | Kind::Tga => unreachable!("handled above"),
+        _ => unreachable!("handled above"),
     };
     if ctx.lossy && ctx.tools.has("ssimulacra2") {
         match kind {

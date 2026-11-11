@@ -60,7 +60,7 @@ const IMAGES: &[(u32, &str)] = &[
     (0, "Don't process images"),
 ];
 const CONVERSIONS: &[(u32, &str)] = &[
-    (1, "WAV → FLAC, BMP/TGA → PNG"),
+    (1, "WAV → FLAC, BMP/TGA → PNG, CBR → CBZ"),
     (0, "Keep file formats"),
 ];
 const QUALITY_CHECK: &[(u32, &str)] = &[
