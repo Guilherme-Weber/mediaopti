@@ -53,6 +53,27 @@ pub enum ImageMode {
     Lossy,
 }
 
+/// Which lossless format conversions are on (each changes the file extension).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Conversions {
+    /// WAV -> FLAC.
+    pub wav: bool,
+    /// BMP/TGA -> PNG.
+    pub images: bool,
+    /// CBR -> CBZ.
+    pub cbr: bool,
+}
+
+impl Conversions {
+    pub const ALL: Self = Self { wav: true, images: true, cbr: true };
+    pub const NONE: Self = Self { wav: false, images: false, cbr: false };
+
+    /// From a bit mask: 1 = WAV, 2 = BMP/TGA, 4 = CBR.
+    pub fn from_mask(m: u32) -> Self {
+        Self { wav: m & 1 != 0, images: m & 2 != 0, cbr: m & 4 != 0 }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Options {
     pub crf: u32,
@@ -68,9 +89,12 @@ pub struct Options {
     /// Added to the CQ/CRF for the quality-checked retry (0 for the normal encode).
     pub cq_boost: u32,
     pub images: ImageMode,
-    /// Lossless format conversions (WAV -> FLAC; later BMP/TGA -> PNG, CBR -> CBZ). They
-    /// change the file extension.
-    pub convert: bool,
+    /// Lossless format conversions (WAV -> FLAC, BMP/TGA -> PNG, CBR -> CBZ), each on or off.
+    pub convert: Conversions,
+    /// Videos (and animated GIFs over the limit) are processed at all.
+    pub videos: bool,
+    /// Documents (PDF, Office, EPUB, comics) are processed at all.
+    pub docs: bool,
     /// PDF images may be re-encoded lossily (SSIMULACRA2 >= 93, every page rendered and
     /// checked), when images are visually lossless too. Text and vectors are never touched.
     pub lossy_docs: bool,
@@ -95,7 +119,9 @@ impl Default for Options {
             vmaf_floor: Some(93.0),
             cq_boost: 0,
             images: ImageMode::Lossy,
-            convert: true,
+            convert: Conversions::ALL,
+            videos: true,
+            docs: true,
             lossy_docs: true,
             audio: ImageMode::Lossy,
             temp_dir: None,
@@ -118,8 +144,16 @@ pub struct RawOptions {
     pub vmaf_floor: Option<u32>,
     /// 0 = off, 1 = lossless, 2 = lossy (visually lossless).
     pub images: Option<u32>,
-    /// 0 = keep file formats, 1 = lossless conversions.
+    /// 0 = keep file formats, anything else = all conversions (older settings); see
+    /// `conversions` for each one.
     pub convert: Option<u32>,
+    /// Conversions as a bit mask (1 = WAV -> FLAC, 2 = BMP/TGA -> PNG, 4 = CBR -> CBZ); wins
+    /// over `convert`.
+    pub conversions: Option<u32>,
+    /// 0 = skip videos.
+    pub videos: Option<u32>,
+    /// 0 = skip documents.
+    pub docs: Option<u32>,
     /// 0 = PDFs lossless only, 1 = visually lossless PDF images.
     pub lossy_docs: Option<u32>,
     /// 0 = off, 1 = lossless, 2 = cover art visually lossless.
@@ -173,7 +207,14 @@ impl Options {
                 Some(2) => ImageMode::Lossy,
                 _ => d.images,
             },
-            convert: raw.convert.map_or(d.convert, |c| c != 0),
+            convert: match (raw.conversions, raw.convert) {
+                (Some(mask), _) => Conversions::from_mask(mask),
+                (None, Some(0)) => Conversions::NONE,
+                (None, Some(_)) => Conversions::ALL,
+                (None, None) => d.convert,
+            },
+            videos: raw.videos.map_or(d.videos, |v| v != 0),
+            docs: raw.docs.map_or(d.docs, |v| v != 0),
             lossy_docs: raw.lossy_docs.map_or(d.lossy_docs, |c| c != 0),
             audio: match raw.audio {
                 Some(0) => ImageMode::Off,
@@ -379,10 +420,14 @@ mod tests {
             audio: Some(9),
             temp_dir: Some("  ".into()),
             fix_ext: None,
+            conversions: None,
+            videos: None,
+            docs: None,
         });
         assert_eq!(o.audio, ImageMode::Lossy, "audio: cover art visually lossless by default");
         assert!(o.temp_dir.is_none() && !o.fix_ext);
-        assert!(o.convert, "conversions on by default");
+        assert_eq!(o.convert, Conversions::ALL, "conversions on by default");
+        assert!(o.videos && o.docs);
         assert_eq!(o.images, ImageMode::Lossy, "images: visually lossless by default");
         assert_eq!(o.crf, 23);
         assert_eq!(o.preset, "slow");

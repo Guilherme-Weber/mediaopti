@@ -88,6 +88,9 @@ fn opts(encoder: &str, concurrency: f64) -> RawOptions {
         audio: Some(0),
         temp_dir: None,
         fix_ext: None,
+        conversions: None,
+        videos: None,
+        docs: None,
     }
 }
 
@@ -856,6 +859,9 @@ fn real_folder_run() {
         audio: Some(2),
         temp_dir: None,
         fix_ext: None,
+        conversions: None,
+        videos: None,
+        docs: None,
     };
     let t = std::time::Instant::now();
     rt.block_on(async {
@@ -923,5 +929,57 @@ fn dropped_items_join_the_queue() {
     assert_eq!(s.completed_this_run, 4, "{logs}");
     assert_eq!(s.failed_this_run, 0, "{logs}");
     assert_eq!(s.compressed_this_run, 4, "{logs}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The queue runs in stages: videos first, then (as soon as no video is left to start)
+/// audio, documents, images. Types can be switched off, and each conversion on its own.
+#[test]
+fn queue_runs_in_stages_and_types_can_be_skipped() {
+    let Some(ff) = ffmpeg() else {
+        eprintln!("skipping: bundled ffmpeg not found");
+        return;
+    };
+    let tools = crate::image::tools::Tools::discover(ff.clone(), &std::env::temp_dir());
+    if !["oxipng", "flac"].iter().all(|t| tools.has(t)) {
+        eprintln!("skipping: tools not found");
+        return;
+    }
+    let root = test_dir("stages");
+    let media = root.join("media");
+    std::fs::create_dir_all(&media).unwrap();
+    lossless_video(&ff, 3, "640x360", &media.join("clip.mp4"));
+    let tone = ["-f", "lavfi", "-i", "sine=frequency=440:duration=2", "-c:a", "pcm_s16le"];
+    make(&ff, &tone, &media.join("song.wav"));
+    make(&ff, &tone, &media.join("other.wav"));
+    make(&ff, &["-f", "lavfi", "-i", "testsrc=s=200x150", "-frames:v", "1", "-compression_level", "0"], &media.join("pic.png"));
+    make(&ff, &["-f", "lavfi", "-i", "testsrc=s=200x150", "-frames:v", "1"], &media.join("old.bmp"));
+
+    let rt = runtime();
+    // Switches: videos off, BMP -> PNG off (WAV -> FLAC on): only audio and the PNG queue.
+    let (engine, _) = new_engine(&rt, &root, ff.clone());
+    let off = RawOptions { images: Some(1), audio: Some(1), videos: Some(0), conversions: Some(1), ..opts("av1_nvenc", 1.0) };
+    engine.apply_options(off);
+    rt.block_on(engine.load_dir(media.clone()));
+    let s = engine.snapshot();
+    assert_eq!(s.queue_counts.map(|c| c.0), [0, 2, 0, 1], "videos off, BMP conversion off");
+    assert_eq!(engine.queue_preview(10).iter().map(|q| q.1).collect::<Vec<_>>(), ["Audio", "Audio", "Image"]);
+    engine.clear_queue();
+    let s = engine.snapshot();
+    assert!(s.dir.is_none() && s.pending_files == 0 && s.queue_counts.iter().all(|c| c.0 == 0));
+
+    // Everything on: audio first, images after (the CPU stages start once no video is left to
+    // start; the video worker logs its file a moment after claiming it).
+    let (engine, rec) = new_engine(&rt, &root, ff.clone());
+    let all = || RawOptions { images: Some(1), audio: Some(1), convert: Some(1), ..opts("av1_nvenc", 1.0) };
+    rt.block_on(async {
+        engine.apply_options(all());
+        engine.load_dir(media.clone()).await;
+        engine.clone().run_batch(all()).await;
+    });
+    let logs = rec.logs.lock().unwrap().join("\n");
+    let at = |needle: &str| logs.find(needle).unwrap_or_else(|| panic!("no '{needle}' in:\n{logs}"));
+    assert!(at("Now processing 2 audio files") < at("Now processing 2 images"), "{logs}");
+    assert_eq!(engine.snapshot().failed_this_run, 0, "{logs}");
     let _ = std::fs::remove_dir_all(&root);
 }

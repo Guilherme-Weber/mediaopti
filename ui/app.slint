@@ -1,6 +1,6 @@
 // mediaopti interface: Windows 11 Fluent design (dark), rendered by Slint's software renderer.
 
-import { Button, ComboBox, ListView, ScrollView } from "std-widgets.slint";
+import { Button, ComboBox, ListView, ScrollView, Switch } from "std-widgets.slint";
 
 export struct WorkerRow {
     title: string,
@@ -184,19 +184,6 @@ component SettingField inherits VerticalLayout {
     Text { text: root.hint; font-size: 12px; color: Theme.text-tertiary; wrap: word-wrap; }
 }
 
-// Heading of a group of settings, with a thin rule.
-component GroupLabel inherits HorizontalLayout {
-    in property <string> text;
-    spacing: 10px;
-    padding-top: 4px;
-    Text { text: root.text; font-size: 12px; font-weight: 600; color: Theme.accent; vertical-alignment: center; }
-    VerticalLayout {
-        alignment: center;
-        horizontal-stretch: 1;
-        Rectangle { height: 1px; background: Theme.subtle-fill; }
-    }
-}
-
 // Keeps a lone setting at half width (same column sizing as SettingField).
 component EmptyField inherits Rectangle {
     preferred-width: 200px;
@@ -236,12 +223,164 @@ component ThinBar inherits Rectangle {
     }
 }
 
+export struct QueueItem {
+    name: string,
+    kind: string,
+    size: string,
+}
+
+export struct QueueCount {
+    label: string,
+    count: string,
+    size: string,
+    glyph: string,
+}
+
+// One entry of the side navigation (WinUI NavigationView style): icon, label, and a short
+// accent pill on the left when selected.
+component NavItem inherits Rectangle {
+    in property <string> glyph;
+    in property <string> text;
+    in property <bool> selected;
+    callback clicked();
+    height: 40px;
+    border-radius: Theme.radius-small;
+    background: root.selected ? Theme.subtle-fill : touch.has-hover ? #FFFFFF0A : transparent;
+    accessible-role: tab;
+    accessible-label: root.text;
+    accessible-action-default => { root.clicked(); }
+    Rectangle {
+        x: 0;
+        y: (parent.height - self.height) / 2;
+        width: 3px;
+        height: root.selected ? 16px : 0px;
+        border-radius: 1.5px;
+        background: Theme.accent;
+        animate height { duration: 150ms; easing: ease-out; }
+    }
+    HorizontalLayout {
+        padding-left: 14px;
+        padding-right: 10px;
+        spacing: 14px;
+        Glyph { glyph: root.glyph; font-size: 16px; width: 18px; color: Theme.text; }
+        Text { text: root.text; font-size: 14px; color: Theme.text; vertical-alignment: center; }
+    }
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// Header of a settings card: icon, title, accepted formats, and an on/off switch.
+component GroupHeader inherits HorizontalLayout {
+    in property <string> glyph;
+    in property <string> title;
+    in property <string> formats;
+    in property <bool> has-switch: true;
+    in property <bool> enabled: true;
+    in-out property <bool> on: true;
+    callback toggled();
+    spacing: 12px;
+    Glyph { glyph: root.glyph; font-size: 18px; color: Theme.accent; width: 20px; }
+    VerticalLayout {
+        alignment: center;
+        horizontal-stretch: 1;
+        spacing: 2px;
+        Text { text: root.title; font-size: 15px; font-weight: 600; color: Theme.text; }
+        if root.formats != "": Text { text: root.formats; font-size: 12px; color: Theme.text-tertiary; wrap: word-wrap; }
+    }
+    if root.has-switch: VerticalLayout {
+        alignment: center;
+        Switch {
+            text: root.on ? "On" : "Off";
+            enabled: root.enabled;
+            checked <=> root.on;
+            toggled => { root.toggled(); }
+        }
+    }
+}
+
+// A checkbox drawn from its state only (no internal state), so "All" can follow the others.
+component Check inherits Rectangle {
+    in property <string> text;
+    in property <bool> checked;
+    in property <bool> enabled: true;
+    callback clicked();
+    height: 32px;
+    accessible-role: checkbox;
+    accessible-checkable: true;
+    accessible-checked: root.checked;
+    accessible-label: root.text;
+    accessible-action-default => { if (root.enabled) { root.clicked(); } }
+    HorizontalLayout {
+        spacing: 10px;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 20px;
+                height: 20px;
+                border-radius: Theme.radius-small;
+                border-width: root.checked ? 0px : 1px;
+                border-color: #FFFFFF8A;
+                background: !root.enabled ? #FFFFFF14 : root.checked ? Theme.accent : #00000033;
+                if root.checked: Glyph { glyph: "\u{E73E}"; font-size: 12px; color: #000000; }
+            }
+        }
+        Text {
+            text: root.text;
+            font-size: 14px;
+            color: root.enabled ? Theme.text : Theme.text-tertiary;
+            vertical-alignment: center;
+        }
+    }
+    TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// One type in the queue summary: icon, count, size.
+component CountTile inherits Rectangle {
+    in property <QueueCount> item;
+    horizontal-stretch: 1;
+    min-width: 0px;
+    preferred-width: 100px;
+    background: Theme.card-background;
+    border-radius: Theme.radius;
+    border-width: 1px;
+    border-color: Theme.card-stroke;
+    HorizontalLayout {
+        padding: 14px;
+        spacing: 12px;
+        Glyph { glyph: root.item.glyph; font-size: 20px; color: Theme.accent; width: 22px; }
+        VerticalLayout {
+            alignment: center;
+            Text { text: root.item.count; font-size: 18px; font-weight: 600; color: Theme.text; overflow: elide; }
+            Text { text: root.item.label + " · " + root.item.size; font-size: 12px; color: Theme.text-secondary; overflow: elide; }
+        }
+    }
+}
+
+component PageTitle inherits HorizontalLayout {
+    in property <string> text;
+    in property <string> status;
+    in property <string> status-label;
+    spacing: 12px;
+    Text { text: root.text; font-size: 26px; font-weight: 600; color: Theme.text; vertical-alignment: center; }
+    Rectangle { horizontal-stretch: 1; }
+    if root.status != "idle" && root.status != "": VerticalLayout {
+        alignment: center;
+        StatusPill { status: root.status; label: root.status-label; horizontal-stretch: 0; }
+    }
+}
+
 export component AppWindow inherits Window {
     title: root.window-title;
     icon: @image-url("../assets/icon.png");
-    preferred-width: 1120px;
+    preferred-width: 1180px;
     preferred-height: 860px;
-    min-width: 780px;
+    min-width: 820px;
     min-height: 640px;
     background: Theme.window-background;
     default-font-size: 14px;
@@ -254,7 +393,7 @@ export component AppWindow inherits Window {
     in property <bool> empty-folder;
     in property <string> folder-title: "No folder selected";
     in property <string> folder-path;
-    in property <string> folder-summary: "Choose a folder to scan it for videos and images, including subfolders.";
+    in property <string> folder-summary: "Choose a folder, or drop files and folders on this window.";
     in property <bool> busy;
     in property <bool> processing;
     in property <bool> can-start;
@@ -275,6 +414,14 @@ export component AppWindow inherits Window {
     in property <string> current-file: "No active file";
     in property <[WorkerRow]> workers;
     in property <[string]> log-lines;
+    in property <[QueueCount]> queue-counts;
+    in property <[QueueItem]> queue-items;
+    in property <string> queue-more;
+    // ---- about page
+    in property <string> app-version;
+    in property <string> tools-found;
+    in property <string> tools-missing;
+    in property <string> data-dir;
 
     // ---- settings (two-way with Rust)
     in property <[string]> encoder-options;
@@ -295,18 +442,25 @@ export component AppWindow inherits Window {
     in-out property <string> backup-dir;
     in property <[string]> images-options;
     in-out property <int> images-index;
-    in property <[string]> convert-options;
-    in-out property <int> convert-index;
     in property <[string]> pdf-options;
     in-out property <int> pdf-index;
     in property <[string]> audio-options;
     in-out property <int> audio-index;
-    // A file is being dragged over the window.
-    in property <bool> drop-hover;
     in property <[string]> fix-ext-options;
     in-out property <int> fix-ext-index;
     in-out property <string> temp-dir;
     in property <string> system-temp;
+    in-out property <bool> videos-on: true;
+    in-out property <bool> images-on: true;
+    in-out property <bool> audio-on: true;
+    in-out property <bool> docs-on: true;
+    in-out property <bool> conv-wav: true;
+    in-out property <bool> conv-img: true;
+    in-out property <bool> conv-cbr: true;
+    // A file is being dragged over the window.
+    in property <bool> drop-hover;
+    // 0 = queue, 1 = settings, 2 = about.
+    in-out property <int> page: 0;
 
     callback choose-folder();
     callback start();
@@ -315,381 +469,662 @@ export component AppWindow inherits Window {
     callback forget-history();
     callback clear-log();
     callback open-logs();
+    callback open-data-folder();
     callback settings-changed();
+    callback restore-defaults();
     callback choose-backup-folder();
     callback choose-temp-folder();
+    callback clear-queue();
 
     // Incremented by Rust after new log lines arrive; the log view scrolls to the end.
     in property <int> log-revision;
 
-    // Scrollable page: everything stays reachable even at the minimum window size.
-    // The content column is centered and at most 1000px wide; when the window is taller than
-    // the content, the activity card stretches to fill it.
-    page := ScrollView {
-        x: 0;
-        y: 0;
-        width: root.width;
-        height: root.height;
-        content-width: self.visible-width;
-        content-height: max(self.visible-height, column.preferred-height);
+    property <bool> locked: root.processing || root.busy;
 
-    column := VerticalLayout {
-        width: page.visible-width;
-        height: page.content-height;
-        padding-top: 20px;
-        padding-bottom: 20px;
-        padding-left: max(24px, (page.visible-width - 1000px) / 2);
-        padding-right: max(24px, (page.visible-width - 1000px) / 2);
-        spacing: 14px;
-
-        // ---- header
-        HorizontalLayout {
-            spacing: 12px;
+    HorizontalLayout {
+        // ---- navigation pane
+        Rectangle {
+            width: 220px;
+            background: #1C1C1C;
             VerticalLayout {
-                alignment: center;
-                Image { source: @image-url("../assets/icon.png"); width: 36px; height: 36px; }
-            }
-            VerticalLayout {
-                alignment: center;
-                Text { text: "mediaopti"; font-size: 22px; font-weight: 600; color: Theme.text; }
-                Text { text: "Batch media optimizer"; font-size: 12px; color: Theme.text-secondary; }
-            }
-            Rectangle { horizontal-stretch: 1; }
-            if root.status != "idle": VerticalLayout {
-                alignment: center;
-                horizontal-stretch: 0;
-                StatusPill { status: root.status; label: root.status-label; horizontal-stretch: 0; }
-            }
-        }
-
-        // ---- source folder + primary actions
-        Card {
-            HorizontalLayout {
-                spacing: 14px;
-                VerticalLayout {
-                    alignment: center;
-                    IconTile { glyph: "\u{E8B7}"; }
-                }
-                VerticalLayout {
-                    alignment: center;
-                    spacing: 2px;
-                    horizontal-stretch: 1;
-                    Text { text: root.folder-title; font-size: 14px; font-weight: 600; color: Theme.text; overflow: elide; }
-                    if root.has-folder: Text { text: root.folder-path; font-size: 12px; color: Theme.text-tertiary; overflow: elide; }
-                    Text { text: root.folder-summary; font-size: 12px; color: Theme.text-secondary; overflow: elide; }
-                }
-                VerticalLayout {
-                    alignment: center;
-                    Button {
-                        text: root.has-folder ? "Change folder" : "Choose folder";
-                        primary: !root.has-folder || root.empty-folder;
-                        enabled: !root.busy;
-                        clicked => { root.choose-folder(); }
-                    }
-                }
-                if root.processing: VerticalLayout {
-                    alignment: center;
-                    Button {
-                        text: root.paused ? "Resume" : "Pause";
-                        primary: root.paused;
-                        enabled: root.stop-enabled;
-                        clicked => { root.toggle-pause(); }
-                    }
-                }
-                if root.processing: VerticalLayout {
-                    alignment: center;
-                    Button { text: "Stop"; enabled: root.stop-enabled; clicked => { root.stop(); } }
-                }
-                if root.show-options: VerticalLayout {
-                    alignment: center;
-                    Button { text: "Start"; primary: true; enabled: root.can-start; clicked => { root.start(); } }
-                }
-            }
-            if root.show-history: HorizontalLayout {
-                spacing: 12px;
-                Glyph { glyph: "\u{E81C}"; font-size: 13px; color: Theme.text-tertiary; width: 14px; }
-                Text { text: root.history-text; font-size: 13px; color: Theme.text-tertiary; vertical-alignment: center; }
-                Rectangle { horizontal-stretch: 1; }
-                LinkText {
-                    text: "Forget processed history";
-                    enabled: !root.busy;
-                    clicked => { root.forget-history(); }
-                }
-            }
-        }
-
-        // ---- settings, grouped by what they apply to
-        if root.show-options: Card {
-            gap: 14px;
-            SectionTitle { glyph: "\u{E713}"; text: "Settings"; }
-            GroupLabel { text: "Videos"; }
-            GridLayout {
-                spacing-horizontal: 24px;
-                spacing-vertical: 16px;
-                Row {
-                    SettingField {
-                        glyph: "\u{E714}";
-                        label: "Encoder";
-                        hint: "AV1 makes the smallest files (RTX 40+).";
-                        model: root.encoder-options;
-                        current-index <=> root.encoder-index;
-                        changed => { root.settings-changed(); }
-                    }
-                    SettingField {
-                        glyph: "\u{E9F5}";
-                        label: "Parallel jobs";
-                        hint: "Videos encoded at the same time.";
-                        model: root.jobs-options;
-                        current-index <=> root.jobs-index;
-                        changed => { root.settings-changed(); }
-                    }
-                }
-                Row {
-                    SettingField {
-                        glyph: "\u{E7B3}";
-                        label: "Quality";
-                        hint: "More detail means less space saved.";
-                        model: root.quality-options;
-                        current-index <=> root.quality-index;
-                        changed => { root.settings-changed(); }
-                    }
-                    SettingField {
-                        glyph: "\u{EC4A}";
-                        label: "Encoding speed";
-                        hint: "Slower presets compress better.";
-                        model: root.speed-options;
-                        current-index <=> root.speed-index;
-                        changed => { root.settings-changed(); }
-                    }
-                }
-                Row {
-                    SettingField {
-                        glyph: "\u{E73E}";
-                        label: "If not smaller";
-                        hint: "Retry stronger settings, keeping the measured quality (VMAF) at or above this.";
-                        model: root.check-options;
-                        current-index <=> root.check-index;
-                        changed => { root.settings-changed(); }
-                    }
-                    SettingField {
-                        glyph: "\u{E8B9}";
-                        label: "Animated GIFs";
-                        hint: "Smaller GIFs stay GIFs (optimized as images).";
-                        model: root.gifs-options;
-                        current-index <=> root.gifs-index;
-                        changed => { root.settings-changed(); }
-                    }
-                }
-            }
-            GroupLabel { text: "Images and documents"; }
-            GridLayout {
-                spacing-horizontal: 24px;
-                spacing-vertical: 16px;
-                Row {
-                    SettingField {
-                        glyph: "\u{EB9F}";
-                        label: "Images";
-                        hint: "PNG, JPEG, GIF, BMP/TGA, and the pictures in comics and Office files.";
-                        model: root.images-options;
-                        current-index <=> root.images-index;
-                        changed => { root.settings-changed(); }
-                    }
-                    SettingField {
-                        glyph: "\u{EA90}";
-                        label: "PDF";
-                        hint: "Text and drawings never change; every page is rendered and compared.";
-                        model: root.pdf-options;
-                        current-index <=> root.pdf-index;
-                        changed => { root.settings-changed(); }
-                    }
-                }
-            }
-            GroupLabel { text: "Audio"; }
-            GridLayout {
-                spacing-horizontal: 24px;
-                spacing-vertical: 16px;
-                Row {
-                    SettingField {
-                        glyph: "\u{E8D6}";
-                        label: "Audio";
-                        hint: "FLAC, MP3, Ogg and WAV. The sound itself never changes; this sets the cover art.";
-                        model: root.audio-options;
-                        current-index <=> root.audio-index;
-                        changed => { root.settings-changed(); }
-                    }
-                    EmptyField { }
-                }
-            }
-            GroupLabel { text: "Files"; }
-            GridLayout {
-                spacing-horizontal: 24px;
-                spacing-vertical: 16px;
-                Row {
-                    SettingField {
-                        glyph: "\u{E8AB}";
-                        label: "Conversions";
-                        hint: "Lossless and verified. The file extension changes.";
-                        model: root.convert-options;
-                        current-index <=> root.convert-index;
-                        changed => { root.settings-changed(); }
-                    }
-                    SettingField {
-                        glyph: "\u{E74D}";
-                        label: "Replaced originals";
-                        hint: "Recycle Bin or backup folder: restorable.";
-                        model: root.originals-options;
-                        current-index <=> root.originals-index;
-                        changed => { root.settings-changed(); }
-                    }
-                }
-                Row {
-                    SettingField {
-                        glyph: "\u{E8AC}";
-                        label: "Wrong extensions";
-                        hint: "A JPEG named .png becomes .jpg (may break saved web pages).";
-                        model: root.fix-ext-options;
-                        current-index <=> root.fix-ext-index;
-                        changed => { root.settings-changed(); }
-                    }
-                    EmptyField { }
-                }
-            }
-            // Index 1 = "Move to a backup folder".
-            if root.originals-index == 1: HorizontalLayout {
-                spacing: 12px;
-                Glyph { glyph: "\u{E8B7}"; font-size: 13px; color: Theme.text-tertiary; width: 14px; }
-                Text {
-                    // Default: "<scanned folder> (originals)" next to it (a drive root gets a
-                    // "mediaopti originals" folder inside; that rare case keeps the generic text).
-                    text: root.backup-dir != ""
-                        ? "Originals go to " + root.backup-dir + ", in the same subfolders."
-                        : root.folder-path != "" && !root.folder-path.ends-with(":\\")
-                        ? "Originals go to " + root.folder-path + " (originals), in the same subfolders."
-                        : "Originals go next to the scanned folder, into \"<folder> (originals)\", in the same subfolders.";
-                    font-size: 13px;
-                    color: Theme.text-secondary;
-                    vertical-alignment: center;
-                    overflow: elide;
-                    horizontal-stretch: 1;
-                }
-                LinkText { text: "Change folder…"; clicked => { root.choose-backup-folder(); } }
-                if root.backup-dir != "": LinkText {
-                    text: "Use default";
-                    clicked => {
-                        root.backup-dir = "";
-                        root.settings-changed();
-                    }
-                }
-            }
-            HorizontalLayout {
-                spacing: 12px;
-                Glyph { glyph: "\u{E8B7}"; font-size: 13px; color: Theme.text-tertiary; width: 14px; }
-                Text {
-                    text: "Temporary files go to " + (root.temp-dir != "" ? root.temp-dir : root.system-temp)
-                        + " (a drive short on space uses a hidden folder on the file's own drive).";
-                    font-size: 13px;
-                    color: Theme.text-secondary;
-                    vertical-alignment: center;
-                    overflow: elide;
-                    horizontal-stretch: 1;
-                }
-                LinkText { text: "Change folder…"; clicked => { root.choose-temp-folder(); } }
-                if root.temp-dir != "": LinkText {
-                    text: "Use default";
-                    clicked => {
-                        root.temp-dir = "";
-                        root.settings-changed();
-                    }
-                }
-            }
-        }
-
-        // ---- metrics
-        // One compact card: a single row of six figures when there is room (each needs
-        // ~140px for values like "190 fps (6.3x)"), otherwise two rows of three.
-        if root.show-stats: Card {
-            pad: 14px;
-            gap: 14px;
-            if root.width >= 1000px: HorizontalLayout {
-                spacing: 16px;
-                for metric in root.metrics: MetricCell { metric: metric; }
-            }
-            if root.width < 1000px: HorizontalLayout {
-                spacing: 16px;
-                MetricCell { metric: root.metrics[0]; }
-                MetricCell { metric: root.metrics[1]; }
-                MetricCell { metric: root.metrics[2]; }
-            }
-            if root.width < 1000px: HorizontalLayout {
-                spacing: 16px;
-                MetricCell { metric: root.metrics[3]; }
-                MetricCell { metric: root.metrics[4]; }
-                MetricCell { metric: root.metrics[5]; }
-            }
-        }
-
-        // ---- progress
-        if root.show-stats: Card {
-            HorizontalLayout {
-                SectionTitle { glyph: "\u{E9D9}"; text: "Progress"; }
-                Rectangle { horizontal-stretch: 1; }
-                Text { text: root.overall-percent; font-size: 15px; font-weight: 600; color: Theme.text; vertical-alignment: center; }
-            }
-            Text { text: root.current-file; font-size: 13px; color: Theme.text-secondary; overflow: elide; }
-            ThinBar { progress: root.overall-progress; height: 6px; border-radius: 3px; }
-            for worker in root.workers: VerticalLayout {
-                spacing: 6px;
-                padding-top: 4px;
+                padding: 8px;
+                padding-top: 16px;
+                spacing: 4px;
                 HorizontalLayout {
-                    spacing: 12px;
-                    Text { text: worker.title; font-size: 13px; color: Theme.text; overflow: elide; horizontal-stretch: 1; }
-                    Text { text: worker.meta; font-size: 12px; color: Theme.text-tertiary; horizontal-stretch: 0; }
+                    padding-left: 10px;
+                    padding-bottom: 14px;
+                    spacing: 10px;
+                    Image { source: @image-url("../assets/icon.png"); width: 28px; height: 28px; }
+                    VerticalLayout {
+                        alignment: center;
+                        Text { text: "mediaopti"; font-size: 16px; font-weight: 600; color: Theme.text; }
+                        Text { text: "Batch media optimizer"; font-size: 11px; color: Theme.text-tertiary; }
+                    }
                 }
-                ThinBar { progress: worker.progress; }
+                NavItem { glyph: "\u{E8FD}"; text: "Queue"; selected: root.page == 0; clicked => { root.page = 0; } }
+                Rectangle { vertical-stretch: 1; }
+                NavItem { glyph: "\u{E713}"; text: "Settings"; selected: root.page == 1; clicked => { root.page = 1; } }
+                NavItem { glyph: "\u{E946}"; text: "About"; selected: root.page == 2; clicked => { root.page = 2; } }
             }
         }
 
-        // ---- activity log
-        if root.show-log: Card {
-            vertical-stretch: 1;
-            HorizontalLayout {
-                SectionTitle { glyph: "\u{E7C3}"; text: "Activity"; }
-                Rectangle { horizontal-stretch: 1; }
-                HorizontalLayout {
-                    spacing: 12px;
-                    LinkText { text: "Open log folder"; clicked => { root.open-logs(); } }
-                    Button { text: "Clear"; clicked => { root.clear-log(); } }
+        // ---- pages
+        Rectangle {
+            horizontal-stretch: 1;
+
+            // ================= Queue
+            if root.page == 0: queue-page := ScrollView {
+                x: 0;
+                y: 0;
+                width: parent.width;
+                height: parent.height;
+                content-width: self.visible-width;
+                content-height: max(self.visible-height, queue-column.preferred-height);
+
+                queue-column := VerticalLayout {
+                    width: queue-page.visible-width;
+                    height: queue-page.content-height;
+                    padding: 24px;
+                    padding-left: max(24px, (queue-page.visible-width - 1000px) / 2);
+                    padding-right: max(24px, (queue-page.visible-width - 1000px) / 2);
+                    spacing: 14px;
+
+                    PageTitle { text: "Queue"; status: root.status; status-label: root.status-label; }
+
+                    // Source and the main actions.
+                    Card {
+                        HorizontalLayout {
+                            spacing: 14px;
+                            VerticalLayout {
+                                alignment: center;
+                                IconTile { glyph: "\u{E8B7}"; }
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                spacing: 2px;
+                                horizontal-stretch: 1;
+                                Text { text: root.folder-title; font-size: 14px; font-weight: 600; color: Theme.text; overflow: elide; }
+                                if root.has-folder: Text { text: root.folder-path; font-size: 12px; color: Theme.text-tertiary; overflow: elide; }
+                                Text { text: root.folder-summary; font-size: 12px; color: Theme.text-secondary; overflow: elide; }
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                Button {
+                                    text: root.has-folder ? "Change folder" : "Choose folder";
+                                    primary: !root.has-folder || root.empty-folder;
+                                    enabled: !root.busy;
+                                    clicked => { root.choose-folder(); }
+                                }
+                            }
+                            if root.has-folder && !root.processing: VerticalLayout {
+                                alignment: center;
+                                Button { text: "Clear queue"; enabled: !root.busy; clicked => { root.clear-queue(); } }
+                            }
+                            if root.processing: VerticalLayout {
+                                alignment: center;
+                                Button {
+                                    text: root.paused ? "Resume" : "Pause";
+                                    primary: root.paused;
+                                    enabled: root.stop-enabled;
+                                    clicked => { root.toggle-pause(); }
+                                }
+                            }
+                            if root.processing: VerticalLayout {
+                                alignment: center;
+                                Button { text: "Stop"; enabled: root.stop-enabled; clicked => { root.stop(); } }
+                            }
+                            if !root.processing: VerticalLayout {
+                                alignment: center;
+                                Button { text: "Start"; primary: true; enabled: root.can-start; clicked => { root.start(); } }
+                            }
+                        }
+                        if root.show-history: HorizontalLayout {
+                            spacing: 12px;
+                            Glyph { glyph: "\u{E81C}"; font-size: 13px; color: Theme.text-tertiary; width: 14px; }
+                            Text { text: root.history-text; font-size: 13px; color: Theme.text-tertiary; vertical-alignment: center; }
+                        }
+                    }
+
+                    // Waiting files by type, then the list (not while running).
+                    if root.has-folder && !root.processing: HorizontalLayout {
+                        spacing: 12px;
+                        for c in root.queue-counts: CountTile { item: c; }
+                    }
+                    if root.has-folder && !root.processing: Card {
+                        vertical-stretch: 1;
+                        HorizontalLayout {
+                            SectionTitle { glyph: "\u{E8FD}"; text: "In processing order"; }
+                            Rectangle { horizontal-stretch: 1; }
+                            Text { text: root.queue-more; font-size: 12px; color: Theme.text-tertiary; vertical-alignment: center; }
+                        }
+                        Rectangle {
+                            vertical-stretch: 1;
+                            min-height: 220px;
+                            background: Theme.well-background;
+                            border-radius: Theme.radius-small;
+                            if root.queue-items.length == 0: Text {
+                                text: "Nothing waiting: everything here is processed, or its type is switched off in Settings.";
+                                font-size: 13px;
+                                color: Theme.text-tertiary;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                                wrap: word-wrap;
+                            }
+                            ListView {
+                                for item in root.queue-items: HorizontalLayout {
+                                    padding-left: 12px;
+                                    padding-right: 12px;
+                                    padding-top: 4px;
+                                    padding-bottom: 4px;
+                                    spacing: 12px;
+                                    Text { text: item.kind; width: 72px; font-size: 12px; color: Theme.accent; vertical-alignment: center; }
+                                    Text { text: item.name; font-size: 13px; color: Theme.text; overflow: elide; horizontal-stretch: 1; vertical-alignment: center; }
+                                    Text { text: item.size; font-size: 12px; color: Theme.text-tertiary; horizontal-alignment: right; width: 80px; vertical-alignment: center; }
+                                }
+                            }
+                        }
+                    }
+
+                    // Running (or just finished): figures, progress, active files.
+                    if root.show-stats: Card {
+                        pad: 14px;
+                        gap: 14px;
+                        if root.width >= 1220px: HorizontalLayout {
+                            spacing: 16px;
+                            for metric in root.metrics: MetricCell { metric: metric; }
+                        }
+                        if root.width < 1220px: HorizontalLayout {
+                            spacing: 16px;
+                            MetricCell { metric: root.metrics[0]; }
+                            MetricCell { metric: root.metrics[1]; }
+                            MetricCell { metric: root.metrics[2]; }
+                        }
+                        if root.width < 1220px: HorizontalLayout {
+                            spacing: 16px;
+                            MetricCell { metric: root.metrics[3]; }
+                            MetricCell { metric: root.metrics[4]; }
+                            MetricCell { metric: root.metrics[5]; }
+                        }
+                    }
+                    if root.show-stats: Card {
+                        HorizontalLayout {
+                            SectionTitle { glyph: "\u{E9D9}"; text: "Progress"; }
+                            Rectangle { horizontal-stretch: 1; }
+                            Text { text: root.overall-percent; font-size: 15px; font-weight: 600; color: Theme.text; vertical-alignment: center; }
+                        }
+                        Text { text: root.current-file; font-size: 13px; color: Theme.text-secondary; overflow: elide; }
+                        ThinBar { progress: root.overall-progress; height: 6px; border-radius: 3px; }
+                        for worker in root.workers: VerticalLayout {
+                            spacing: 6px;
+                            padding-top: 4px;
+                            HorizontalLayout {
+                                spacing: 12px;
+                                Text { text: worker.title; font-size: 13px; color: Theme.text; overflow: elide; horizontal-stretch: 1; }
+                                Text { text: worker.meta; font-size: 12px; color: Theme.text-tertiary; horizontal-stretch: 0; }
+                            }
+                            ThinBar { progress: worker.progress; }
+                        }
+                    }
+
+                    // Running log.
+                    if root.show-log: Card {
+                        vertical-stretch: 1;
+                        HorizontalLayout {
+                            SectionTitle { glyph: "\u{E7C3}"; text: "Activity"; }
+                            Rectangle { horizontal-stretch: 1; }
+                            HorizontalLayout {
+                                spacing: 12px;
+                                LinkText { text: "Open log folder"; clicked => { root.open-logs(); } }
+                                Button { text: "Clear"; clicked => { root.clear-log(); } }
+                            }
+                        }
+                        Rectangle {
+                            vertical-stretch: 1;
+                            min-height: 160px;
+                            background: Theme.well-background;
+                            border-radius: Theme.radius-small;
+                            ListView {
+                                property <int> revision: root.log-revision;
+                                changed revision => {
+                                    self.content-y = min(0px, self.visible-height - self.content-height);
+                                }
+                                for line in root.log-lines: HorizontalLayout {
+                                    padding-left: 10px;
+                                    padding-right: 10px;
+                                    padding-top: 1px;
+                                    padding-bottom: 1px;
+                                    Text {
+                                        text: line;
+                                        font-family: "Consolas";
+                                        font-size: 12px;
+                                        color: Theme.text-secondary;
+                                        wrap: word-wrap;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if !root.has-folder && !root.show-log: Rectangle {
+                        vertical-stretch: 1;
+                        min-height: 200px;
+                        border-radius: Theme.radius;
+                        border-width: 1px;
+                        border-color: #FFFFFF1F;
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 8px;
+                            Glyph { glyph: "\u{E896}"; font-size: 32px; color: Theme.text-tertiary; }
+                            Text { text: "Drop files or folders here"; font-size: 16px; color: Theme.text-secondary; horizontal-alignment: center; }
+                            Text { text: "Videos, images, audio and documents. Folders include their subfolders."; font-size: 12px; color: Theme.text-tertiary; horizontal-alignment: center; }
+                        }
+                    }
+                    if root.has-folder && root.processing && !root.show-log: Rectangle { vertical-stretch: 1; }
                 }
             }
-            Rectangle {
-                vertical-stretch: 1;
-                min-height: 120px;
-                background: Theme.well-background;
-                border-radius: Theme.radius-small;
-                ListView {
-                    property <int> revision: root.log-revision;
-                    changed revision => {
-                        self.content-y = min(0px, self.visible-height - self.content-height);
-                    }
-                    for line in root.log-lines: HorizontalLayout {
-                        padding-left: 10px;
-                        padding-right: 10px;
-                        padding-top: 1px;
-                        padding-bottom: 1px;
+
+            // ================= Settings
+            if root.page == 1: settings-page := ScrollView {
+                x: 0;
+                y: 0;
+                width: parent.width;
+                height: parent.height;
+                content-width: self.visible-width;
+                content-height: max(self.visible-height, settings-column.preferred-height);
+
+                settings-column := VerticalLayout {
+                    width: settings-page.visible-width;
+                    padding: 24px;
+                    padding-left: max(24px, (settings-page.visible-width - 1000px) / 2);
+                    padding-right: max(24px, (settings-page.visible-width - 1000px) / 2);
+                    spacing: 14px;
+                    alignment: LayoutAlignment.start;
+
+                    HorizontalLayout {
+                        spacing: 12px;
+                        Text { text: "Settings"; font-size: 26px; font-weight: 600; color: Theme.text; vertical-alignment: center; }
+                        Rectangle { horizontal-stretch: 1; }
                         Text {
-                            text: line;
-                            font-family: "Consolas";
+                            text: root.locked ? "Locked while a batch runs" : "Saved automatically";
                             font-size: 12px;
-                            color: Theme.text-secondary;
+                            color: Theme.text-tertiary;
+                            vertical-alignment: center;
+                        }
+                        Button { text: "Restore defaults"; enabled: !root.locked; clicked => { root.restore-defaults(); } }
+                    }
+
+                    // ---- videos
+                    Card {
+                        gap: 16px;
+                        GroupHeader {
+                            glyph: "\u{E714}";
+                            title: "Videos";
+                            formats: "mp4, mkv, mov, avi, wmv, webm, flv, m4v, mts, m2ts, ts, 3gp, mpg, mpeg, and animated GIFs over the size limit";
+                            enabled: !root.locked;
+                            on <=> root.videos-on;
+                            toggled => { root.settings-changed(); }
+                        }
+                        if root.videos-on: GridLayout {
+                            spacing-horizontal: 24px;
+                            spacing-vertical: 16px;
+                            Row {
+                                SettingField {
+                                    glyph: "\u{E7F4}";
+                                    label: "Encoder";
+                                    hint: "AV1 makes the smallest files (RTX 40+).";
+                                    enabled: !root.locked;
+                                    model: root.encoder-options;
+                                    current-index <=> root.encoder-index;
+                                    changed => { root.settings-changed(); }
+                                }
+                                SettingField {
+                                    glyph: "\u{E9F5}";
+                                    label: "Parallel jobs";
+                                    hint: "Videos encoded at the same time (2 for dual-NVENC GPUs).";
+                                    enabled: !root.locked;
+                                    model: root.jobs-options;
+                                    current-index <=> root.jobs-index;
+                                    changed => { root.settings-changed(); }
+                                }
+                            }
+                            Row {
+                                SettingField {
+                                    glyph: "\u{E7B3}";
+                                    label: "Quality";
+                                    hint: "More detail means less space saved.";
+                                    enabled: !root.locked;
+                                    model: root.quality-options;
+                                    current-index <=> root.quality-index;
+                                    changed => { root.settings-changed(); }
+                                }
+                                SettingField {
+                                    glyph: "\u{EC4A}";
+                                    label: "Encoding speed";
+                                    hint: "Slower presets compress better.";
+                                    enabled: !root.locked;
+                                    model: root.speed-options;
+                                    current-index <=> root.speed-index;
+                                    changed => { root.settings-changed(); }
+                                }
+                            }
+                            Row {
+                                SettingField {
+                                    glyph: "\u{E73E}";
+                                    label: "If not smaller";
+                                    hint: "Retry stronger settings, keeping the measured quality (VMAF) at or above this.";
+                                    enabled: !root.locked;
+                                    model: root.check-options;
+                                    current-index <=> root.check-index;
+                                    changed => { root.settings-changed(); }
+                                }
+                                SettingField {
+                                    glyph: "\u{E8B9}";
+                                    label: "Animated GIFs";
+                                    hint: "Smaller GIFs stay GIFs (optimized as images).";
+                                    enabled: !root.locked;
+                                    model: root.gifs-options;
+                                    current-index <=> root.gifs-index;
+                                    changed => { root.settings-changed(); }
+                                }
+                            }
+                        }
+                    }
+
+                    // ---- images
+                    Card {
+                        gap: 16px;
+                        GroupHeader {
+                            glyph: "\u{EB9F}";
+                            title: "Images";
+                            formats: "png, jpg, jpeg, jpe, jfif, gif, bmp, tga";
+                            enabled: !root.locked;
+                            on <=> root.images-on;
+                            toggled => { root.settings-changed(); }
+                        }
+                        if root.images-on: GridLayout {
+                            spacing-horizontal: 24px;
+                            spacing-vertical: 16px;
+                            Row {
+                                SettingField {
+                                    glyph: "\u{E7B3}";
+                                    label: "Quality";
+                                    hint: "Also used for the pictures inside comics.";
+                                    enabled: !root.locked;
+                                    model: root.images-options;
+                                    current-index <=> root.images-index;
+                                    changed => { root.settings-changed(); }
+                                }
+                                SettingField {
+                                    glyph: "\u{E8AC}";
+                                    label: "Wrong extensions";
+                                    hint: "A JPEG named .png becomes .jpg (may break saved web pages).";
+                                    enabled: !root.locked;
+                                    model: root.fix-ext-options;
+                                    current-index <=> root.fix-ext-index;
+                                    changed => { root.settings-changed(); }
+                                }
+                            }
+                        }
+                    }
+
+                    // ---- audio
+                    Card {
+                        gap: 16px;
+                        GroupHeader {
+                            glyph: "\u{E8D6}";
+                            title: "Audio";
+                            formats: "flac, mp3, ogg, oga, wav (ALAC/m4a and other lossy formats are left alone)";
+                            enabled: !root.locked;
+                            on <=> root.audio-on;
+                            toggled => { root.settings-changed(); }
+                        }
+                        if root.audio-on: GridLayout {
+                            spacing-horizontal: 24px;
+                            Row {
+                                SettingField {
+                                    glyph: "\u{E7B3}";
+                                    label: "Cover art";
+                                    hint: "The sound itself never changes.";
+                                    enabled: !root.locked;
+                                    model: root.audio-options;
+                                    current-index <=> root.audio-index;
+                                    changed => { root.settings-changed(); }
+                                }
+                                EmptyField { }
+                            }
+                        }
+                    }
+
+                    // ---- documents
+                    Card {
+                        gap: 16px;
+                        GroupHeader {
+                            glyph: "\u{E8A5}";
+                            title: "Documents";
+                            formats: "pdf, docx, xlsx, pptx (and docm, xlsm, pptm), odt, ods, odp, odg, epub, cbz, cbr";
+                            enabled: !root.locked;
+                            on <=> root.docs-on;
+                            toggled => { root.settings-changed(); }
+                        }
+                        if root.docs-on: GridLayout {
+                            spacing-horizontal: 24px;
+                            Row {
+                                SettingField {
+                                    glyph: "\u{EA90}";
+                                    label: "PDF";
+                                    hint: "Text and drawings never change; every page is rendered and compared.";
+                                    enabled: !root.locked;
+                                    model: root.pdf-options;
+                                    current-index <=> root.pdf-index;
+                                    changed => { root.settings-changed(); }
+                                }
+                                EmptyField { }
+                            }
+                        }
+                    }
+
+                    // ---- files
+                    Card {
+                        gap: 16px;
+                        GroupHeader {
+                            glyph: "\u{E8B7}";
+                            title: "Files";
+                            formats: "Conversions, replaced originals and work folders";
+                            has-switch: false;
+                        }
+                        HorizontalLayout {
+                            spacing: 24px;
+                            VerticalLayout {
+                                spacing: 2px;
+                                horizontal-stretch: 1;
+                                preferred-width: 200px;
+                                min-width: 0px;
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    padding-bottom: 4px;
+                                    Glyph { glyph: "\u{E8AB}"; font-size: 14px; color: Theme.text-secondary; width: 16px; }
+                                    Text { text: "Conversions"; font-size: 14px; font-weight: 600; color: Theme.text; vertical-alignment: center; }
+                                }
+                                Check {
+                                    text: "All";
+                                    enabled: !root.locked;
+                                    checked: root.conv-wav && root.conv-img && root.conv-cbr;
+                                    clicked => {
+                                        if (root.conv-wav && root.conv-img && root.conv-cbr) {
+                                            root.conv-wav = false;
+                                            root.conv-img = false;
+                                            root.conv-cbr = false;
+                                        } else {
+                                            root.conv-wav = true;
+                                            root.conv-img = true;
+                                            root.conv-cbr = true;
+                                        }
+                                        root.settings-changed();
+                                    }
+                                }
+                                Check {
+                                    text: "WAV → FLAC";
+                                    enabled: !root.locked;
+                                    checked: root.conv-wav;
+                                    clicked => { root.conv-wav = !root.conv-wav; root.settings-changed(); }
+                                }
+                                Check {
+                                    text: "BMP / TGA → PNG";
+                                    enabled: !root.locked;
+                                    checked: root.conv-img;
+                                    clicked => { root.conv-img = !root.conv-img; root.settings-changed(); }
+                                }
+                                Check {
+                                    text: "CBR → CBZ";
+                                    enabled: !root.locked;
+                                    checked: root.conv-cbr;
+                                    clicked => { root.conv-cbr = !root.conv-cbr; root.settings-changed(); }
+                                }
+                                Text { text: "Lossless and verified. The file extension changes."; font-size: 12px; color: Theme.text-tertiary; wrap: word-wrap; }
+                            }
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                preferred-width: 200px;
+                                min-width: 0px;
+                                alignment: LayoutAlignment.start;
+                                SettingField {
+                                    glyph: "\u{E74D}";
+                                    label: "Replaced originals";
+                                    hint: "Recycle Bin or backup folder: restorable.";
+                                    enabled: !root.locked;
+                                    model: root.originals-options;
+                                    current-index <=> root.originals-index;
+                                    changed => { root.settings-changed(); }
+                                }
+                            }
+                        }
+                        // Index 1 = "Move to a backup folder".
+                        if root.originals-index == 1: HorizontalLayout {
+                            spacing: 12px;
+                            Glyph { glyph: "\u{E8B7}"; font-size: 13px; color: Theme.text-tertiary; width: 14px; }
+                            Text {
+                                text: root.backup-dir != ""
+                                    ? "Originals go to " + root.backup-dir + ", in the same subfolders."
+                                    : "Originals go next to the scanned folder, into \"<folder> (originals)\", in the same subfolders.";
+                                font-size: 13px;
+                                color: Theme.text-secondary;
+                                vertical-alignment: center;
+                                overflow: elide;
+                                horizontal-stretch: 1;
+                            }
+                            LinkText { text: "Change folder…"; enabled: !root.locked; clicked => { root.choose-backup-folder(); } }
+                            if root.backup-dir != "": LinkText {
+                                text: "Use default";
+                                enabled: !root.locked;
+                                clicked => {
+                                    root.backup-dir = "";
+                                    root.settings-changed();
+                                }
+                            }
+                        }
+                        HorizontalLayout {
+                            spacing: 12px;
+                            Glyph { glyph: "\u{E8B7}"; font-size: 13px; color: Theme.text-tertiary; width: 14px; }
+                            Text {
+                                text: "Temporary files go to " + (root.temp-dir != "" ? root.temp-dir : root.system-temp)
+                                    + " (a drive short on space uses a hidden folder on the file's own drive).";
+                                font-size: 13px;
+                                color: Theme.text-secondary;
+                                vertical-alignment: center;
+                                overflow: elide;
+                                horizontal-stretch: 1;
+                            }
+                            LinkText { text: "Change folder…"; enabled: !root.locked; clicked => { root.choose-temp-folder(); } }
+                            if root.temp-dir != "": LinkText {
+                                text: "Use default";
+                                enabled: !root.locked;
+                                clicked => {
+                                    root.temp-dir = "";
+                                    root.settings-changed();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ================= About
+            if root.page == 2: about-page := ScrollView {
+                x: 0;
+                y: 0;
+                width: parent.width;
+                height: parent.height;
+                content-width: self.visible-width;
+                content-height: max(self.visible-height, about-column.preferred-height);
+
+                about-column := VerticalLayout {
+                    width: about-page.visible-width;
+                    padding: 24px;
+                    padding-left: max(24px, (about-page.visible-width - 1000px) / 2);
+                    padding-right: max(24px, (about-page.visible-width - 1000px) / 2);
+                    spacing: 14px;
+                    alignment: LayoutAlignment.start;
+
+                    Text { text: "About"; font-size: 26px; font-weight: 600; color: Theme.text; }
+
+                    Card {
+                        HorizontalLayout {
+                            spacing: 16px;
+                            Image { source: @image-url("../assets/icon.png"); width: 48px; height: 48px; }
+                            VerticalLayout {
+                                alignment: center;
+                                spacing: 2px;
+                                Text { text: "mediaopti " + root.app-version; font-size: 18px; font-weight: 600; color: Theme.text; }
+                                Text {
+                                    text: "Makes a media library smaller. A file is replaced only when the result is smaller and passes verification (identical pixels or audio, or SSIMULACRA2 / VMAF ≥ 93); dates and attributes are kept.";
+                                    font-size: 13px;
+                                    color: Theme.text-secondary;
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+                    }
+
+                    Card {
+                        SectionTitle { glyph: "\u{E90F}"; text: "Tools"; }
+                        Text { text: "Found: " + root.tools-found; font-size: 13px; color: Theme.text-secondary; wrap: word-wrap; }
+                        if root.tools-missing != "": Text { text: "Missing (their steps are skipped): " + root.tools-missing; font-size: 13px; color: Theme.caution; wrap: word-wrap; }
+                        Text {
+                            text: "Run scripts\\fetch-tools.ps1 to install them. pingo and beeim (css-ig.net) are free for private use and are never bundled; the other tools come with their licences (THIRD-PARTY.txt in the release).";
+                            font-size: 12px;
+                            color: Theme.text-tertiary;
                             wrap: word-wrap;
+                        }
+                    }
+
+                    Card {
+                        SectionTitle { glyph: "\u{E8B7}"; text: "Data"; }
+                        HorizontalLayout {
+                            spacing: 12px;
+                            Text { text: root.data-dir; font-size: 13px; color: Theme.text-secondary; overflow: elide; horizontal-stretch: 1; vertical-alignment: center; }
+                            LinkText { text: "Open folder"; clicked => { root.open-data-folder(); } }
+                            LinkText { text: "Open logs"; clicked => { root.open-logs(); } }
+                        }
+                        Text {
+                            text: "Settings, the processed history (by location and by content) and the logs are stored there.";
+                            font-size: 12px;
+                            color: Theme.text-tertiary;
+                            wrap: word-wrap;
+                        }
+                        HorizontalLayout {
+                            spacing: 12px;
+                            Glyph { glyph: "\u{E81C}"; font-size: 13px; color: Theme.text-tertiary; width: 14px; }
+                            Text { text: root.history-text; font-size: 13px; color: Theme.text-tertiary; vertical-alignment: center; horizontal-stretch: 1; }
+                            LinkText {
+                                text: "Forget processed history";
+                                enabled: !root.busy && root.show-history;
+                                clicked => { root.forget-history(); }
+                            }
                         }
                     }
                 }
             }
         }
-
-        if !root.show-log: Rectangle { vertical-stretch: 1; }
-    }
     }
 
     // While files are dragged over the window: where they will go.

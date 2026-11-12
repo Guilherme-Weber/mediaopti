@@ -119,6 +119,13 @@ measurable or too little for their time (oxipng `-o max`, pingo as a lossy PNG m
 and pingo for JPEG, lossy re-encoding of JPEGs below quality 90, PDF JPEGs below quality 85,
 re-encoding FLACs from libFLAC 1.4+, and flac `-e`), so they are not used.
 
+**Queue order.** One batch runs in stages, each sized to what limits it: videos first (the
+*Parallel jobs* setting, 2 for dual-NVENC GPUs), then audio files (2 at a time, they are
+disk-heavy), then documents (2 at a time, their pages use the idle cores), then images (every core
+but two). A stage starts as soon as the previous one has no file left to start, so the last
+encodes overlap with the next stage instead of leaving the CPU idle, and the stages don't compete
+for memory.
+
 The **Audio** setting is separate from Images: FLAC, MP3, Ogg and WAV files can be switched off,
 processed losslessly, or have their cover art made visually lossless (the sound itself never
 changes).
@@ -171,11 +178,14 @@ suspends the image, audio, and document tools that are running.
 
 ## Usage
 
-1. Extract the release zip and run `mediaopti.exe`.
-2. Choose a folder, or drag files and folders onto the window (several at once; they are added to
-   what is loaded, and during a run to the running queue).
-3. Pick the settings: encoder, jobs, quality, speed, the *If not smaller* check, GIF handling, and
-   what happens to replaced originals.
+1. Extract the release zip and run `mediaopti.exe`. The window has three pages on the left:
+   **Queue**, **Settings** and **About**.
+2. On **Queue**, choose a folder, or drag files and folders onto the window (several at once;
+   they are added to what is loaded, and during a run to the running queue). The page shows the
+   waiting files by type and in processing order; **Clear queue** empties it.
+3. On **Settings** (saved automatically; **Restore defaults** resets them), each type (videos,
+   images, audio, documents) can be switched off, and each lists the formats it takes. The
+   conversions (WAV → FLAC, BMP/TGA → PNG, CBR → CBZ) are switched one by one or all at once.
 4. Click **Start**. Use **Pause/Resume** or **Stop** at any time.
 
 ```powershell

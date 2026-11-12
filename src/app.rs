@@ -57,20 +57,14 @@ const GIFS: &[(u32, &str)] = &[
 const IMAGES: &[(u32, &str)] = &[
     (2, "Visually lossless (SSIMULACRA2 ≥ 93)"),
     (1, "Lossless only (pixel-identical)"),
-    (0, "Don't process images"),
-];
-const CONVERSIONS: &[(u32, &str)] = &[
-    (1, "WAV → FLAC, BMP/TGA → PNG, CBR → CBZ"),
-    (0, "Keep file formats"),
 ];
 const PDFS: &[(u32, &str)] = &[
     (1, "Visually lossless images (pages checked)"),
     (0, "Lossless only"),
 ];
 const AUDIO: &[(u32, &str)] = &[
-    (2, "Cover art visually lossless (≥ 93)"),
+    (2, "Visually lossless (≥ 93)"),
     (1, "Lossless only"),
-    (0, "Don't process audio"),
 ];
 const FIX_EXT: &[(u32, &str)] = &[
     (0, "Keep file names"),
@@ -99,12 +93,20 @@ struct Prefs {
     backup_dir: String,
     gif_min_mb: u32,
     vmaf_floor: u32,
+    /// 1 = lossless, 2 = visually lossless.
     images: u32,
-    /// 1 = lossless format conversions (WAV -> FLAC), 0 = keep formats.
-    convert: u32,
+    /// Each type on or off.
+    videos: bool,
+    images_on: bool,
+    audio_on: bool,
+    docs: bool,
+    /// Each lossless conversion on or off.
+    conv_wav: bool,
+    conv_img: bool,
+    conv_cbr: bool,
     /// 1 = visually lossless PDF images, 0 = lossless only.
     lossy_docs: u32,
-    /// 0 = off, 1 = lossless, 2 = cover art visually lossless.
+    /// Cover art: 1 = lossless, 2 = visually lossless.
     audio: u32,
     /// Folder for work files; empty = the system temp folder.
     temp_dir: String,
@@ -124,7 +126,13 @@ impl Default for Prefs {
             gif_min_mb: 1,
             vmaf_floor: 93,
             images: 2,
-            convert: 1,
+            videos: true,
+            images_on: true,
+            audio_on: true,
+            docs: true,
+            conv_wav: true,
+            conv_img: true,
+            conv_cbr: true,
             lossy_docs: 1,
             audio: 2,
             temp_dir: String::new(),
@@ -141,10 +149,20 @@ fn position<K: PartialEq>(choices: &[(K, &str)], value: &K, default: &K) -> i32 
 
 impl Prefs {
     fn load(path: &Path) -> Self {
-        std::fs::read_to_string(path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<Prefs>(&s).ok())
-            .unwrap_or_default()
+        let Some(text) = std::fs::read_to_string(path).ok() else { return Self::default() };
+        let Ok(mut p) = serde_json::from_str::<Prefs>(&text) else { return Self::default() };
+        // Older settings: "Don't process" was a quality choice, conversions one switch.
+        let old: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+        if p.images == 0 {
+            (p.images_on, p.images) = (false, 2);
+        }
+        if p.audio == 0 {
+            (p.audio_on, p.audio) = (false, 2);
+        }
+        if old.get("conv_wav").is_none() && old.get("convert").and_then(serde_json::Value::as_u64) == Some(0) {
+            (p.conv_wav, p.conv_img, p.conv_cbr) = (false, false, false);
+        }
+        p
     }
 
     fn save(&self, path: &Path) {
@@ -166,7 +184,13 @@ impl Prefs {
             gif_min_mb: GIFS[pick(w.get_gifs_index(), GIFS.len())].0,
             vmaf_floor: QUALITY_CHECK[pick(w.get_check_index(), QUALITY_CHECK.len())].0,
             images: IMAGES[pick(w.get_images_index(), IMAGES.len())].0,
-            convert: CONVERSIONS[pick(w.get_convert_index(), CONVERSIONS.len())].0,
+            videos: w.get_videos_on(),
+            images_on: w.get_images_on(),
+            audio_on: w.get_audio_on(),
+            docs: w.get_docs_on(),
+            conv_wav: w.get_conv_wav(),
+            conv_img: w.get_conv_img(),
+            conv_cbr: w.get_conv_cbr(),
             lossy_docs: PDFS[pick(w.get_pdf_index(), PDFS.len())].0,
             audio: AUDIO[pick(w.get_audio_index(), AUDIO.len())].0,
             temp_dir: w.get_temp_dir().into(),
@@ -187,7 +211,13 @@ impl Prefs {
         w.set_gifs_index(position(GIFS, &self.gif_min_mb, &d.gif_min_mb));
         w.set_check_index(position(QUALITY_CHECK, &self.vmaf_floor, &d.vmaf_floor));
         w.set_images_index(position(IMAGES, &self.images, &d.images));
-        w.set_convert_index(position(CONVERSIONS, &self.convert, &d.convert));
+        w.set_videos_on(self.videos);
+        w.set_images_on(self.images_on);
+        w.set_audio_on(self.audio_on);
+        w.set_docs_on(self.docs);
+        w.set_conv_wav(self.conv_wav);
+        w.set_conv_img(self.conv_img);
+        w.set_conv_cbr(self.conv_cbr);
         w.set_pdf_index(position(PDFS, &self.lossy_docs, &d.lossy_docs));
         w.set_audio_index(position(AUDIO, &self.audio, &d.audio));
         w.set_temp_dir(self.temp_dir.as_str().into());
@@ -204,10 +234,13 @@ impl Prefs {
             backup_dir: Some(self.backup_dir.clone()),
             gif_min_mb: Some(self.gif_min_mb),
             vmaf_floor: Some(self.vmaf_floor),
-            images: Some(self.images),
-            convert: Some(self.convert),
+            images: Some(if self.images_on { self.images } else { 0 }),
+            convert: None,
+            conversions: Some(u32::from(self.conv_wav) | u32::from(self.conv_img) << 1 | u32::from(self.conv_cbr) << 2),
+            videos: Some(u32::from(self.videos)),
+            docs: Some(u32::from(self.docs)),
             lossy_docs: Some(self.lossy_docs),
-            audio: Some(self.audio),
+            audio: Some(if self.audio_on { self.audio } else { 0 }),
             temp_dir: Some(self.temp_dir.clone()),
             fix_ext: Some(self.fix_ext),
         }
@@ -271,6 +304,10 @@ fn with_controller(f: impl FnOnce(&mut Controller)) {
 
 /// Lives on the UI thread; owns the window models.
 struct Controller {
+    engine: Arc<Engine>,
+    queue_model: Rc<VecModel<QueueItem>>,
+    /// The queue revision (and running state) the list was last loaded for.
+    queue_shown: Option<(u64, bool)>,
     window: slint::Weak<AppWindow>,
     inbox: Arc<Inbox>,
     state: StateDto,
@@ -374,10 +411,48 @@ impl Controller {
         self.render();
     }
 
+    /// The queue summary by type, and the file list when the queue changed (not while
+    /// running: the list is hidden then, and reloading it would cost time on every change).
+    fn render_queue(&mut self, w: &AppWindow) {
+        let s = &self.state;
+        let labels = [("Videos", "\u{E714}"), ("Audio", "\u{E8D6}"), ("Documents", "\u{E8A5}"), ("Images", "\u{EB9F}")];
+        let counts: Vec<QueueCount> = labels
+            .iter()
+            .zip(s.queue_counts)
+            .map(|((label, glyph), (n, bytes))| QueueCount {
+                label: (*label).into(),
+                count: group_thousands(n).into(),
+                size: if n == 0 { "—".into() } else { format_bytes(bytes).into() },
+                glyph: (*glyph).into(),
+            })
+            .collect();
+        w.set_queue_counts(ModelRc::new(VecModel::from(counts)));
+        let running = matches!(s.status, Status::Running | Status::Paused | Status::Stopping);
+        let key = (s.queue_revision, running);
+        if running || self.queue_shown == Some(key) {
+            return;
+        }
+        self.queue_shown = Some(key);
+        let items = self.engine.queue_preview(QUEUE_LIST_MAX);
+        let waiting: usize = s.queue_counts.iter().map(|c| c.0).sum();
+        w.set_queue_more(if waiting > items.len() {
+            format!("first {} of {}", group_thousands(items.len()), group_thousands(waiting)).into()
+        } else {
+            plural(waiting, "file", "files").into()
+        });
+        self.queue_model.set_vec(
+            items
+                .into_iter()
+                .map(|(name, kind, size)| QueueItem { name: name.into(), kind: kind.into(), size: format_bytes(size).into() })
+                .collect::<Vec<_>>(),
+        );
+    }
+
     fn render(&mut self) {
         let Some(w) = self.window.upgrade() else {
             return;
         };
+        self.render_queue(&w);
         self.clock.update(self.state.status);
         let s = &self.state;
         let busy = matches!(
@@ -578,6 +653,8 @@ fn hwnd(w: &AppWindow) -> Option<isize> {
 pub struct Launch {
     pub folder: Option<PathBuf>,
     pub start: bool,
+    /// The page shown first (`--page=settings` / `--page=about`).
+    pub page: i32,
 }
 
 impl Launch {
@@ -586,6 +663,12 @@ impl Launch {
         for arg in args {
             if arg == "--start" {
                 launch.start = true;
+            } else if let Some(page) = arg.strip_prefix("--page=") {
+                launch.page = match page {
+                    "settings" => 1,
+                    "about" => 2,
+                    _ => 0,
+                };
             } else if arg.starts_with("--") {
                 // Unknown flag: ignore rather than treating it as a folder.
             } else if launch.folder.is_none() {
@@ -628,7 +711,6 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
     window.set_gifs_options(labels(GIFS));
     window.set_check_options(labels(QUALITY_CHECK));
     window.set_images_options(labels(IMAGES));
-    window.set_convert_options(labels(CONVERSIONS));
     window.set_pdf_options(labels(PDFS));
     window.set_fix_ext_options(labels(FIX_EXT));
     window.set_system_temp(std::env::temp_dir().to_string_lossy().trim_end_matches('\\').into());
@@ -644,9 +726,21 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
     window.set_log_lines(log_model.clone().into());
     window.set_workers(worker_model.clone().into());
     window.set_metrics(metric_model.clone().into());
+    let queue_model = Rc::new(VecModel::<QueueItem>::default());
+    window.set_queue_items(queue_model.clone().into());
+
+    // About page.
+    window.set_app_version(env!("CARGO_PKG_VERSION").into());
+    let (found, missing) = engine.tool_lists();
+    window.set_tools_found(if found.is_empty() { "none".into() } else { found.join(", ").into() });
+    window.set_tools_missing(missing.join(", ").into());
+    window.set_data_dir(data_dir.to_string_lossy().as_ref().into());
 
     CONTROLLER.with(|c| {
         *c.borrow_mut() = Some(Controller {
+            engine: engine.clone(),
+            queue_model,
+            queue_shown: None,
             window: window.as_weak(),
             inbox,
             state: engine.snapshot(),
@@ -718,6 +812,28 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
         });
     }
     window.on_clear_log(|| with_controller(Controller::clear_log));
+    {
+        let engine = engine.clone();
+        window.on_clear_queue(move || engine.clear_queue());
+    }
+    {
+        let dir = data_dir.to_path_buf();
+        window.on_open_data_folder(move || {
+            let _ = std::process::Command::new("explorer").arg(&dir).spawn();
+        });
+    }
+    {
+        let engine = engine.clone();
+        let weak = window.as_weak();
+        let prefs_path = prefs_path.clone();
+        window.on_restore_defaults(move || {
+            let Some(w) = weak.upgrade() else { return };
+            let prefs = Prefs::default();
+            prefs.apply_to_window(&w);
+            prefs.save(&prefs_path);
+            engine.apply_options_in_background(prefs.to_raw());
+        });
+    }
     {
         // The full activity log and any crash reports live here.
         let logs_dir = data_dir.join("logs");
@@ -824,6 +940,8 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
         });
     }
 
+    window.set_page(launch.page);
+
     // First paint, then honour command-line options.
     with_controller(Controller::render);
     if let Some(dir) = launch.folder {
@@ -895,6 +1013,21 @@ fn format_mb(value: f64) -> String {
             .to_string()
     }
 }
+
+/// Bytes as "812 KB", "45.2 MB", "1.3 GB".
+fn format_bytes(b: u64) -> String {
+    let b = b as f64;
+    if b >= 1024.0 * 1024.0 * 1024.0 {
+        format!("{:.1} GB", b / (1024.0 * 1024.0 * 1024.0))
+    } else if b >= 1024.0 * 1024.0 {
+        format!("{:.1} MB", b / (1024.0 * 1024.0))
+    } else {
+        format!("{:.0} KB", (b / 1024.0).ceil())
+    }
+}
+
+/// Files shown in the queue list (more would slow the window down).
+const QUEUE_LIST_MAX: usize = 5000;
 
 /// Space saved: MB below 1 GB, otherwise GB with one decimal.
 fn format_saved(mb: f64) -> String {

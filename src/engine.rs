@@ -114,6 +114,10 @@ pub struct StateDto {
     pub images_done_this_run: usize,
     /// Image workers busy right now.
     pub images_active: usize,
+    /// Files waiting, by type (videos, audio, documents, images): count and bytes.
+    pub queue_counts: [(usize, u64); 4],
+    /// Changes whenever the queue's content changes (the window then reloads its list).
+    pub queue_revision: u64,
     /// CPU files running for a while (a big comic, a long FLAC): name and seconds so far,
     /// longest first.
     pub slow_jobs: Vec<(String, u64)>,
@@ -130,8 +134,16 @@ struct Inner {
     /// Single-frame GIFs found by the scan: always images, whatever their size.
     static_gifs: HashSet<PathBuf>,
     /// PNG/JPEG and small GIFs, processed by the CPU image workers.
-    image_queue: Vec<PathBuf>,
-    image_cursor: usize,
+    /// CPU files by stage (audio, documents, images: see `Kind::stage`), each with its cursor
+    /// and how many run now. A stage starts when the one before has nothing left to start.
+    cpu_queues: [Vec<PathBuf>; 3],
+    cpu_cursors: [usize; 3],
+    cpu_active: [usize; 3],
+    /// The stages announced in the log this batch.
+    stage_logged: [bool; 3],
+    /// Bytes waiting by type (videos, audio, documents, images).
+    queue_bytes: [u64; 4],
+    queue_revision: u64,
     images_active: usize,
     /// When each CPU file being processed was started.
     cpu_started: std::collections::HashMap<PathBuf, Instant>,
@@ -164,6 +176,11 @@ struct Inner {
     cpu: Option<Arc<images::CpuCtx>>,
     fatal: Arc<AtomicBool>,
     gpu_polling: bool,
+}
+
+/// The CPU stage of a queued file (see `Kind::stage`).
+fn cpu_stage(file: &Path) -> usize {
+    image::kind_of(file).map_or(2, image::Kind::stage)
 }
 
 /// Where a scanned file goes (see `Inner::place`).
@@ -283,7 +300,8 @@ impl Inner {
     /// GIFs, and animated GIFs under the size limit (bigger ones become video).
     fn is_image_job(&self, file: &Path, size: u64) -> bool {
         match image::kind_of(file) {
-            Some(image::Kind::Gif) => size < self.options.gif_min_bytes || self.static_gifs.contains(file),
+            // With videos switched off, big animated GIFs are optimized as GIFs.
+            Some(image::Kind::Gif) => size < self.options.gif_min_bytes || self.static_gifs.contains(file) || !self.options.videos,
             Some(_) => true,
             None => false,
         }
@@ -293,8 +311,19 @@ impl Inner {
     /// conversions option, everything else (images, cover art) the image option.
     fn cpu_job_enabled(&self, file: &Path) -> bool {
         let Some(kind) = image::kind_of(file) else { return false };
-        let category = if kind.is_audio() { self.options.audio } else { self.options.images };
-        category != ImageMode::Off && (!kind.is_conversion() || self.options.convert)
+        let on = match kind.stage() {
+            0 => self.options.audio != ImageMode::Off,
+            1 => self.options.docs,
+            _ => self.options.images != ImageMode::Off,
+        };
+        let c = self.options.convert;
+        let conversion_on = match kind {
+            image::Kind::Wav => c.wav,
+            image::Kind::Bmp | image::Kind::Tga => c.images,
+            image::Kind::Cbr => c.cbr,
+            _ => true,
+        };
+        on && conversion_on
     }
 
     /// Whether `file` is processed visually lossless (its category's setting: audio files by
@@ -358,6 +387,8 @@ impl Inner {
             } else {
                 Place::Cpu
             }
+        } else if !self.options.videos {
+            Place::Off { gif: false }
         } else if self.history.contains(file) {
             Place::Known
         } else if self.failed.contains(file) {
@@ -369,7 +400,8 @@ impl Inner {
 
     /// Rebuilds the work queues from the scanned files, history and this run's failures.
     fn rebuild_queue(&mut self) {
-        let (mut queue, mut images) = (Vec::new(), Vec::new());
+        let (mut queue, mut cpu): (Vec<PathBuf>, [Vec<PathBuf>; 3]) = (Vec::new(), Default::default());
+        let mut bytes = [0u64; 4];
         let (mut known, mut generated, mut small_gifs) = (0, 0, 0);
         for (i, file) in self.files.iter().enumerate() {
             let size = self.file_sizes.get(i).copied().unwrap_or(u64::MAX);
@@ -378,23 +410,48 @@ impl Inner {
                 Place::Off { gif } => small_gifs += usize::from(gif),
                 Place::Known => known += 1,
                 Place::Failed => {}
-                Place::Cpu => images.push(file.clone()),
-                Place::Video => queue.push(file.clone()),
+                Place::Cpu => {
+                    let stage = cpu_stage(file);
+                    bytes[stage + 1] += size;
+                    cpu[stage].push(file.clone());
+                }
+                Place::Video => {
+                    bytes[0] += size;
+                    queue.push(file.clone());
+                }
             }
         }
         self.pending_queue = queue;
         self.queue_cursor = 0;
-        self.image_queue = images;
-        self.image_cursor = 0;
+        self.cpu_queues = cpu;
+        self.cpu_cursors = [0; 3];
+        self.queue_bytes = bytes;
+        self.queue_revision += 1;
         self.skipped_known = known;
         self.skipped_generated = generated;
         self.skipped_small_gifs = small_gifs;
     }
 
     fn remaining_pending(&self) -> usize {
-        self.pending_queue.len().saturating_sub(self.queue_cursor)
-            + self.image_queue.len().saturating_sub(self.image_cursor)
-            + self.in_progress.len()
+        self.pending_queue.len().saturating_sub(self.queue_cursor) + self.cpu_left() + self.in_progress.len()
+    }
+
+    /// CPU files queued in all stages.
+    fn cpu_total(&self) -> usize {
+        self.cpu_queues.iter().map(Vec::len).sum()
+    }
+
+    /// CPU files not started yet.
+    fn cpu_left(&self) -> usize {
+        self.cpu_queues.iter().zip(self.cpu_cursors).map(|(q, c)| q.len().saturating_sub(c)).sum()
+    }
+
+    /// Adds a CPU file to its stage's queue (and the byte counts).
+    fn queue_cpu(&mut self, file: PathBuf, size: u64) {
+        let stage = cpu_stage(&file);
+        self.queue_bytes[stage + 1] += size;
+        self.cpu_queues[stage].push(file);
+        self.queue_revision += 1;
     }
 
     fn display_name(&self, path: &Path) -> String {
@@ -486,6 +543,13 @@ impl Inner {
             images_total_this_run: self.run.images_total,
             images_done_this_run: self.run.images_done,
             images_active: self.images_active,
+            queue_counts: [
+                (self.pending_queue.len().saturating_sub(self.queue_cursor), self.queue_bytes[0]),
+                (self.cpu_queues[0].len().saturating_sub(self.cpu_cursors[0]), self.queue_bytes[1]),
+                (self.cpu_queues[1].len().saturating_sub(self.cpu_cursors[1]), self.queue_bytes[2]),
+                (self.cpu_queues[2].len().saturating_sub(self.cpu_cursors[2]), self.queue_bytes[3]),
+            ],
+            queue_revision: self.queue_revision,
             slow_jobs,
             telemetry: TelemetryDto {
                 total_fps: total_fps.round() as i64,
@@ -520,8 +584,12 @@ impl Engine {
                 pending_queue: Vec::new(),
                 queue_cursor: 0,
                 static_gifs: HashSet::new(),
-                image_queue: Vec::new(),
-                image_cursor: 0,
+                cpu_queues: Default::default(),
+                cpu_cursors: [0; 3],
+                cpu_active: [0; 3],
+                stage_logged: [false; 3],
+                queue_bytes: [0; 4],
+                queue_revision: 0,
                 images_active: 0,
                 cpu_started: std::collections::HashMap::new(),
                 skipped_known: 0,
@@ -761,8 +829,8 @@ impl Engine {
             }
             inner.pending_queue.clear();
             inner.queue_cursor = 0;
-            inner.image_queue.clear();
-            inner.image_cursor = 0;
+            inner.cpu_queues = Default::default();
+            inner.cpu_cursors = [0; 3];
             inner.reset_run_tracking();
             inner.run = RunStats::default();
             inner.status = Status::Scanning;
@@ -822,10 +890,12 @@ impl Engine {
                     match inner.place(&file, size) {
                         Place::Video => {
                             inner.pending_queue.push(file.clone());
+                            inner.queue_bytes[0] += size;
+                            inner.queue_revision += 1;
                             videos += 1;
                         }
                         Place::Cpu => {
-                            inner.image_queue.push(file.clone());
+                            inner.queue_cpu(file.clone(), size);
                             cpu += 1;
                         }
                         _ => {}
@@ -869,7 +939,7 @@ impl Engine {
             inner.rebuild_queue();
             inner.run = RunStats::default();
             inner.status = Status::Ready;
-            (inner.skipped_known, inner.skipped_generated, inner.skipped_small_gifs, inner.pending_queue.len(), inner.image_queue.len(), inner.files.len())
+            (inner.skipped_known, inner.skipped_generated, inner.skipped_small_gifs, inner.pending_queue.len(), inner.cpu_total(), inner.files.len())
         };
         self.log(format!(
             "{} {total} files in {} ({videos} videos and {cpu} images, audio or documents to process)",
@@ -886,6 +956,57 @@ impl Engine {
             self.log(format!("{generated} generated or temporary files will be ignored"));
         }
         self.send_state(true);
+    }
+
+    /// The external tools found at start-up, and the missing ones.
+    pub fn tool_lists(&self) -> (Vec<&'static str>, Vec<&'static str>) {
+        image::tools::NAMES.iter().partition(|n| self.image_tools.has(n))
+    }
+
+    /// Empties the queue (nothing is deleted on disk). Not during a run.
+    pub fn clear_queue(self: &Arc<Self>) {
+        {
+            let mut inner = self.lock();
+            if inner.working || inner.status == Status::Scanning {
+                drop(inner);
+                self.log("Stop processing before clearing the queue");
+                return;
+            }
+            inner.dir = None;
+            inner.files.clear();
+            inner.file_sizes.clear();
+            inner.static_gifs.clear();
+            inner.pending_queue.clear();
+            inner.queue_cursor = 0;
+            inner.cpu_queues = Default::default();
+            inner.cpu_cursors = [0; 3];
+            inner.queue_bytes = [0; 4];
+            inner.queue_revision += 1;
+            inner.reset_run_tracking();
+            inner.run = RunStats::default();
+            inner.skipped_known = 0;
+            inner.skipped_generated = 0;
+            inner.skipped_small_gifs = 0;
+            inner.status = Status::Idle;
+        }
+        self.log("Queue cleared");
+        self.send_state(true);
+    }
+
+    /// The first `limit` files waiting, in processing order: (name, type, size).
+    pub fn queue_preview(&self, limit: usize) -> Vec<(String, &'static str, u64)> {
+        let inner = self.lock();
+        let mut picked: Vec<(&PathBuf, &'static str)> = Vec::new();
+        let videos = inner.pending_queue.iter().skip(inner.queue_cursor).map(|p| (p, "Video"));
+        let cpu = ["Audio", "Document", "Image"]
+            .iter()
+            .enumerate()
+            .flat_map(|(i, label)| inner.cpu_queues[i].iter().skip(inner.cpu_cursors[i]).map(move |p| (p, *label)));
+        picked.extend(videos.chain(cpu).take(limit));
+        let wanted: HashSet<&PathBuf> = picked.iter().map(|(p, _)| *p).collect();
+        let sizes: std::collections::HashMap<&PathBuf, u64> =
+            inner.files.iter().zip(&inner.file_sizes).filter(|(f, _)| wanted.contains(f)).map(|(f, s)| (f, *s)).collect();
+        picked.into_iter().map(|(p, kind)| (inner.display_name(p), kind, sizes.get(p).copied().unwrap_or(0))).collect()
     }
 
     // ---------------------------------------------------------------- batch control
@@ -951,8 +1072,8 @@ impl Engine {
             inner.stop_requested = false;
             self.paused.send_replace(false);
             inner.run = RunStats {
-                total: inner.pending_queue.len() + inner.image_queue.len(),
-                images_total: inner.image_queue.len(),
+                total: inner.pending_queue.len() + inner.cpu_total(),
+                images_total: inner.cpu_total(),
                 ..RunStats::default()
             };
             if inner.run.total > 0 {
@@ -974,7 +1095,7 @@ impl Engine {
 
         let (videos, images) = {
             let inner = self.lock();
-            (inner.pending_queue.len(), inner.image_queue.len())
+            (inner.pending_queue.len(), inner.cpu_total())
         };
         if videos > 0 {
             self.log(format!(
@@ -1005,6 +1126,8 @@ impl Engine {
             let mut inner = self.lock();
             inner.fatal = Arc::new(AtomicBool::new(false));
             inner.cpu = None;
+            inner.cpu_active = [0; 3];
+            inner.stage_logged = [false; 3];
             self.spawn_workers(&mut inner);
         }
         self.send_state(true);
@@ -1081,7 +1204,7 @@ impl Engine {
     /// Called with the lock held, at the start of a batch and when files are added to it.
     fn spawn_workers(self: &Arc<Self>, inner: &mut Inner) {
         let videos = inner.pending_queue.len().saturating_sub(inner.queue_cursor);
-        let cpu_files = inner.image_queue.len().saturating_sub(inner.image_cursor);
+        let cpu_files = inner.cpu_left();
         let want_video = (inner.options.concurrency as usize).min(videos + inner.video_ids.len());
         while inner.video_ids.len() < want_video {
             let id = (1..).find(|i| !inner.video_ids.contains(i)).unwrap_or(1);
@@ -1100,18 +1223,18 @@ impl Engine {
             Arc::clone(c)
         } else {
             {
-                // Leave some CPU for the desktop, and half of the rest for the video encoders'
-                // decoding (and their memory) while there are videos to encode. Slots beyond
-                // the worker count stay idle for big jobs (comic pages) to borrow.
+                // Leave some CPU for the desktop. The stages run after the videos (rolling), so
+                // they get every other core; slots beyond the active workers stay idle for big
+                // jobs (comic pages) to borrow.
                 let cores = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
-                let spare = cores.saturating_sub(2);
-                let slots = if videos > 0 { spare / 2 } else { spare }.max(1);
+                let slots = cores.saturating_sub(2).max(1);
                 let c = Arc::new(images::CpuCtx::new(self.image_ctx(&inner.options, slots, inner.cancel.clone()), &inner.options, slots));
                 inner.cpu = Some(Arc::clone(&c));
                 c
             }
         };
         let want_cpu = cpu.slots.min(cpu_files + inner.cpu_ids.len());
+        let _ = videos;
         while inner.cpu_ids.len() < want_cpu {
             let id = (1..).find(|i| !inner.cpu_ids.contains(i)).unwrap_or(1);
             inner.cpu_ids.insert(id);

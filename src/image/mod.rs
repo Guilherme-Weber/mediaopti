@@ -60,10 +60,23 @@ impl Kind {
         matches!(self, Kind::Doc | Kind::Cbz | Kind::Cbr)
     }
 
-    /// Converted to another format (the extension changes): only with the conversions option.
-    pub fn is_conversion(self) -> bool {
-        matches!(self, Kind::Wav | Kind::Bmp | Kind::Tga | Kind::Cbr)
+    /// Documents: PDF, Office/ODF/EPUB, comics.
+    pub fn is_document(self) -> bool {
+        matches!(self, Kind::Pdf | Kind::Doc | Kind::Cbz | Kind::Cbr)
     }
+
+    /// The CPU queue stage this kind runs in: 0 audio (disk-heavy, few at a time), 1 documents
+    /// (few at a time; their pages borrow idle CPU slots), 2 images (every CPU slot).
+    pub fn stage(self) -> usize {
+        if self.is_audio() {
+            0
+        } else if self.is_document() {
+            1
+        } else {
+            2
+        }
+    }
+
 }
 
 /// Files for the CPU workers, by extension (GIFs are routed separately: big animated ones

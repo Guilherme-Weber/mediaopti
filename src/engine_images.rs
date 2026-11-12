@@ -70,6 +70,19 @@ impl CpuCtx {
     }
 }
 
+/// How many CPU files of each stage run at once: audio (disk-heavy), documents (their
+/// pages borrow idle CPU slots), images (every slot).
+const STAGE_LIMITS: [usize; 3] = [2, 2, usize::MAX];
+
+enum CpuClaim {
+    /// A file, its stage, and the log line announcing a new stage.
+    File(PathBuf, usize, Option<String>),
+    /// An earlier stage still has files to start, or this stage is at its limit.
+    Wait,
+    /// Nothing left to start.
+    Done,
+}
+
 impl Inner {
     /// The CPU jobs' settings under the current options (a chosen temp folder that is gone
     /// falls back to the system one).
@@ -80,17 +93,47 @@ impl Inner {
         }
     }
 
-    fn claim_image(&mut self) -> Option<PathBuf> {
-        while self.image_cursor < self.image_queue.len() {
-            let candidate = self.image_queue[self.image_cursor].clone();
-            self.image_cursor += 1;
-            if !self.in_progress.contains(&candidate) && !self.failed.contains(&candidate) {
-                self.in_progress.insert(candidate.clone());
-                self.cpu_started.insert(candidate.clone(), std::time::Instant::now());
-                return Some(candidate);
-            }
+    /// The next CPU file, by stage (rolling): nothing while videos are still to be started,
+    /// then audio (at most `STAGE_LIMITS[0]` at once), then documents, then images. A stage
+    /// begins as soon as the one before has nothing left to start.
+    fn claim_cpu(&mut self) -> CpuClaim {
+        let videos_waiting = self.queue_cursor < self.pending_queue.len()
+            && !self.video_ids.is_empty()
+            && !self.fatal.load(std::sync::atomic::Ordering::SeqCst);
+        if videos_waiting {
+            return CpuClaim::Wait;
         }
-        None
+        for (stage, limit) in STAGE_LIMITS.into_iter().enumerate() {
+            let queue = &self.cpu_queues[stage];
+            let mut cursor = self.cpu_cursors[stage];
+            while cursor < queue.len() && (self.in_progress.contains(&queue[cursor]) || self.failed.contains(&queue[cursor])) {
+                cursor += 1;
+            }
+            self.cpu_cursors[stage] = cursor;
+            if cursor == self.cpu_queues[stage].len() {
+                continue;
+            }
+            if self.cpu_active[stage] >= limit {
+                return CpuClaim::Wait;
+            }
+            let file = self.cpu_queues[stage][cursor].clone();
+            self.cpu_cursors[stage] += 1;
+            self.cpu_active[stage] += 1;
+            self.in_progress.insert(file.clone());
+            self.cpu_started.insert(file.clone(), std::time::Instant::now());
+            let announce = (!self.stage_logged[stage]).then(|| {
+                self.stage_logged[stage] = true;
+                let left = self.cpu_queues[stage].len() - cursor;
+                let (what, how) = match stage {
+                    0 => ("audio files", format!("{} at a time (disk-heavy)", STAGE_LIMITS[0])),
+                    1 => ("documents", format!("{} at a time, their pages on idle cores", STAGE_LIMITS[1])),
+                    _ => ("images", "on every free core".to_string()),
+                };
+                format!("Now processing {left} {what}, {how}")
+            });
+            return CpuClaim::File(file, stage, announce);
+        }
+        CpuClaim::Done
     }
 }
 
@@ -178,22 +221,37 @@ impl Engine {
                 self.lock().cpu_ids.remove(&worker_id);
                 break;
             }
-            let (path, lossy, disposal, opts) = {
+            let claimed = {
                 let mut inner = self.lock();
                 if !inner.working || inner.stop_requested {
                     inner.cpu_ids.remove(&worker_id);
                     break;
                 }
-                // Leaving in the same lock as the empty check: files added later start a
-                // new worker.
-                let Some(path) = inner.claim_image() else {
-                    inner.cpu_ids.remove(&worker_id);
-                    break;
-                };
-                inner.images_active += 1;
-                let disposal = inner.disposal_for(&path);
-                (path.clone(), inner.lossy_for(&path), disposal, inner.job_opts())
+                match inner.claim_cpu() {
+                    CpuClaim::File(path, stage, announce) => {
+                        inner.images_active += 1;
+                        let disposal = inner.disposal_for(&path);
+                        Some((path.clone(), stage, announce, inner.lossy_for(&path), disposal, inner.job_opts()))
+                    }
+                    CpuClaim::Wait => None,
+                    // Leaving in the same lock as the empty check: files added later start
+                    // a new worker.
+                    CpuClaim::Done => {
+                        inner.cpu_ids.remove(&worker_id);
+                        break;
+                    }
+                }
             };
+            let Some((path, stage, announce, lossy, disposal, opts)) = claimed else {
+                tokio::select! {
+                    () = tokio::time::sleep(Duration::from_millis(300)) => {}
+                    () = cancel.cancelled() => {}
+                }
+                continue;
+            };
+            if let Some(line) = announce {
+                self.log(line);
+            }
             self.send_state(false);
             let (cpu2, p2) = (Arc::clone(&cpu), path.clone());
             let result = self
@@ -211,6 +269,8 @@ impl Engine {
                 })
                 .await;
             self.finish_image(&path, lossy, result);
+            let mut inner = self.lock();
+            inner.cpu_active[stage] = inner.cpu_active[stage].saturating_sub(1);
         }
     }
 
