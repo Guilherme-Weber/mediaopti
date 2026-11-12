@@ -752,14 +752,21 @@ fn wav_becomes_flac_only_when_safe() {
 
     let (engine, rec) = new_engine(&rt, &root, ff.clone());
     let raw = || RawOptions { originals: Some(2), convert: Some(1), audio: Some(1), ..opts("av1_nvenc", 1.0) };
-    rt.block_on(async {
-        engine.apply_options(raw());
-        engine.load_dir(media.clone()).await;
-        engine.clone().run_batch(raw()).await;
-    });
+    // Twice: same.wav and same.flac may run at the same time, and then the duplicate is left
+    // for the next run (one copy must never be replaced while the other is processed).
+    let mut made_smaller = 0;
+    for _ in 0..2 {
+        rt.block_on(async {
+            engine.apply_options(raw());
+            engine.load_dir(media.clone()).await;
+            engine.clone().run_batch(raw()).await;
+        });
+        made_smaller += engine.snapshot().compressed_this_run;
+    }
     let logs = rec.logs.lock().unwrap().join("\n");
+    assert!(!logs.contains("Failed"), "{logs}");
     // pcm and taken converted, same.flac re-encoded (an old encoder), same.wav a duplicate.
-    assert_eq!(engine.snapshot().compressed_this_run, 4, "{logs}");
+    assert_eq!(made_smaller, 4, "{logs}");
     let flac = media.join("pcm.flac");
     assert!(!pcm.exists() && flac.exists(), "{logs}");
     assert_eq!(std::fs::metadata(&flac).unwrap().modified().unwrap(), old, "date not kept");

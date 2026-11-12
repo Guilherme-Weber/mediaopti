@@ -96,6 +96,7 @@ impl Inner {
         JobOpts {
             temp: self.options.temp_dir.clone().filter(|d| d.is_dir()).unwrap_or_else(std::env::temp_dir),
             fix_ext: self.options.fix_ext,
+            busy: None,
         }
     }
 
@@ -259,13 +260,15 @@ impl Engine {
                     }
                 }
             };
-            let Some((path, stage, announce, lossy, disposal, opts)) = claimed else {
+            let Some((path, stage, announce, lossy, disposal, mut opts)) = claimed else {
                 tokio::select! {
                     () = tokio::time::sleep(Duration::from_millis(300)) => {}
                     () = cancel.cancelled() => {}
                 }
                 continue;
             };
+            let engine = Arc::clone(&self);
+            opts.busy = Some(Arc::new(move |p: &Path| engine.lock().in_progress.contains(p)));
             if let Some(line) = announce {
                 self.log(line);
             }
@@ -491,11 +494,17 @@ fn content_of(path: &Path) -> Option<(ContentHash, u64)> {
 
 /// Optimizes one image and, if worthwhile, replaces the original. Blocking.
 /// Per-run settings of the CPU jobs besides the image pipeline's.
+/// Answers "is another worker processing this file now?".
+pub(super) type BusyCheck = Arc<dyn Fn(&Path) -> bool + Send + Sync>;
+
 pub(super) struct JobOpts {
     /// Where work folders go first.
     pub temp: PathBuf,
     /// Rename pictures whose extension doesn't match their format.
     pub fix_ext: bool,
+    /// Whether another worker is processing a file now (a duplicate must not be replaced or
+    /// removed under it).
+    pub busy: Option<BusyCheck>,
 }
 
 /// Whether `existing` holds the same content as the original (`src`, its private copy):
@@ -598,6 +607,12 @@ pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, dispo
                     Err(RunError::Failed(e)) => return ImageResult::Failed(e),
                 };
                 if same {
+                    // The other copy is being processed right now (a.wav and a.flac in one
+                    // batch): leave both; they are compared again next time.
+                    if opts.busy.as_ref().is_some_and(|busy| busy(&target)) {
+                        let name = target.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                        return ImageResult::Skipped(format!("{name} has the same content and is being processed at the same time; compared next time"));
+                    }
                     return keep_smaller_copy(path, &target, smaller.as_ref(), before, disposal, worker_id);
                 }
             }

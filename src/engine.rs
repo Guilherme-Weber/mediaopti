@@ -1833,6 +1833,17 @@ impl Engine {
                             self.log_remove(&tmp);
                             return Outcome::Stopped;
                         }
+                        // The other copy is being encoded right now: leave both, compared next time.
+                        Ok(true) if self.lock().in_progress.contains(&final_target) => {
+                            self.log_remove(&tmp);
+                            self.lock().run.skipped_larger += 1;
+                            self.log(format!(
+                                "[Worker {worker_id}] Skipped {display}: {} has the same content and is being encoded at the same time; compared next time",
+                                final_target.file_name().unwrap_or_default().to_string_lossy()
+                            ));
+                            self.send_state(false);
+                            return Outcome::Skipped;
+                        }
                         Ok(true) => return self.keep_smaller_video(worker_id, &input, &final_target, &tmp, &display, in_size).await,
                         Ok(false) => {}
                     }
