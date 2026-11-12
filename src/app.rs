@@ -588,7 +588,7 @@ impl Controller {
         if processing && s.images_total_this_run > 0 {
             let total = s.images_total_this_run.max(1);
             workers.push(WorkerRow {
-                title: format!("Images · {} of {}", group_thousands(s.images_done_this_run), group_thousands(total)).into(),
+                title: format!("Audio, documents and images · {} of {}", group_thousands(s.images_done_this_run), group_thousands(total)).into(),
                 meta: format!("{} CPU workers busy", s.images_active).into(),
                 progress: s.images_done_this_run as f32 / total as f32,
             });

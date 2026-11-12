@@ -684,9 +684,21 @@ export component AppWindow inherits Window {
                             background: Theme.well-background;
                             border-radius: Theme.radius-small;
                             ListView {
+                                // Follows the newest line unless the user scrolled up; re-pinned
+                                // when lines arrive and when the view or its content resizes (rows
+                                // appearing in the progress card above change its height).
+                                property <bool> follow: true;
                                 property <int> revision: root.log-revision;
-                                changed revision => {
-                                    self.content-y = min(0px, self.visible-height - self.content-height);
+                                function pin() {
+                                    if (self.follow) {
+                                        self.content-y = min(0px, self.visible-height - self.content-height);
+                                    }
+                                }
+                                changed revision => { self.pin(); }
+                                changed visible-height => { self.pin(); }
+                                changed content-height => { self.pin(); }
+                                scrolled => {
+                                    self.follow = self.content-y <= self.visible-height - self.content-height + 4px;
                                 }
                                 for line in root.log-lines: HorizontalLayout {
                                     padding-left: 10px;

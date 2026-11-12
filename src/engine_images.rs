@@ -70,9 +70,12 @@ impl CpuCtx {
     }
 }
 
-/// How many CPU files of each stage run at once: audio (disk-heavy), documents (their
-/// pages borrow idle CPU slots), images (every slot).
-const STAGE_LIMITS: [usize; 3] = [2, 2, usize::MAX];
+/// How many CPU files of each stage run at once with `slots` CPU slots: audio 2 (disk-heavy),
+/// documents half the slots (CPU-bound, but a PDF's renders and qpdf use memory; comic pages
+/// borrow the idle slots), images every slot.
+fn stage_limits(slots: usize) -> [usize; 3] {
+    [2, (slots / 2).max(2), usize::MAX]
+}
 
 enum CpuClaim {
     /// A file, its stage, and the log line announcing a new stage.
@@ -103,7 +106,8 @@ impl Inner {
         if videos_waiting {
             return CpuClaim::Wait;
         }
-        for (stage, limit) in STAGE_LIMITS.into_iter().enumerate() {
+        let limits = stage_limits(self.cpu.as_ref().map_or(2, |c| c.slots));
+        for (stage, limit) in limits.into_iter().enumerate() {
             let queue = &self.cpu_queues[stage];
             let mut cursor = self.cpu_cursors[stage];
             while cursor < queue.len() && (self.in_progress.contains(&queue[cursor]) || self.failed.contains(&queue[cursor])) {
@@ -125,8 +129,8 @@ impl Inner {
                 self.stage_logged[stage] = true;
                 let left = self.cpu_queues[stage].len() - cursor;
                 let (what, how) = match stage {
-                    0 => ("audio files", format!("{} at a time (disk-heavy)", STAGE_LIMITS[0])),
-                    1 => ("documents", format!("{} at a time, their pages on idle cores", STAGE_LIMITS[1])),
+                    0 => ("audio files", format!("{} at a time (disk-heavy)", limits[0])),
+                    1 => ("documents", format!("{} at a time, comic pages on idle cores", limits[1])),
                     _ => ("images", "on every free core".to_string()),
                 };
                 format!("Now processing {left} {what}, {how}")
@@ -278,6 +282,11 @@ impl Engine {
         let mode = image::mode(lossy);
         let mut remembered = false;
         let mut log = None;
+        let tag = match image::kind_of(path).map(image::Kind::stage) {
+            Some(0) => "[Audio]",
+            Some(1) => "[Documents]",
+            _ => "[Images]",
+        };
         let progress = {
             let mut inner = self.lock();
             inner.images_active = inner.images_active.saturating_sub(1);
@@ -301,17 +310,22 @@ impl Engine {
                     inner.run.images_lossy += usize::from(lossy);
                     inner.space_saved_mb += (before - after) as f64 / (1024.0 * 1024.0);
                     remember(&mut inner, content);
-                    if let Some(new) = renamed {
-                        inner.history.add_image(&new, mode);
-                        log = Some(format!("[Images] Converted {display} to {}", new.file_name().unwrap_or_default().to_string_lossy()));
-                    }
+                    let saved = format!("{} ({:.0}%)", format_size(before - after), 100.0 * (before - after) as f64 / before.max(1) as f64);
+                    log = Some(match renamed {
+                        Some(new) => {
+                            inner.history.add_image(&new, mode);
+                            format!("{tag} Converted {display} to {}, saved {saved}", new.file_name().unwrap_or_default().to_string_lossy())
+                        }
+                        None => format!("{tag} Saved {saved} from {display}{}", if lossy { " (visually lossless)" } else { "" }),
+                    });
                 }
                 ImageResult::Kept { content, note } => {
                     inner.run.skipped_larger += 1;
                     remember(&mut inner, content);
-                    if let Some(note) = note {
-                        log = Some(format!("[Images] Skipped {display}: {note}"));
-                    }
+                    log = Some(match note {
+                        Some(note) => format!("{tag} Skipped {display}: {note}"),
+                        None => format!("{tag} Kept {display} (already optimal)"),
+                    });
                 }
                 ImageResult::Renamed { to, content } => {
                     inner.run.skipped_larger += 1;
@@ -320,7 +334,7 @@ impl Engine {
                         inner.history.add_content(hash, size, mode);
                     }
                     remembered = true;
-                    log = Some(format!("[Images] Renamed {display} to {} (its real format)", to.file_name().unwrap_or_default().to_string_lossy()));
+                    log = Some(format!("{tag} Renamed {display} to {} (its real format)", to.file_name().unwrap_or_default().to_string_lossy()));
                 }
                 ImageResult::Duplicate { before, kept, content, replaced } => {
                     inner.run.compressed += 1;
@@ -332,25 +346,25 @@ impl Engine {
                     remembered = true;
                     let name = kept.file_name().unwrap_or_default().to_string_lossy().into_owned();
                     log = Some(if replaced {
-                        format!("[Images] {display}: {name} had the same content; it now holds the smaller version and the original was removed")
+                        format!("{tag} {display}: {name} had the same content; it now holds the smaller version and the original was removed")
                     } else {
-                        format!("[Images] {display}: {name} already has the same content and is smaller; the original was removed")
+                        format!("{tag} {display}: {name} already has the same content and is smaller; the original was removed")
                     });
                 }
                 ImageResult::Skipped(why) => {
                     inner.run.skipped_larger += 1;
-                    log = Some(format!("[Images] Skipped {display}: {why}"));
+                    log = Some(format!("{tag} Skipped {display}: {why}"));
                 }
                 ImageResult::Failed(err) => {
                     inner.run.failed += 1;
                     inner.failed.insert(path.to_path_buf());
-                    log = Some(format!("[Images] Failed on {display}: {err}"));
+                    log = Some(format!("{tag} Failed on {display}: {err}"));
                 }
                 ImageResult::Stopped => {}
             }
             let r = &inner.run;
             (r.images_done.is_multiple_of(PROGRESS_EVERY) && r.images_done > 0)
-                .then(|| format!("[Images] {}/{} done, {:.0} MB saved so far", r.images_done, r.images_total, inner.space_saved_mb))
+                .then(|| format!("[Progress] {}/{} audio, documents and images done, {:.0} MB saved so far", r.images_done, r.images_total, inner.space_saved_mb))
         };
         if remembered {
             self.schedule_history_save();
@@ -435,6 +449,15 @@ fn max_parts() -> image::Max {
         }
     }
     image::Max::chosen()
+}
+
+/// "812 KB", "4.5 MB".
+fn format_size(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{} KB", bytes.div_ceil(1024))
+    }
 }
 
 fn content_of(path: &Path) -> Option<(ContentHash, u64)> {
