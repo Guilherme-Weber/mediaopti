@@ -51,15 +51,16 @@ files per second and drops its oldest items when full.
 
 ## External tools
 
-Image, audio and document optimizers are external programs. Install them with:
+Image, audio and document optimizers are external programs. The release zip includes them all
+except pingo and beeim, which are free for private use only and may not be redistributed. When
+they are missing, mediaopti downloads them from their author's site (css-ig.net) at start-up into
+`%APPDATA%\mediaopti\tools`. Missing tools are skipped; the **About** page lists what was found.
+
+For development, install the tools with:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/fetch-tools.ps1
 ```
-
-The open-source tools come from [Scoop](https://scoop.sh); cjpegli, OptiVorbis, pingo and beeim are
-downloaded. pingo and beeim are free for private use only and are never bundled. Missing tools are
-skipped; the **About** page lists what was found.
 
 ## Data
 
@@ -80,8 +81,7 @@ powershell -ExecutionPolicy Bypass -File scripts/package.ps1        # dist/media
 ```
 
 The release zip includes FFmpeg and the redistributable tools with their licences
-(`THIRD-PARTY.txt`). On another PC, run `fetch-tools.ps1 -NoScoop -Dest <folder>\tools` to add
-pingo and beeim.
+(`THIRD-PARTY.txt`); pingo and beeim are downloaded by the app itself.
 
 ## Credits and license
 

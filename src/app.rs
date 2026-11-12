@@ -758,6 +758,30 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
     window.set_tools_missing(missing.join(", ").into());
     window.set_data_dir(data_dir.to_string_lossy().as_ref().into());
 
+    // pingo and beeim may not be bundled: if they are missing, download them from their
+    // author's site in the background, then show the tools found again.
+    {
+        let engine = engine.clone();
+        let weak = window.as_weak();
+        std::thread::spawn(move || {
+            let lines = engine.download_missing_tools();
+            if lines.is_empty() {
+                return;
+            }
+            for line in lines {
+                engine.log(line);
+            }
+            let (found, missing) = engine.tool_lists();
+            let (found, missing) = (found.join(", "), missing.join(", "));
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(w) = weak.upgrade() {
+                    w.set_tools_found(found.as_str().into());
+                    w.set_tools_missing(missing.as_str().into());
+                }
+            });
+        });
+    }
+
     CONTROLLER.with(|c| {
         *c.borrow_mut() = Some(Controller {
             engine: engine.clone(),

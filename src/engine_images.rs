@@ -150,7 +150,7 @@ impl Engine {
     /// `slots`: how many tools may run at once (one per worker; idle ones are borrowed).
     pub(super) fn image_ctx(&self, options: &crate::args::Options, slots: usize, cancel: tokio_util::sync::CancellationToken) -> image::Ctx {
         image::Ctx {
-            tools: self.image_tools.clone(),
+            tools: self.tools(),
             lossy: options.images == crate::args::ImageMode::Lossy,
             target: 93.0,
             lossy_min_gain: 0.03,

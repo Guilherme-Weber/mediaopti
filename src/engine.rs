@@ -222,7 +222,9 @@ pub struct Engine {
     rt: tokio::runtime::Handle,
     ffmpeg_path: PathBuf,
     /// External image optimizers found at start-up.
-    image_tools: image::tools::Tools,
+    /// Found at start-up, found again after pingo/beeim are downloaded.
+    image_tools: Mutex<image::tools::Tools>,
+    data_dir: PathBuf,
     inner: Mutex<Inner>,
     emit: Mutex<EmitThrottle>,
     /// Serializes encoder start-up so memory checks see the previous encoder's usage.
@@ -606,7 +608,8 @@ impl Engine {
             ui,
             rt,
             ffmpeg_path,
-            image_tools,
+            image_tools: Mutex::new(image_tools),
+            data_dir: data_dir.to_path_buf(),
             inner: Mutex::new(Inner {
                 dir: None,
                 files: Vec::new(),
@@ -991,9 +994,26 @@ impl Engine {
         self.send_state(true);
     }
 
+    /// The external tools in use.
+    pub(crate) fn tools(&self) -> image::tools::Tools {
+        self.image_tools.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+
+    /// Downloads pingo and beeim if they are missing (they may not be bundled), then looks
+    /// for the tools again. Blocking; returns the log lines.
+    pub fn download_missing_tools(&self) -> Vec<String> {
+        let lines = image::tools::download_missing(&self.tools(), &self.data_dir);
+        if !lines.is_empty() {
+            let found = image::tools::Tools::discover(self.ffmpeg_path.clone(), &self.data_dir);
+            *self.image_tools.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = found;
+        }
+        lines
+    }
+
     /// The external tools found at start-up, and the missing ones.
     pub fn tool_lists(&self) -> (Vec<&'static str>, Vec<&'static str>) {
-        image::tools::NAMES.iter().partition(|n| self.image_tools.has(n))
+        let tools = self.tools();
+        image::tools::NAMES.iter().partition(|n| tools.has(n))
     }
 
     /// Empties the queue (nothing is deleted on disk). Not during a run.
@@ -1143,7 +1163,7 @@ impl Engine {
                 mode_label(options.images),
                 mode_label(options.audio)
             ));
-            self.log(self.image_tools.summary());
+            self.log(self.tools().summary());
         }
         // Keeps "running for" of long CPU files current when nothing else updates the window.
         let engine = Arc::clone(&self);

@@ -42,6 +42,8 @@ impl Tools {
             dirs.push(tools);
             dirs.extend(sub);
         }
+        // Tools downloaded by the app itself (pingo, beeim: see `download_missing`).
+        dirs.push(data_dir.join("tools"));
         dirs.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("bin"));
         if let Some(path) = std::env::var_os("PATH") {
             dirs.extend(std::env::split_paths(&path));
@@ -77,6 +79,113 @@ impl Tools {
             s.push_str(&format!(" | missing: {}", missing.join(", ")));
         }
         s
+    }
+}
+
+/// Tools that may not be redistributed (free for private use, by Cedric Louvrier): never
+/// bundled, downloaded from the author's site by the app when missing.
+pub const DOWNLOADED: &[(&str, &str)] = &[("pingo", "https://css-ig.net/bin/pingo.zip"), ("beeim", "https://css-ig.net/bin/beeim.zip")];
+
+/// Downloads the `DOWNLOADED` tools that `found` lacks into `<data_dir>\tools`, with Windows'
+/// own downloader (no extra program) and the zip reader the app already has. Returns one
+/// log line per tool. Blocking.
+pub fn download_missing(found: &Tools, data_dir: &Path) -> Vec<String> {
+    let dir = data_dir.join("tools");
+    let mut lines = Vec::new();
+    for (name, url) in DOWNLOADED.iter().filter(|(n, _)| !found.has(n)) {
+        lines.push(match download_tool(name, url, &dir) {
+            Ok(path) => format!("Downloaded {name} from css-ig.net to {}", path.display()),
+            Err(why) => format!("Could not download {name} ({why}); its steps are skipped (other tools are used)"),
+        });
+    }
+    lines
+}
+
+fn download_tool(name: &str, url: &str, dir: &Path) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let zip_path = dir.join(format!("{name}.download.zip"));
+    let exe_tmp = dir.join(format!("{name}.download.exe"));
+    let result = (|| {
+        url_download(url, &zip_path)?;
+        let file = std::fs::File::open(&zip_path).map_err(|e| e.to_string())?;
+        let mut archive = zip::ZipArchive::new(file).map_err(|_| "the download is not a zip file".to_string())?;
+        let wanted = format!("{name}.exe");
+        let index = (0..archive.len())
+            .find(|&i| {
+                archive.name_for_index(i).is_some_and(|n| {
+                    n.as_ref().is_ok_and(|n| Path::new(n.as_ref()).file_name().is_some_and(|f| f.to_string_lossy().eq_ignore_ascii_case(&wanted)))
+                })
+            })
+            .ok_or_else(|| format!("{wanted} is not in the download"))?;
+        let mut entry = archive.by_index(index).map_err(|e| e.to_string())?;
+        let mut data = Vec::new();
+        entry.read_to_end(&mut data).map_err(|e| e.to_string())?;
+        // A Windows program starts with "MZ".
+        if !data.starts_with(b"MZ") || data.len() < 64 * 1024 {
+            return Err(format!("{wanted} in the download is not a Windows program"));
+        }
+        std::fs::write(&exe_tmp, &data).map_err(|e| e.to_string())?;
+        let target = dir.join(&wanted);
+        std::fs::rename(&exe_tmp, &target).map_err(|e| e.to_string())?;
+        Ok(target)
+    })();
+    let _ = std::fs::remove_file(&zip_path);
+    let _ = std::fs::remove_file(&exe_tmp);
+    result
+}
+
+/// Downloads `url` to `to` with what Windows itself has: curl.exe (in System32 since
+/// Windows 10 1803), or else the URL moniker (urlmon). Both use the system's certificates.
+fn url_download(url: &str, to: &Path) -> Result<(), String> {
+    let curl = std::env::var_os("SystemRoot").map(|r| Path::new(&r).join("System32").join("curl.exe")).filter(|p| p.is_file());
+    if let Some(curl) = curl {
+        let mut cmd = Command::new(curl);
+        cmd.args(["--fail", "--location", "--silent", "--show-error", "--proto", "=https", "--max-time", "300", "--output"])
+            .arg(to)
+            .arg(url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // no console window
+        }
+        let out = cmd.output().map_err(|e| e.to_string())?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(if err.is_empty() { "the download failed".into() } else { err });
+    }
+    url_moniker_download(url, to)
+}
+
+fn url_moniker_download(url: &str, to: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let wide = |s: &std::ffi::OsStr| s.encode_wide().chain(std::iter::once(0)).collect::<Vec<u16>>();
+        let (u, t) = (wide(std::ffi::OsStr::new(url)), wide(to.as_os_str()));
+        // urlmon needs COM on the calling thread (a background thread here).
+        // SAFETY: plain COM set-up for this thread; undone below when it succeeded.
+        let com = unsafe { windows_sys::Win32::System::Com::CoInitializeEx(std::ptr::null(), windows_sys::Win32::System::Com::COINIT_APARTMENTTHREADED as u32) };
+        // SAFETY: both strings are NUL-terminated and live through the call; no callback.
+        let hr = unsafe { windows_sys::Win32::System::Com::Urlmon::URLDownloadToFileW(std::ptr::null_mut(), u.as_ptr(), t.as_ptr(), 0, std::ptr::null_mut()) };
+        if com >= 0 {
+            // SAFETY: balances the successful CoInitializeEx above.
+            unsafe { windows_sys::Win32::System::Com::CoUninitialize() };
+        }
+        if hr == 0 {
+            Ok(())
+        } else {
+            Err(format!("no connection or the site refused it, code {hr:#010x}"))
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (url, to);
+        Err("only on Windows".into())
     }
 }
 
@@ -355,6 +464,27 @@ mod tests {
         resume.join().unwrap();
         assert!(ran.as_ref().is_ok_and(|r| r.success), "{ran:?}");
         assert!(t.elapsed() >= Duration::from_millis(5900), "it ran while paused: {:?}", t.elapsed());
+    }
+
+    /// Downloads pingo and beeim from css-ig.net into a temp folder (network).
+    #[test]
+    #[ignore = "downloads pingo and beeim from css-ig.net"]
+    fn downloads_pingo_and_beeim() {
+        let dir = std::env::temp_dir().join(format!("mo-download-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let lines = download_missing(&Tools::default(), &dir);
+        println!("{lines:#?}");
+        for (name, _) in DOWNLOADED {
+            let got = std::fs::read(dir.join("tools").join(format!("{name}.exe"))).expect("downloaded");
+            let dev = Path::new(env!("CARGO_MANIFEST_DIR")).join("bin").join(format!("{name}.exe"));
+            if let Ok(known) = std::fs::read(dev) {
+                assert_eq!(got, known, "{name}: same file as the one fetch-tools.ps1 got");
+            }
+        }
+        let found = Tools::discover(PathBuf::from("ffmpeg"), &dir);
+        assert!(found.has("pingo") && found.has("beeim"), "found where the app looks");
+        assert!(download_missing(&found, &dir).is_empty(), "nothing to do once present");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
