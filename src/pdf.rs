@@ -254,7 +254,16 @@ fn optimize_images(ctx: &Ctx, src: &Path, work: &Path, lossy: bool) -> Result<Op
         .collect();
     let keep_ratio = 1.0 - ctx.lossy_min_gain;
     let (mut update, mut n_lossless, mut n_lossy) = (Map::new(), 0, 0);
+    if let Some(p) = &ctx.progress {
+        let images = objects.values().filter(|o| o.pointer("/stream/dict/~1Subtype").and_then(Value::as_str) == Some("/Image")).count();
+        p.set_total(images);
+    }
     for (n, (key, obj)) in objects.iter().enumerate() {
+        if let Some(p) = &ctx.progress {
+            if obj.pointer("/stream/dict/~1Subtype").and_then(Value::as_str) == Some("/Image") {
+                p.step();
+            }
+        }
         let (Some(dict), Some(file)) = (
             obj.pointer("/stream/dict").and_then(Value::as_object),
             obj.pointer("/stream/datafile").and_then(Value::as_str).map(PathBuf::from),
@@ -387,6 +396,7 @@ mod tests {
             gate: crate::image::tools::Gate::default(),
             max: crate::image::Max::default(),
             slots: None,
+            progress: None,
         })
     }
 

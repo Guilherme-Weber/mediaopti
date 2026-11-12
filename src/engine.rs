@@ -20,6 +20,8 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 use tokio_util::sync::CancellationToken;
 
 const STATE_THROTTLE: Duration = Duration::from_millis(250);
+/// Kept free on a video's drive besides room for its new version.
+const VIDEO_DISK_RESERVE: u64 = 4 * 1024 * 1024 * 1024;
 /// CPU files running at least this long get their own progress row.
 const SLOW_JOB_SECS: u64 = 15;
 const HISTORY_SAVE_DELAY: Duration = Duration::from_secs(2);
@@ -72,6 +74,9 @@ struct RunStats {
     images_total: usize,
     images_done: usize,
     images_lossy: usize,
+    /// CPU files by stage (audio, documents, images): queued this run, and finished.
+    stage_total: [usize; 3],
+    stage_done: [usize; 3],
 }
 
 #[derive(Clone, Debug)]
@@ -110,18 +115,27 @@ pub struct StateDto {
     pub skipped_larger_this_run: usize,
     pub failed_this_run: usize,
     pub space_saved_mb: f64,
-    pub images_total_this_run: usize,
-    pub images_done_this_run: usize,
-    /// Image workers busy right now.
-    pub images_active: usize,
     /// Files waiting, by type (videos, audio, documents, images): count and bytes.
     pub queue_counts: [(usize, u64); 4],
     /// Changes whenever the queue's content changes (the window then reloads its list).
     pub queue_revision: u64,
     /// CPU files running for a while (a big comic, a long FLAC): name and seconds so far,
     /// longest first.
-    pub slow_jobs: Vec<(String, u64)>,
+    pub slow_jobs: Vec<SlowJob>,
+    /// This run by type (videos, audio, documents, images): finished, total, running now.
+    pub type_progress: [(usize, usize, usize); 4],
+    /// CPU work is waiting for free memory.
+    pub cpu_waiting_memory: bool,
     pub telemetry: TelemetryDto,
+}
+
+/// A CPU file running for a while: its name, seconds so far, and its own progress (pages of
+/// a comic, images of a PDF) when known.
+#[derive(Clone, Debug)]
+pub struct SlowJob {
+    pub name: String,
+    pub secs: u64,
+    pub progress: Option<(usize, usize)>,
 }
 
 struct Inner {
@@ -147,6 +161,9 @@ struct Inner {
     images_active: usize,
     /// When each CPU file being processed was started.
     cpu_started: std::collections::HashMap<PathBuf, Instant>,
+    /// The progress of the CPU files that report it (comics, PDFs).
+    cpu_progress: std::collections::HashMap<PathBuf, Arc<image::tools::Progress>>,
+    cpu_waiting_memory: bool,
     skipped_known: usize,
     skipped_generated: usize,
     skipped_small_gifs: usize,
@@ -487,6 +504,8 @@ impl Inner {
         self.failed.clear();
         self.in_progress.clear();
         self.cpu_started.clear();
+        self.cpu_progress.clear();
+        self.cpu_waiting_memory = false;
         self.workers.clear();
         self.space_saved_mb = 0.0;
     }
@@ -516,14 +535,26 @@ impl Inner {
             })
             .collect();
 
-        let mut slow_jobs: Vec<(String, u64)> = self
+        let mut slow_jobs: Vec<SlowJob> = self
             .cpu_started
             .iter()
-            .map(|(p, t)| (self.display_name(p), t.elapsed().as_secs()))
-            .filter(|(_, secs)| *secs >= SLOW_JOB_SECS)
+            .filter(|(_, t)| t.elapsed().as_secs() >= SLOW_JOB_SECS)
+            .map(|(p, t)| SlowJob {
+                name: self.display_name(p),
+                secs: t.elapsed().as_secs(),
+                progress: self.cpu_progress.get(p).and_then(|pr| pr.get()),
+            })
             .collect();
-        slow_jobs.sort_by_key(|j| std::cmp::Reverse(j.1));
+        slow_jobs.sort_by_key(|j| std::cmp::Reverse(j.secs));
         slow_jobs.truncate(4);
+        let r = &self.run;
+        let videos_running = self.workers.len();
+        let type_progress = [
+            (r.completed.saturating_sub(r.images_done), r.total.saturating_sub(r.images_total), videos_running),
+            (r.stage_done[0], r.stage_total[0], self.cpu_active[0]),
+            (r.stage_done[1], r.stage_total[1], self.cpu_active[1]),
+            (r.stage_done[2], r.stage_total[2], self.cpu_active[2]),
+        ];
 
         StateDto {
             status: self.status,
@@ -540,9 +571,6 @@ impl Inner {
             skipped_larger_this_run: self.run.skipped_larger,
             failed_this_run: self.run.failed,
             space_saved_mb: round1(self.space_saved_mb),
-            images_total_this_run: self.run.images_total,
-            images_done_this_run: self.run.images_done,
-            images_active: self.images_active,
             queue_counts: [
                 (self.pending_queue.len().saturating_sub(self.queue_cursor), self.queue_bytes[0]),
                 (self.cpu_queues[0].len().saturating_sub(self.cpu_cursors[0]), self.queue_bytes[1]),
@@ -551,6 +579,8 @@ impl Inner {
             ],
             queue_revision: self.queue_revision,
             slow_jobs,
+            type_progress,
+            cpu_waiting_memory: self.cpu_waiting_memory,
             telemetry: TelemetryDto {
                 total_fps: total_fps.round() as i64,
                 total_speed: round1(total_speed),
@@ -592,6 +622,8 @@ impl Engine {
                 queue_revision: 0,
                 images_active: 0,
                 cpu_started: std::collections::HashMap::new(),
+                cpu_progress: std::collections::HashMap::new(),
+                cpu_waiting_memory: false,
                 skipped_known: 0,
                 skipped_generated: 0,
                 skipped_small_gifs: 0,
@@ -895,6 +927,7 @@ impl Engine {
                             videos += 1;
                         }
                         Place::Cpu => {
+                            inner.run.stage_total[cpu_stage(&file)] += 1;
                             inner.queue_cpu(file.clone(), size);
                             cpu += 1;
                         }
@@ -1074,6 +1107,7 @@ impl Engine {
             inner.run = RunStats {
                 total: inner.pending_queue.len() + inner.cpu_total(),
                 images_total: inner.cpu_total(),
+                stage_total: [inner.cpu_queues[0].len(), inner.cpu_queues[1].len(), inner.cpu_queues[2].len()],
                 ..RunStats::default()
             };
             if inner.run.total > 0 {
@@ -1479,6 +1513,26 @@ impl Engine {
         let (source_state, links) = self
             .blocking(move || (file_state(&path), system::hard_link_count(&path).unwrap_or(1)))
             .await;
+        // Like the CPU files' work folders: the new version (and the quality retry's second
+        // one) is written next to the original, so its drive needs room for about twice it.
+        let size = source_state.map_or(0, |s| s.0);
+        let free = system::free_space(input.parent().unwrap_or(&input));
+        if free.is_some_and(|f| f < size.saturating_mul(2) + VIDEO_DISK_RESERVE) {
+            {
+                let mut inner = self.lock();
+                inner.in_progress.remove(&input);
+                inner.run.completed += 1;
+                inner.run.skipped_larger += 1;
+            }
+            let gb = |b: u64| b as f64 / 1_073_741_824.0;
+            self.log(format!(
+                "[Worker {worker_id}] Skipped {display}: its drive has {:.1} GB free, about {:.1} GB is needed (it will be tried next time)",
+                gb(free.unwrap_or(0)),
+                gb(size.saturating_mul(2) + VIDEO_DISK_RESERVE)
+            ));
+            self.send_state(false);
+            return Outcome::Skipped;
+        }
         if links > 1 {
             self.lock().in_progress.remove(&input);
             {

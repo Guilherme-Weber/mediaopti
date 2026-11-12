@@ -136,6 +136,29 @@ impl Gate {
     }
 }
 
+/// Progress inside one job (a comic's pages, a PDF's images), shown next to its name.
+#[derive(Debug, Default)]
+pub struct Progress {
+    pub done: std::sync::atomic::AtomicUsize,
+    pub total: std::sync::atomic::AtomicUsize,
+}
+
+impl Progress {
+    pub fn set_total(&self, n: usize) {
+        self.total.store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn step(&self) {
+        self.done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// (done, total), or `None` before a total is known.
+    pub fn get(&self) -> Option<(usize, usize)> {
+        let total = self.total.load(std::sync::atomic::Ordering::Relaxed);
+        (total > 0).then(|| (self.done.load(std::sync::atomic::Ordering::Relaxed).min(total), total))
+    }
+}
+
 /// CPU slots shared by the image workers: each file being processed holds one, and a job
 /// with many parts (a comic's pages) borrows the idle ones, so the parts run in parallel
 /// without ever running more tools at once than there are workers.

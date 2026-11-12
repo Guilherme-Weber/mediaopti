@@ -78,6 +78,8 @@ fn inner_ctx(ctx: &Ctx, kind: Kind) -> Ctx {
         gate: ctx.gate.clone(),
         max: ctx.max,
         slots: ctx.slots.clone(),
+        // Pages count on the archive's own progress (see `optimize_pages`).
+        progress: None,
     }
 }
 
@@ -122,7 +124,7 @@ type Done = (usize, Vec<u8>, Vec<String>);
 /// Optimizes a batch of pictures: on this job's own thread plus the image workers' idle CPU
 /// slots (a comic's pages then use the whole CPU near the end of a run). Returns, per page,
 /// its index, bytes (optimized or not) and steps.
-fn optimize_pages(ictx: &Ctx, pages: Vec<Page>, work: &Path) -> Result<Vec<Done>, RunError> {
+fn optimize_pages(ictx: &Ctx, pages: Vec<Page>, work: &Path, progress: Option<&image::tools::Progress>) -> Result<Vec<Done>, RunError> {
     let mut extra = 0;
     if let Some(slots) = &ictx.slots {
         let commit = crate::system::memory_status().map_or(u64::MAX, |m| m.available_commit);
@@ -143,7 +145,11 @@ fn optimize_pages(ictx: &Ctx, pages: Vec<Page>, work: &Path) -> Result<Vec<Done>
                     failure.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert(RunError::Cancelled);
                     break;
                 }
-                match optimize_entry(ictx, kind, &data, &work.join(format!("z{idx}"))) {
+                let r = optimize_entry(ictx, kind, &data, &work.join(format!("z{idx}")));
+                if let Some(p) = progress {
+                    p.step();
+                }
+                match r {
                     Ok(better) => {
                         let (bytes, steps) = better.unwrap_or((data, Vec::new()));
                         results.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((idx, bytes, steps));
@@ -218,6 +224,10 @@ fn repack(ctx: &Ctx, kind: Kind, src: &Path, work: &Path) -> Result<Optimized, E
         }
     }
     let ictx = inner_ctx(ctx, kind);
+    if let Some(p) = &ctx.progress {
+        let pictures = (0..zin.len()).filter(|&i| zin.name_for_index(i).is_some_and(|n| n.as_ref().is_ok_and(|n| image_kind(n).is_some()))).count();
+        p.set_total(pictures);
+    }
     let out = work.join(format!("repack.{}", crate::args::ext_lower(src)));
     let mut zout = ZipWriter::new(BufWriter::new(File::create(&out)?));
     zout.set_raw_comment(zin.comment().into())?;
@@ -238,7 +248,7 @@ fn repack(ctx: &Ctx, kind: Kind, src: &Path, work: &Path) -> Result<Optimized, E
             end += 1;
         }
         let mut done: HashMap<usize, (Vec<u8>, Vec<String>)> =
-            optimize_pages(&ictx, pages, work)?.into_iter().map(|(i, b, s)| (i, (b, s))).collect();
+            optimize_pages(&ictx, pages, work, ctx.progress.as_deref())?.into_iter().map(|(i, b, s)| (i, (b, s))).collect();
         // ...then write the entries of the batch in their order.
         for i in start..end {
             let mut f = zin.by_index(i)?;
@@ -394,6 +404,9 @@ fn cbr(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, Error> {
         return Ok(Optimized::skipped("7-Zip could not extract it"));
     }
     let ictx = inner_ctx(ctx, Kind::Cbr);
+    if let Some(p) = &ctx.progress {
+        p.set_total(files.iter().filter(|e| image_kind(&e.path).is_some()).count());
+    }
     let out = work.join("out.cbz");
     let mut zout = ZipWriter::new(BufWriter::new(File::create(&out)?));
     let (mut expected, mut n_img, mut steps) = (Vec::new(), 0, BTreeSet::new());
@@ -415,7 +428,7 @@ fn cbr(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, Error> {
         // ...optimize its pictures together, then write the files in their order.
         let (pages, others): (Vec<_>, Vec<_>) = batch.into_iter().partition(|(j, _)| image_kind(&files[*j].path).is_some());
         let pages = pages.into_iter().filter_map(|(j, d)| Some((j, image_kind(&files[j].path)?, d))).collect();
-        let mut ready = optimize_pages(&ictx, pages, work)?;
+        let mut ready = optimize_pages(&ictx, pages, work, ctx.progress.as_deref())?;
         ready.extend(others.into_iter().map(|(j, d)| (j, d, Vec::new())));
         ready.sort_by_key(|r| r.0);
         for (j, data, s) in ready {
@@ -477,6 +490,7 @@ mod tests {
             gate: crate::image::tools::Gate::default(),
             max: crate::image::Max::default(),
             slots: None,
+            progress: None,
         })
     }
 
@@ -565,6 +579,8 @@ mod tests {
         let slots = crate::image::tools::Slots::new(4);
         assert!(slots.acquire(&c.gate), "the job's own slot");
         c.slots = Some(slots.clone());
+        let progress = std::sync::Arc::new(crate::image::tools::Progress::default());
+        c.progress = Some(progress.clone());
         let dir = std::env::temp_dir().join(format!("mo-comic-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -595,6 +611,7 @@ mod tests {
         }
         assert!(r.steps[0].contains(&format!("[{pages} img")), "{:?}", r.steps);
         assert_eq!(slots.borrow_idle(10), 3, "borrowed slots returned");
+        assert_eq!(progress.get(), Some((pages, pages)), "every page counted");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

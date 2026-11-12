@@ -568,37 +568,53 @@ impl Controller {
             _ => "mediaopti".to_string(),
         }
         .into());
-        let mut workers: Vec<WorkerRow> = if processing {
-            t.workers
-                .iter()
-                .map(|wk| WorkerRow {
-                    title: format!("Worker {} · {}", wk.worker_id, wk.file).into(),
-                    meta: if wk.fps > 0 {
-                        format!("{}% · {} fps ({}x)", wk.percent, wk.fps, wk.speed)
-                    } else {
-                        format!("{}%", wk.percent)
-                    }
-                    .into(),
-                    progress: wk.percent as f32 / 100.0,
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        if processing && s.images_total_this_run > 0 {
-            let total = s.images_total_this_run.max(1);
-            workers.push(WorkerRow {
-                title: format!("Audio, documents and images · {} of {}", group_thousands(s.images_done_this_run), group_thousands(total)).into(),
-                meta: format!("{} CPU workers busy", s.images_active).into(),
-                progress: s.images_done_this_run as f32 / total as f32,
-            });
+        // Rows: all files, then each type of this run (finished of total), then the files
+        // being worked on (video encodes with their %, long CPU files with their pages).
+        let mut workers: Vec<WorkerRow> = Vec::new();
+        if processing {
+            let row = |title: String, done: usize, total: usize, meta: String| WorkerRow {
+                title: format!("{title} · {} of {}", group_thousands(done), group_thousands(total)).into(),
+                meta: meta.into(),
+                progress: if total == 0 { 0.0 } else { done as f32 / total as f32 },
+            };
+            let running: usize = s.type_progress.iter().map(|t| t.2).sum();
+            workers.push(row("All files".into(), s.completed_this_run, s.run_total, format!("{running} running")));
+            let names = [("Videos", "encoding"), ("Audio", "running"), ("Documents", "running"), ("Images", "running")];
+            for (i, ((name, verb), (done, total, active))) in names.iter().zip(s.type_progress).enumerate() {
+                if total == 0 {
+                    continue;
+                }
+                let meta = if done >= total {
+                    "done".to_string()
+                } else if i > 0 && s.cpu_waiting_memory && active == 0 {
+                    "waiting for memory".to_string()
+                } else if active > 0 {
+                    format!("{active} {verb}")
+                } else if i > 0 {
+                    "waiting for its turn".to_string()
+                } else {
+                    String::new()
+                };
+                workers.push(row((*name).into(), done, total, meta));
+            }
+            workers.extend(t.workers.iter().map(|wk| WorkerRow {
+                title: format!("Worker {} · {}", wk.worker_id, wk.file).into(),
+                meta: if wk.fps > 0 {
+                    format!("{}% · {} fps ({}x)", wk.percent, wk.fps, wk.speed)
+                } else {
+                    format!("{}%", wk.percent)
+                }
+                .into(),
+                progress: wk.percent as f32 / 100.0,
+            }));
             // Long single files (a big comic, a long FLAC) would otherwise look stuck.
-            for (name, secs) in &s.slow_jobs {
-                workers.push(WorkerRow {
-                    title: format!("CPU · {name}").into(),
-                    meta: format!("running for {}", format_duration(std::time::Duration::from_secs(*secs))).into(),
-                    progress: 0.0,
-                });
+            for job in &s.slow_jobs {
+                let time = format_duration(std::time::Duration::from_secs(job.secs));
+                let (meta, progress) = match job.progress {
+                    Some((done, total)) => (format!("{done} of {total} pictures · {time}"), done as f32 / total.max(1) as f32),
+                    None => (format!("running for {time}"), 0.0),
+                };
+                workers.push(WorkerRow { title: format!("CPU · {}", job.name).into(), meta: meta.into(), progress });
             }
         }
         sync_model(&self.worker_model, workers);

@@ -573,8 +573,8 @@ fn images_and_videos_in_one_batch() {
     let logs = rec.logs.lock().unwrap().join("\n");
     println!("{logs}");
     let s = engine.snapshot();
-    assert_eq!(s.images_total_this_run, 3, "{logs}");
-    assert_eq!(s.images_done_this_run, 3, "{logs}");
+    let cpu = |t: &[(usize, usize, usize); 4]| t[1..].iter().fold((0, 0), |a, x| (a.0 + x.0, a.1 + x.1));
+    assert_eq!(cpu(&s.type_progress), (3, 3), "{logs}");
     assert_eq!(s.compressed_this_run, 3, "video + PNG + JPEG: {logs}");
     assert!(std::fs::metadata(&png).unwrap().len() < png_before, "{logs}");
     let jpg_meta = std::fs::metadata(&jpg).unwrap();
@@ -649,8 +649,8 @@ fn bench_folder() {
     }
     println!(
         "{} images in {secs:.0}s ({:.2} s/image wall), {:.1} MB -> {:.1} MB ({:.2}% saved)",
-        s.images_done_this_run,
-        secs / s.images_done_this_run.max(1) as f64,
+        s.type_progress[1..].iter().map(|t| t.0).sum::<usize>(),
+        secs / s.type_progress[1..].iter().map(|t| t.0).sum::<usize>().max(1) as f64,
         before as f64 / 1048576.0,
         after as f64 / 1048576.0,
         100.0 * (before - after) as f64 / before as f64
@@ -875,7 +875,7 @@ fn real_folder_run() {
     let s = engine.snapshot();
     println!(
         "== {:.0}s | done {} (images {}) | smaller {} | kept {} | failed {} | saved {} MB",
-        t.elapsed().as_secs_f64(), s.completed_this_run, s.images_done_this_run,
+        t.elapsed().as_secs_f64(), s.completed_this_run, s.type_progress[1..].iter().map(|t| t.0).sum::<usize>(),
         s.compressed_this_run, s.skipped_larger_this_run, s.failed_this_run, s.space_saved_mb
     );
 }
@@ -980,6 +980,9 @@ fn queue_runs_in_stages_and_types_can_be_skipped() {
     let logs = rec.logs.lock().unwrap().join("\n");
     let at = |needle: &str| logs.find(needle).unwrap_or_else(|| panic!("no '{needle}' in:\n{logs}"));
     assert!(at("Now processing 2 audio files") < at("Now processing 2 images"), "{logs}");
-    assert_eq!(engine.snapshot().failed_this_run, 0, "{logs}");
+    let s = engine.snapshot();
+    assert_eq!(s.failed_this_run, 0, "{logs}");
+    // Each type finished all of its files.
+    assert_eq!(s.type_progress.map(|t| (t.0, t.1)), [(1, 1), (2, 2), (0, 0), (2, 2)], "{logs}");
     let _ = std::fs::remove_dir_all(&root);
 }

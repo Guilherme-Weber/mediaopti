@@ -46,7 +46,10 @@ pub(super) enum ImageResult {
     /// A file with the same content already had the new name: the smaller copy (`kept`) stays,
     /// the original is gone; `before` bytes were freed. `replaced`: the new version replaced it.
     Duplicate { before: u64, kept: PathBuf, content: Option<(ContentHash, u64)>, replaced: bool },
+    /// Could not be done (disk, permissions): not remembered, tried again next run.
     Failed(String),
+    /// Processing this file failed: remembered, not retried.
+    Broken(String),
     Stopped,
 }
 
@@ -158,6 +161,7 @@ impl Engine {
             gate: image::tools::Gate::new(cancel, Some(self.paused.subscribe())),
             max: max_parts(),
             slots: (slots > 1).then(|| image::tools::Slots::new(slots)),
+            progress: None,
         }
     }
 
@@ -197,6 +201,7 @@ impl Engine {
             let mut inner = self.lock();
             inner.images_active += 1; // finish_image decrements it
             inner.run.images_total += 1;
+            inner.run.stage_total[2] += 1;
             inner.run.completed = inner.run.completed.saturating_sub(1);
         }
         self.finish_image(input, lossy, result);
@@ -208,8 +213,16 @@ impl Engine {
     async fn wait_for_image_memory(&self, cancel: &tokio_util::sync::CancellationToken) -> bool {
         loop {
             let busy = self.lock().images_active;
-            if busy == 0 || system::memory_status().is_none_or(|m| m.available_commit >= IMAGE_MIN_FREE_COMMIT) {
+            let memory = system::memory_status();
+            if busy == 0 || memory.is_none_or(|m| m.available_commit >= IMAGE_MIN_FREE_COMMIT) {
+                self.lock().cpu_waiting_memory = false;
                 return true;
+            }
+            // Shown like a video waiting for memory: once in the log, and on its progress row.
+            let first = !std::mem::replace(&mut self.lock().cpu_waiting_memory, true);
+            if first {
+                let free = memory.map_or(0.0, |m| m.available_commit as f64 / 1_073_741_824.0);
+                self.log(format!("[Memory] CPU work waits for free memory ({free:.1} GB available, 2 GB needed per new file)"));
             }
             tokio::select! {
                 () = tokio::time::sleep(Duration::from_secs(1)) => {}
@@ -257,10 +270,12 @@ impl Engine {
                 self.log(line);
             }
             self.send_state(false);
+            let progress = Arc::new(image::tools::Progress::default());
+            self.lock().cpu_progress.insert(path.clone(), Arc::clone(&progress));
             let (cpu2, p2) = (Arc::clone(&cpu), path.clone());
             let result = self
                 .blocking(move || {
-                    let ctx2 = cpu2.for_file(&p2);
+                    let ctx2 = &image::Ctx { progress: Some(progress), ..cpu2.for_file(&p2).clone() };
                     // A slot is free unless a big job borrowed it: then wait for it back.
                     if ctx2.slots.as_ref().is_some_and(|s| !s.acquire(&ctx2.gate)) {
                         return ImageResult::Stopped;
@@ -296,7 +311,10 @@ impl Engine {
             if !matches!(result, ImageResult::Stopped) {
                 inner.run.completed += 1;
                 inner.run.images_done += 1;
+                let stage = image::kind_of(path).map_or(2, image::Kind::stage);
+                inner.run.stage_done[stage] += 1;
             }
+            inner.cpu_progress.remove(path);
             let mut remember = |inner: &mut Inner, content: Option<(ContentHash, u64)>| {
                 inner.history.add_image(path, mode);
                 if let Some((hash, size)) = content {
@@ -359,6 +377,12 @@ impl Engine {
                     inner.run.failed += 1;
                     inner.failed.insert(path.to_path_buf());
                     log = Some(format!("{tag} Failed on {display}: {err}"));
+                }
+                ImageResult::Broken(err) => {
+                    inner.run.failed += 1;
+                    inner.failed.insert(path.to_path_buf());
+                    remember(&mut inner, None);
+                    log = Some(format!("{tag} Failed on {display}: {err} (remembered in history, will not retry)"));
                 }
                 ImageResult::Stopped => {}
             }
@@ -539,7 +563,9 @@ pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, dispo
     let result = match image::optimize(ctx, kind, &src, &work) {
         Ok(r) => r,
         Err(RunError::Cancelled) => return ImageResult::Stopped,
-        Err(RunError::Failed(err)) => return ImageResult::Failed(err),
+        // The file itself couldn't be processed (a tool failed on it): remembered, like a
+        // video whose encode failed, so it isn't retried on every run.
+        Err(RunError::Failed(err)) => return ImageResult::Broken(err),
     };
     // At least 0.5% smaller. Audio also counts 64 KiB: cover art is a small part of a
     // song, but its saving is lossless and verified, and adds up over a music library.

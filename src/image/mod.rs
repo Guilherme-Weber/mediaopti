@@ -279,6 +279,8 @@ pub struct Ctx {
     pub max: Max,
     /// The image workers' CPU slots (borrowed by jobs with many parts), if shared.
     pub slots: Option<std::sync::Arc<tools::Slots>>,
+    /// This job's progress (pages of a comic, images of a PDF), if someone shows it.
+    pub progress: Option<std::sync::Arc<tools::Progress>>,
 }
 
 pub struct Optimized {
@@ -817,6 +819,7 @@ mod tests {
             gate: tools::Gate::default(),
             max: crate::image::Max::default(),
             slots: None,
+            progress: None,
         }
     }
 
