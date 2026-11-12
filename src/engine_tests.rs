@@ -970,7 +970,7 @@ fn queue_runs_in_stages_and_types_can_be_skipped() {
 
     // Everything on: audio first, images after (the CPU stages start once no video is left to
     // start; the video worker logs its file a moment after claiming it).
-    let (engine, rec) = new_engine(&rt, &root, ff.clone());
+    let (engine, rec) = new_engine(&rt, &root, ff);
     let all = || RawOptions { images: Some(1), audio: Some(1), convert: Some(1), ..opts("av1_nvenc", 1.0) };
     rt.block_on(async {
         engine.apply_options(all());
