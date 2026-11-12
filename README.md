@@ -87,3 +87,6 @@ pingo and beeim.
 
 Based on [batchviproc](https://github.com/kachurovskiy/batchviproc) by Maxim Kachurovskiy. MIT
 License, see [LICENSE](LICENSE). FFmpeg and the bundled tools keep their own licenses.
+
+Developed with the help of [Claude Code](https://www.anthropic.com/claude-code), Anthropic's AI
+coding assistant.

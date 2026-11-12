@@ -10,13 +10,6 @@
 logs/
 *.exe
 
-# AI assistant tooling (skills, local agent settings and notes) - not part of the project
-/.agents/
-/.claude/
-/skills-lock.json
-CLAUDE.local.md
-devrel-context.md
-
 # Editors and OS
 .vscode/
 .idea/
