@@ -242,6 +242,7 @@ component NavItem inherits Rectangle {
     in property <string> glyph;
     in property <string> text;
     in property <bool> selected;
+    in property <bool> compact;
     callback clicked();
     height: 40px;
     border-radius: Theme.radius-small;
@@ -263,7 +264,7 @@ component NavItem inherits Rectangle {
         padding-right: 10px;
         spacing: 14px;
         Glyph { glyph: root.glyph; font-size: 16px; width: 18px; color: Theme.text; }
-        Text { text: root.text; font-size: 14px; color: Theme.text; vertical-alignment: center; }
+        if !root.compact: Text { text: root.text; font-size: 14px; color: Theme.text; vertical-alignment: center; }
     }
     touch := TouchArea {
         mouse-cursor: pointer;
@@ -461,6 +462,11 @@ export component AppWindow inherits Window {
     in property <bool> drop-hover;
     // 0 = queue, 1 = settings, 2 = about.
     in-out property <int> page: 0;
+    // The side navigation shows only icons.
+    in-out property <bool> nav-compact;
+    callback nav-toggled();
+    // Flipped by Rust to make the software renderer repaint the whole window.
+    in property <bool> repaint-all;
 
     callback choose-folder();
     callback start();
@@ -484,15 +490,26 @@ export component AppWindow inherits Window {
     HorizontalLayout {
         // ---- navigation pane
         Rectangle {
-            width: 220px;
+            width: root.nav-compact ? 64px : 220px;
             background: #1C1C1C;
             VerticalLayout {
                 padding: 8px;
-                padding-top: 16px;
+                padding-top: 10px;
                 spacing: 4px;
-                HorizontalLayout {
+                // The menu button switches between icons only and icons with names.
+                NavItem {
+                    glyph: "\u{E700}";
+                    text: root.nav-compact ? "Show names" : "Hide names";
+                    compact: true;
+                    clicked => {
+                        root.nav-compact = !root.nav-compact;
+                        root.nav-toggled();
+                    }
+                }
+                if !root.nav-compact: HorizontalLayout {
                     padding-left: 10px;
-                    padding-bottom: 14px;
+                    padding-top: 4px;
+                    padding-bottom: 10px;
                     spacing: 10px;
                     Image { source: @image-url("../assets/icon.png"); width: 28px; height: 28px; }
                     VerticalLayout {
@@ -501,10 +518,10 @@ export component AppWindow inherits Window {
                         Text { text: "Batch media optimizer"; font-size: 11px; color: Theme.text-tertiary; }
                     }
                 }
-                NavItem { glyph: "\u{E8FD}"; text: "Queue"; selected: root.page == 0; clicked => { root.page = 0; } }
+                NavItem { glyph: "\u{E8FD}"; text: "Queue"; compact: root.nav-compact; selected: root.page == 0; clicked => { root.page = 0; } }
                 Rectangle { vertical-stretch: 1; }
-                NavItem { glyph: "\u{E713}"; text: "Settings"; selected: root.page == 1; clicked => { root.page = 1; } }
-                NavItem { glyph: "\u{E946}"; text: "About"; selected: root.page == 2; clicked => { root.page = 2; } }
+                NavItem { glyph: "\u{E713}"; text: "Settings"; compact: root.nav-compact; selected: root.page == 1; clicked => { root.page = 1; } }
+                NavItem { glyph: "\u{E946}"; text: "About"; compact: root.nav-compact; selected: root.page == 2; clicked => { root.page = 2; } }
             }
         }
 
@@ -1137,6 +1154,16 @@ export component AppWindow inherits Window {
                 }
             }
         }
+    }
+
+    // Covers the window with an invisible tint that changes when `repaint-all` flips, so the
+    // whole window is redrawn (it takes no input).
+    Rectangle {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        background: root.repaint-all ? #00000001 : #00000000;
     }
 
     // While files are dragged over the window: where they will go.

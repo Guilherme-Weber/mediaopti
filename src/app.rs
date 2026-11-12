@@ -112,6 +112,8 @@ struct Prefs {
     temp_dir: String,
     /// 1 = rename misnamed pictures (a JPEG called .png) to their real format.
     fix_ext: u32,
+    /// The side navigation shows only icons.
+    nav_compact: bool,
 }
 
 impl Default for Prefs {
@@ -137,6 +139,7 @@ impl Default for Prefs {
             audio: 2,
             temp_dir: String::new(),
             fix_ext: 0,
+            nav_compact: false,
         }
     }
 }
@@ -195,6 +198,7 @@ impl Prefs {
             audio: AUDIO[pick(w.get_audio_index(), AUDIO.len())].0,
             temp_dir: w.get_temp_dir().into(),
             fix_ext: FIX_EXT[pick(w.get_fix_ext_index(), FIX_EXT.len())].0,
+            nav_compact: w.get_nav_compact(),
         }
     }
 
@@ -222,6 +226,7 @@ impl Prefs {
         w.set_audio_index(position(AUDIO, &self.audio, &d.audio));
         w.set_temp_dir(self.temp_dir.as_str().into());
         w.set_fix_ext_index(position(FIX_EXT, &self.fix_ext, &d.fix_ext));
+        w.set_nav_compact(self.nav_compact);
     }
 
     fn to_raw(&self) -> RawOptions {
@@ -505,7 +510,7 @@ impl Controller {
             "Paused".into()
         } else if processing && t.total_fps > 0 {
             format!("{} fps ({}x)", t.total_fps, t.total_speed)
-        } else if processing {
+        } else if processing && s.type_progress[0].0 < s.type_progress[0].1 {
             "Starting…".into()
         } else {
             "—".into()
@@ -547,14 +552,17 @@ impl Controller {
         // While processing, the worker rows name the files; this line gives the time.
         w.set_current_file(if processing {
             let elapsed = format_duration(self.clock.elapsed());
-            let mut left = plural(s.run_total.saturating_sub(s.completed_this_run), "file", "files") + " left";
-            if let Some(eta) = format_eta(self.clock.elapsed(), fraction) {
-                left = format!("{left} ({eta})");
-            }
+            let running: usize = s.type_progress.iter().map(|t| t.2).sum();
+            let files = format!(
+                "All files · {} of {} · {running} running",
+                group_thousands(s.completed_this_run),
+                group_thousands(s.run_total)
+            );
+            let left = format_eta(self.clock.elapsed(), fraction).map(|eta| format!(" · {eta} left")).unwrap_or_default();
             match s.status {
-                Status::Paused => format!("Paused · {elapsed} elapsed · {left}"),
+                Status::Paused => format!("Paused · {files} · {elapsed} elapsed{left}"),
                 Status::Stopping => "Stopping…".to_string(),
-                _ => format!("{elapsed} elapsed · {left}"),
+                _ => format!("{files} · {elapsed} elapsed{left}"),
             }
             .into()
         } else {
@@ -577,8 +585,6 @@ impl Controller {
                 meta: meta.into(),
                 progress: if total == 0 { 0.0 } else { done as f32 / total as f32 },
             };
-            let running: usize = s.type_progress.iter().map(|t| t.2).sum();
-            workers.push(row("All files".into(), s.completed_this_run, s.run_total, format!("{running} running")));
             let names = [("Videos", "encoding"), ("Audio", "running"), ("Documents", "running"), ("Images", "running")];
             for (i, ((name, verb), (done, total, active))) in names.iter().zip(s.type_progress).enumerate() {
                 if total == 0 {
@@ -829,6 +835,15 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
     }
     window.on_clear_log(|| with_controller(Controller::clear_log));
     {
+        let weak = window.as_weak();
+        let prefs_path = prefs_path.clone();
+        window.on_nav_toggled(move || {
+            if let Some(w) = weak.upgrade() {
+                Prefs::from_window(&w).save(&prefs_path);
+            }
+        });
+    }
+    {
         let engine = engine.clone();
         window.on_clear_queue(move || engine.clear_queue());
     }
@@ -844,7 +859,8 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
         let prefs_path = prefs_path.clone();
         window.on_restore_defaults(move || {
             let Some(w) = weak.upgrade() else { return };
-            let prefs = Prefs::default();
+            // The layout of the window isn't a setting: it stays as it is.
+            let prefs = Prefs { nav_compact: w.get_nav_compact(), ..Prefs::default() };
             prefs.apply_to_window(&w);
             prefs.save(&prefs_path);
             engine.apply_options_in_background(prefs.to_raw());
@@ -937,6 +953,13 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
                 }
             };
             match event {
+                // The software renderer repaints only what changed; after a minimize/restore
+                // or resize Windows has dropped the window's pixels, so everything is redrawn.
+                WindowEvent::Resized(_) | WindowEvent::Occluded(false) | WindowEvent::Focused(true) => {
+                    if let Some(w) = weak.upgrade() {
+                        w.set_repaint_all(!w.get_repaint_all());
+                    }
+                }
                 WindowEvent::HoveredFile(_) => hover(true),
                 WindowEvent::HoveredFileCancelled => hover(false),
                 WindowEvent::DroppedFile(path) => {
