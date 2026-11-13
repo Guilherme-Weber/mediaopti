@@ -430,7 +430,45 @@ pub enum Disposal {
 /// converting to the same name (`a.bmp` and `a.tga` both to `a.png`) can't both win: the new
 /// version then replaces only its own placeholder, never someone else's file.
 pub fn claim_new_name(path: &Path) -> std::io::Result<()> {
-    fs::OpenOptions::new().write(true).create_new(true).open(path).map(drop)
+    fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+    journal_claim(path);
+    Ok(())
+}
+
+/// Where claimed names are noted, so an empty placeholder left by a crash or a forced quit
+/// (between the claim and the new version filling it) is removed at the next start.
+static CLAIMS_JOURNAL: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+static CLAIMS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn journal_claim(path: &Path) {
+    let Some(journal) = CLAIMS_JOURNAL.get() else { return };
+    let _guard = CLAIMS_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(journal) {
+        use std::io::Write;
+        let _ = writeln!(f, "{}", path.display());
+    }
+}
+
+/// Sets the claims journal (once per process) and removes the placeholders an earlier run left
+/// empty; returns how many. Only names this app claimed are touched, and only while empty.
+pub fn init_claims_journal(journal: &Path) -> usize {
+    if CLAIMS_JOURNAL.set(journal.to_path_buf()).is_err() {
+        return 0;
+    }
+    let _guard = CLAIMS_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    clean_claims(journal)
+}
+
+/// Removes the claimed names in `journal` that are still empty placeholders, then empties it.
+fn clean_claims(journal: &Path) -> usize {
+    let Ok(text) = fs::read_to_string(journal) else { return 0 };
+    let removed = text
+        .lines()
+        .map(Path::new)
+        .filter(|p| fs::metadata(p).is_ok_and(|m| m.is_file() && m.len() == 0) && fs::remove_file(p).is_ok())
+        .count();
+    let _ = fs::write(journal, "");
+    removed
 }
 
 /// Removes a placeholder made by [`claim_new_name`] if it is still empty.
@@ -818,6 +856,23 @@ mod tests {
         assert_eq!(clean_stale_work(&dir), 2);
         assert!(dead.iter().all(|d| !dir.join(d).exists()));
         assert!(kept.iter().all(|d| dir.join(d).exists()), "only dead runs' exact names are removed");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_placeholders_of_an_interrupted_run_are_removed() {
+        let dir = std::env::temp_dir().join(format!("mo-claims-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (empty, filled, other) = (dir.join("a.png"), dir.join("b.flac"), dir.join("user.png"));
+        fs::write(&empty, b"").unwrap();
+        fs::write(&filled, b"converted").unwrap();
+        fs::write(&other, b"").unwrap(); // empty, but never claimed by the app
+        let journal = dir.join("claimed-names.txt");
+        fs::write(&journal, format!("{}\n{}\n", empty.display(), filled.display())).unwrap();
+        assert_eq!(clean_claims(&journal), 1);
+        assert!(!empty.exists() && filled.exists() && other.exists());
+        assert_eq!(fs::read_to_string(&journal).unwrap(), "", "journal emptied");
         let _ = fs::remove_dir_all(&dir);
     }
 

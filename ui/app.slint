@@ -363,6 +363,21 @@ component CountTile inherits Rectangle {
     }
 }
 
+// A bar for work without a known end (scanning): a segment sliding across.
+component BusyBar inherits Rectangle {
+    height: 4px;
+    border-radius: 2px;
+    background: Theme.subtle-fill;
+    clip: true;
+    Rectangle {
+        width: parent.width * 0.25;
+        height: parent.height;
+        border-radius: parent.border-radius;
+        background: Theme.accent;
+        x: (Math.mod(animation-tick() / 1ms, 1600) / 1600) * (parent.width * 1.25) - self.width;
+    }
+}
+
 component PageTitle inherits HorizontalLayout {
     in property <string> text;
     in property <string> status;
@@ -396,6 +411,7 @@ export component AppWindow inherits Window {
     in property <string> folder-path;
     in property <string> folder-summary: "Choose a folder, or drop files and folders on this window.";
     in property <bool> busy;
+    in property <bool> scanning;
     in property <bool> processing;
     in property <bool> can-start;
     in property <bool> stop-enabled;
@@ -595,6 +611,7 @@ export component AppWindow inherits Window {
                                 Button { text: "Start"; primary: true; enabled: root.can-start; clicked => { root.start(); } }
                             }
                         }
+                        if root.scanning: BusyBar { }
                         if root.show-history: HorizontalLayout {
                             spacing: 12px;
                             Glyph { glyph: "\u{E81C}"; font-size: 13px; color: Theme.text-tertiary; width: 14px; }
@@ -902,7 +919,7 @@ export component AppWindow inherits Window {
                         GroupHeader {
                             glyph: "\u{E8D6}";
                             title: "Audio";
-                            formats: "flac, mp3, ogg, oga, wav (ALAC/m4a and other lossy formats are left alone)";
+                            formats: "flac, mp3, ogg, oga, wav, and lossless m4a (ALAC), aiff, ape, wv, tta (AAC .m4a and other lossy files are left alone)";
                             enabled: !root.locked;
                             on <=> root.audio-on;
                             toggled => { root.settings-changed(); }
@@ -992,7 +1009,7 @@ export component AppWindow inherits Window {
                                     }
                                 }
                                 Check {
-                                    text: "WAV → FLAC";
+                                    text: "WAV, AIFF, ALAC, APE, WavPack, TTA → FLAC (when smaller)";
                                     enabled: !root.locked;
                                     checked: root.conv-wav;
                                     clicked => { root.conv-wav = !root.conv-wav; root.settings-changed(); }

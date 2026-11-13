@@ -10,10 +10,10 @@ and replaced originals go to the Recycle Bin (or a backup folder) by default.
 |---|---|---|
 | Videos | mp4, mkv, mov, avi, wmv, webm, flv, m4v, mts, m2ts, ts, 3gp, mpg, mpeg; GIFs over 1 MB | NVENC AV1/HEVC/H.264 or x264. If the preset isn't smaller, stronger settings are retried while VMAF stays ≥ 93. |
 | Images | png, jpg, gif, bmp, tga | beeim/pingo, oxipng, ECT, jpegtran, gifsicle. Lossless, or visually lossless (SSIMULACRA2 ≥ 93). |
-| Audio | flac, mp3, ogg, wav | Cover art optimized; FLAC and Ogg repacked; the decoded audio stays identical. |
+| Audio | flac, mp3, ogg, wav, m4a (ALAC), aiff, ape, wv, tta | Cover art optimized; FLAC and Ogg repacked; the decoded audio stays identical. |
 | Documents | pdf, docx/xlsx/pptx, odt/ods/odp/odg, epub, cbz, cbr | Pictures inside optimized. Text and drawings are never changed, and PDF pages are rendered and compared. |
 
-Optional lossless conversions: WAV → FLAC, BMP/TGA → PNG, CBR → CBZ.
+Optional lossless conversions: WAV, AIFF, ALAC, APE, WavPack and TTA → FLAC (when smaller, tags and cover art kept), BMP/TGA → PNG, CBR → CBZ.
 
 ## Safety
 

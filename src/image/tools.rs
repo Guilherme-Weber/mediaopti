@@ -210,6 +210,8 @@ pub struct Ran {
     pub stdout_len: u64,
     /// The exit code (qpdf: 0 = fine, 3 = warnings, 2 = errors).
     pub code: Option<i32>,
+    /// The first 64 KiB of what the tool wrote to stderr (ffmpeg's stream description).
+    pub stderr: Vec<u8>,
 }
 
 /// Stop and Pause for the external tools: Stop kills a running tool, Pause suspends it
@@ -384,7 +386,11 @@ pub fn run(
     });
     // Drained so a chatty tool never blocks on a full pipe.
     let err_thread = std::thread::spawn(move || {
+        // The start is kept (bounded); the rest is drained so the tool never blocks.
+        let mut kept = Vec::new();
+        let _ = (&mut err).take(64 * 1024).read_to_end(&mut kept);
         let _ = std::io::copy(&mut err, &mut std::io::sink());
+        kept
     });
 
     let started = Instant::now();
@@ -408,7 +414,7 @@ pub fn run(
             let _ = child.wait();
             let _ = out_thread.join();
             let _ = err_thread.join();
-            return Ok(Ran { success: false, stdout: Vec::new(), hash: None, stdout_len: 0, code: None });
+            return Ok(Ran { success: false, stdout: Vec::new(), hash: None, stdout_len: 0, code: None, stderr: Vec::new() });
         }
         if gate.is_cancelled() || active > timeout {
             let _ = child.kill();
@@ -424,9 +430,9 @@ pub fn run(
         std::thread::sleep(Duration::from_millis(15));
     };
     let (stdout, hash, stdout_len) = out_thread.join().unwrap_or_default();
-    let _ = err_thread.join();
+    let stderr = err_thread.join().unwrap_or_default();
     let success = status.is_some_and(|s| s.success()) && !overflow.load(std::sync::atomic::Ordering::Relaxed);
-    Ok(Ran { success, stdout, hash, stdout_len, code: status.and_then(|s| s.code()) })
+    Ok(Ran { success, stdout, hash, stdout_len, code: status.and_then(|s| s.code()), stderr })
 }
 
 /// `OsString` arguments from anything path- or string-like.

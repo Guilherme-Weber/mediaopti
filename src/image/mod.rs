@@ -38,6 +38,9 @@ pub enum Kind {
     Wav,
     /// Ogg Vorbis, repacked losslessly by OptiVorbis.
     Ogg,
+    /// Other lossless audio (ALAC in .m4a, AIFF, APE, WavPack, TTA), converted to FLAC when
+    /// conversions are on and the FLAC is smaller. (An .m4a holding AAC is left alone.)
+    LosslessAudio,
     /// Converted to PNG (pixel-identical), when conversions are on.
     Bmp,
     Tga,
@@ -53,7 +56,7 @@ pub enum Kind {
 
 impl Kind {
     pub fn is_audio(self) -> bool {
-        matches!(self, Kind::Flac | Kind::Mp3 | Kind::Wav | Kind::Ogg)
+        matches!(self, Kind::Flac | Kind::Mp3 | Kind::Wav | Kind::Ogg | Kind::LosslessAudio)
     }
 
     pub fn is_archive(self) -> bool {
@@ -89,6 +92,7 @@ pub fn kind_of(path: &Path) -> Option<Kind> {
         "flac" => Some(Kind::Flac),
         "mp3" => Some(Kind::Mp3),
         "wav" => Some(Kind::Wav),
+        "m4a" | "aif" | "aiff" | "aifc" | "ape" | "wv" | "tta" => Some(Kind::LosslessAudio),
         "ogg" | "oga" => Some(Kind::Ogg),
         "bmp" => Some(Kind::Bmp),
         "tga" => Some(Kind::Tga),

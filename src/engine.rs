@@ -126,6 +126,8 @@ pub struct StateDto {
     pub type_progress: [(usize, usize, usize); 4],
     /// CPU work is waiting for free memory.
     pub cpu_waiting_memory: bool,
+    /// Media files found so far by the scan running now.
+    pub scan_found: usize,
     pub telemetry: TelemetryDto,
 }
 
@@ -225,6 +227,8 @@ pub struct Engine {
     /// Found at start-up, found again after pingo/beeim are downloaded.
     image_tools: Mutex<image::tools::Tools>,
     data_dir: PathBuf,
+    /// Media files found so far by the running scan (shown while scanning).
+    scan_found: Arc<std::sync::atomic::AtomicUsize>,
     inner: Mutex<Inner>,
     emit: Mutex<EmitThrottle>,
     /// Serializes encoder start-up so memory checks see the previous encoder's usage.
@@ -266,6 +270,38 @@ fn is_generated_name(path: &Path) -> bool {
     is_orphan_temp(path) || name.contains(".tmp.") || name.contains("-h264.")
 }
 
+/// Removes a leftover temp file whose original still exists, or, when the original is gone and
+/// the leftover is complete (`complete`: ffmpeg can read it), renames it to the original's stem
+/// with its own extension (an empty placeholder of that name, left by the same interruption, is
+/// replaced). A half-written leftover is removed. Returns the new name when renamed.
+fn settle_orphan_temp(temp: &Path, complete: &dyn Fn(&Path) -> bool) -> std::io::Result<Option<PathBuf>> {
+    let name = temp.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let lower = name.to_lowercase();
+    let cut = lower.find(".mediaopti.").or_else(|| lower.find(".batchviproc.")).unwrap_or(0);
+    let stem = &name[..cut];
+    let dir = temp.parent().unwrap_or(Path::new("."));
+    let original_exists = std::fs::read_dir(dir)?.filter_map(Result::ok).any(|e| {
+        let p = e.path();
+        p != temp
+            && !is_orphan_temp(&p)
+            && p.file_stem().is_some_and(|s| s.to_string_lossy().eq_ignore_ascii_case(stem))
+            && e.metadata().is_ok_and(|m| m.is_file() && m.len() > 0)
+    });
+    if original_exists || stem.is_empty() || !complete(temp) {
+        system::remove_file_if_exists(temp)?;
+        return Ok(None);
+    }
+    let ext = temp.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default();
+    let mut target = dir.join(format!("{stem}.{ext}"));
+    if std::fs::metadata(&target).is_ok_and(|m| m.len() == 0) {
+        system::remove_file_if_exists(&target)?;
+    } else {
+        target = system::unused_name(&target);
+    }
+    std::fs::rename(temp, &target)?;
+    Ok(Some(target))
+}
+
 /// Temp outputs of this app (`clip.mediaopti.w1.mp4`, `photo.mediaopti.i3.png`), including
 /// ones left by batchviproc (`clip.batchviproc.w1.mp4`). Only this exact shape matches, so a
 /// user's own file that merely contains ".mediaopti." in its name is never deleted.
@@ -280,7 +316,27 @@ fn is_orphan_temp(path: &Path) -> bool {
 /// original as `disposal` says. On failure the error says what happened; if the original was
 /// already set aside (Recycle Bin or backup folder), the new version is never deleted.
 /// Blocking. Shared by the video and image workers.
+/// Replacements running now: quitting waits for them (an original already in the Recycle Bin
+/// with its new version not yet renamed must not be cut off).
+static REPLACING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+struct ReplacingGuard;
+
+impl ReplacingGuard {
+    fn new() -> Self {
+        REPLACING.fetch_add(1, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for ReplacingGuard {
+    fn drop(&mut self) {
+        REPLACING.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 fn replace_original(tmp: &Path, final_target: &Path, original: &Path, disposal: &system::Disposal) -> Result<(), String> {
+    let _replacing = ReplacingGuard::new();
     let Err(err) = system::replace_file_with_retry(tmp, final_target, original, disposal) else {
         return Ok(());
     };
@@ -337,7 +393,7 @@ impl Inner {
         };
         let c = self.options.convert;
         let conversion_on = match kind {
-            image::Kind::Wav => c.wav,
+            image::Kind::Wav | image::Kind::LosslessAudio => c.wav,
             image::Kind::Bmp | image::Kind::Tga => c.images,
             image::Kind::Cbr => c.cbr,
             _ => true,
@@ -583,6 +639,7 @@ impl Inner {
             slow_jobs,
             type_progress,
             cpu_waiting_memory: self.cpu_waiting_memory,
+            scan_found: 0,
             telemetry: TelemetryDto {
                 total_fps: total_fps.round() as i64,
                 total_speed: round1(total_speed),
@@ -603,13 +660,18 @@ impl Engine {
         rt: tokio::runtime::Handle,
     ) -> Arc<Self> {
         let history = History::load(data_dir.join("processedFiles.txt"));
+        let placeholders = system::init_claims_journal(&data_dir.join("claimed-names.txt"));
         let image_tools = image::tools::Tools::discover(ffmpeg_path.clone(), data_dir);
+        if placeholders > 0 {
+            ui.log(format!("Removed {placeholders} empty name placeholder(s) left by an interrupted run"));
+        }
         Arc::new(Self {
             ui,
             rt,
             ffmpeg_path,
             image_tools: Mutex::new(image_tools),
             data_dir: data_dir.to_path_buf(),
+            scan_found: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             inner: Mutex::new(Inner {
                 dir: None,
                 files: Vec::new(),
@@ -679,7 +741,9 @@ impl Engine {
     }
 
     pub fn snapshot(&self) -> StateDto {
-        self.lock().snapshot()
+        let mut s = self.lock().snapshot();
+        s.scan_found = self.scan_found.load(Ordering::Relaxed);
+        s
     }
 
     /// Broadcasts state to the UI; non-forced updates are throttled to one per 250 ms.
@@ -883,7 +947,21 @@ impl Engine {
             (inner.backup_root(), inner.options.temp_dir.clone())
         };
         let roots = items.clone();
-        let scan = self.rt.spawn_blocking(move || scan_folder(&roots, exclude.as_deref(), temp.as_deref())).await;
+        // The window shows the count as it grows (nothing else updates it during a scan).
+        let found = Arc::clone(&self.scan_found);
+        found.store(0, Ordering::Relaxed);
+        let ticker = {
+            let engine = Arc::clone(self);
+            self.rt.spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    engine.send_state(false);
+                }
+            })
+        };
+        let ffmpeg = self.ffmpeg_path.clone();
+        let scan = self.rt.spawn_blocking(move || scan_folder(&roots, exclude.as_deref(), temp.as_deref(), &found, &ffmpeg)).await;
+        ticker.abort();
         let result = match scan {
             Ok(r) => r,
             Err(err) => {
@@ -1426,6 +1504,12 @@ impl Engine {
             inner.stop_requested = true;
             inner.cancel.cancel();
             inner.power = None;
+        }
+        // A file being replaced finishes first (a few seconds at most), so quitting never
+        // leaves an original in the Recycle Bin with its new version still under a temp name.
+        let until = Instant::now() + Duration::from_secs(15);
+        while REPLACING.load(Ordering::SeqCst) > 0 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(50));
         }
         self.flush_history();
     }
@@ -2617,7 +2701,21 @@ struct ScanResult {
 /// Recursively finds videos (skipping hidden folders like the old glob did), deletes leftover
 /// temp files and sorts the queue by size, largest first. File sizes come from the directory
 /// listing itself (on Windows `DirEntry::metadata` needs no extra system call).
-fn scan_folder(roots: &[PathBuf], exclude: Option<&Path>, temp: Option<&Path>) -> ScanResult {
+/// Whether ffmpeg can read `path` as media (a half-written encode, e.g. an MP4 without its
+/// index, can't).
+fn media_readable(ffmpeg: &Path, path: &Path) -> bool {
+    let mut cmd = std::process::Command::new(ffmpeg);
+    cmd.args(["-hide_banner", "-v", "error", "-i"]).arg(path).args(["-map", "0", "-c", "copy", "-f", "null", "-"]);
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // no console window
+    }
+    cmd.output().is_ok_and(|o| o.status.success() && o.stderr.is_empty())
+}
+
+fn scan_folder(roots: &[PathBuf], exclude: Option<&Path>, temp: Option<&Path>, found: &std::sync::atomic::AtomicUsize, ffmpeg: &Path) -> ScanResult {
     let mut messages = Vec::new();
     let mut cleaned_orphans = 0;
     // Work folders of runs that were killed or crashed.
@@ -2657,17 +2755,24 @@ fn scan_folder(roots: &[PathBuf], exclude: Option<&Path>, temp: Option<&Path>) -
             continue; // dropped twice (a folder and a file inside it)
         }
         if is_orphan_temp(entry.path()) {
-            match system::remove_file_if_exists(entry.path()) {
-                Ok(()) => cleaned_orphans += 1,
-                Err(err) => messages.push(format!(
-                    "Could not remove temporary file {}: {err}",
-                    entry.path().display()
+            // A leftover with its original still there is a half-made version: removed. If
+            // the original is gone, the app was stopped after setting it aside but before the
+            // new version got its name: the leftover IS the file now, so it gets the name.
+            match settle_orphan_temp(entry.path(), &|p| media_readable(ffmpeg, p)) {
+                Ok(None) => cleaned_orphans += 1,
+                Ok(Some(named)) => messages.push(format!(
+                    "Recovered {} (the app had stopped while replacing it; its original is in the Recycle Bin or backup folder)",
+                    named.display()
                 )),
+                Err(err) => messages.push(format!("Could not tidy up temporary file {}: {err}", entry.path().display())),
             }
             continue;
         }
         match entry.metadata() {
-            Ok(meta) if meta.len() > 0 => with_sizes.push((entry.into_path(), meta.len())),
+            Ok(meta) if meta.len() > 0 => {
+                found.fetch_add(1, Ordering::Relaxed);
+                with_sizes.push((entry.into_path(), meta.len()));
+            }
             Ok(_) => {}
             Err(err) => messages.push(format!("Could not read {}: {err}", entry.path().display())),
         }
@@ -2740,6 +2845,34 @@ mod tests {
         assert!((mean - 50.5).abs() < 1e-9);
         assert!((worst - 5.0).abs() < 1e-9, "5th percentile of 1..=100 is 5, got {worst}");
         assert_eq!(summarize_vmaf(vec![]), None);
+    }
+
+    /// Leftover temp files after a forced quit: removed when the original is still there,
+    /// renamed into place when the original was already set aside (an empty placeholder of
+    /// that name, left by the same interruption, is replaced).
+    #[test]
+    fn leftover_temps_are_removed_or_recovered() {
+        let dir = std::env::temp_dir().join(format!("mo-orphans-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let w = |n: &str, d: &[u8]| std::fs::write(dir.join(n), d).unwrap();
+        w("clip.mkv", b"original video");
+        w("clip.mediaopti.w1.mp4", b"half-made encode");
+        w("pic.mediaopti.i3.png", b"finished new version");
+        w("sky.png", b""); // the conversion's placeholder
+        w("sky.mediaopti.i2.png", b"finished conversion");
+        let yes = |_: &Path| true;
+        assert_eq!(settle_orphan_temp(&dir.join("clip.mediaopti.w1.mp4"), &yes).unwrap(), None);
+        assert!(!dir.join("clip.mediaopti.w1.mp4").exists() && dir.join("clip.mkv").exists());
+        assert_eq!(settle_orphan_temp(&dir.join("pic.mediaopti.i3.png"), &yes).unwrap(), Some(dir.join("pic.png")));
+        assert_eq!(std::fs::read(dir.join("pic.png")).unwrap(), b"finished new version");
+        assert_eq!(settle_orphan_temp(&dir.join("sky.mediaopti.i2.png"), &yes).unwrap(), Some(dir.join("sky.png")));
+        assert_eq!(std::fs::read(dir.join("sky.png")).unwrap(), b"finished conversion");
+        // Half-written, original gone: removed, not given a name.
+        w("cut.mediaopti.w2.mp4", b"truncated");
+        assert_eq!(settle_orphan_temp(&dir.join("cut.mediaopti.w2.mp4"), &|_: &Path| false).unwrap(), None);
+        assert!(!dir.join("cut.mediaopti.w2.mp4").exists() && !dir.join("cut.mp4").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

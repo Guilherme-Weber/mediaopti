@@ -492,6 +492,7 @@ impl Controller {
             "Choose a folder, or drop files and folders on this window. Subfolders are included.".into()
         });
         w.set_busy(busy);
+        w.set_scanning(s.status == Status::Scanning);
         w.set_processing(processing);
         w.set_can_start(has_folder && !busy && s.pending_files > 0);
         w.set_stop_enabled(matches!(s.status, Status::Running | Status::Paused));
@@ -631,6 +632,8 @@ impl Controller {
             TaskbarProgress::Normal(taskbar_pct)
         } else if paused && s.run_total > 0 {
             TaskbarProgress::Paused(taskbar_pct)
+        } else if s.status == Status::Scanning {
+            TaskbarProgress::Indeterminate
         } else if s.status == Status::Error {
             TaskbarProgress::Error
         } else {
@@ -1103,7 +1106,7 @@ fn format_saved(mb: f64) -> String {
 
 fn file_count_text(s: &StateDto) -> String {
     if s.status == Status::Scanning {
-        return "Scanning folder…".into();
+        return format!("Scanning… {} found so far", plural(s.scan_found, "media file", "media files"));
     }
     if s.total_files == 0 {
         return "No videos or images in this folder or its subfolders. Choose another folder.".into();

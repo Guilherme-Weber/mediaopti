@@ -33,6 +33,7 @@ pub fn optimize(ctx: &Ctx, kind: Kind, src: &Path, work: &Path) -> Result<Optimi
         Kind::Mp3 => mp3(ctx, src, work),
         Kind::Wav => wav(ctx, src, work),
         Kind::Ogg => ogg(ctx, src, work),
+        Kind::LosslessAudio => lossless_to_flac(ctx, src, work),
         _ => unreachable!("not audio"),
     };
     match r {
@@ -405,6 +406,130 @@ fn ogg(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, AudioError> {
             got_len % frame == 0 && decoded(ctx, src, Some(got_len / frame))?.is_some_and(|(h, n)| h == got && n == got_len)
         });
     Ok(if same { Optimized::found(Some(out), vec!["optivorbis".into()]) } else { Optimized::nothing() })
+}
+
+// ---------------------------------------------------------------- other lossless -> FLAC
+
+/// What ffmpeg says about a file's streams.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct StreamInfo {
+    /// Codec of the (only) audio stream, e.g. "alac", "pcm_s24be".
+    codec: String,
+    /// "44100 Hz, stereo".
+    rate_layout: String,
+    /// Bits per sample (16, 24, 32), when stated.
+    bits: Option<u32>,
+    audio_streams: usize,
+    /// Embedded pictures (attached cover art).
+    pictures: usize,
+    /// Video that isn't cover art.
+    other_video: usize,
+}
+
+/// Codecs whose samples FLAC holds exactly.
+const LOSSLESS_CODECS: &[&str] = &[
+    "alac", "ape", "wavpack", "tta", "pcm_s16be", "pcm_s16le", "pcm_s24be", "pcm_s24le", "pcm_s32be", "pcm_s32le", "pcm_s8", "pcm_u8",
+];
+
+fn stream_info(ctx: &Ctx, path: &Path) -> Result<StreamInfo, RunError> {
+    // Without an output ffmpeg exits with an error after describing the input: expected.
+    let ran = tools::run(&ctx.tools.ffmpeg, crate::os_args!["-hide_banner", "-i", path], None, Capture::None, ctx.timeout, &ctx.gate)?;
+    let text = String::from_utf8_lossy(&ran.stderr);
+    let mut info = StreamInfo::default();
+    for line in text.lines().filter(|l| l.trim_start().starts_with("Stream #")) {
+        if let Some(rest) = line.split("Audio: ").nth(1) {
+            info.audio_streams += 1;
+            let parts: Vec<&str> = rest.split(", ").collect();
+            info.codec = parts.first().and_then(|c| c.split_whitespace().next()).unwrap_or_default().to_string();
+            info.rate_layout = parts.iter().skip(1).take(2).copied().collect::<Vec<_>>().join(", ");
+            let fmt = parts.get(3).copied().unwrap_or_default();
+            info.bits = if let Some(b) = fmt.split('(').nth(1).and_then(|b| b.split_whitespace().next()).and_then(|b| b.parse().ok()) {
+                Some(b)
+            } else if fmt.starts_with("s16") {
+                Some(16)
+            } else if fmt.starts_with("s32") {
+                Some(32)
+            } else if fmt.starts_with("u8") {
+                Some(8)
+            } else {
+                None
+            };
+        } else if line.contains("Video: ") {
+            if line.contains("(attached pic)") {
+                info.pictures += 1;
+            } else {
+                info.other_video += 1;
+            }
+        }
+    }
+    Ok(info)
+}
+
+/// The tags of a file as ffmpeg reads them (lower-case keys), without the container's own
+/// fields that a FLAC doesn't have.
+fn tags(ctx: &Ctx, path: &Path) -> Result<Option<BTreeSet<(String, String)>>, RunError> {
+    let ran = tools::run(&ctx.tools.ffmpeg, crate::os_args!["-v", "error", "-i", path, "-f", "ffmetadata", "-"], None, Capture::BytesUpTo(4 << 20), ctx.timeout, &ctx.gate)?;
+    if !ran.success {
+        return Ok(None);
+    }
+    const CONTAINER: &[&str] = &["major_brand", "minor_version", "compatible_brands", "encoder", "handler_name", "vendor_id", "creation_time"];
+    let text = String::from_utf8_lossy(&ran.stdout);
+    Ok(Some(
+        text.lines()
+            .filter(|l| !l.starts_with(';') && !l.starts_with('['))
+            .filter_map(|l| l.split_once('='))
+            .map(|(k, v)| (k.to_ascii_lowercase(), v.to_string()))
+            .filter(|(k, _)| !CONTAINER.contains(&k.as_str()))
+            .collect(),
+    ))
+}
+
+/// ALAC, AIFF, APE, WavPack or TTA -> FLAC, kept only when the FLAC decodes to the same
+/// samples (same rate, channels, bit depth) and keeps every tag and the cover art; the art is
+/// then optimized like any FLAC's.
+fn lossless_to_flac(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, AudioError> {
+    let info = stream_info(ctx, src)?;
+    if info.audio_streams != 1 || info.other_video > 0 {
+        return skip("not a single audio stream (or has video): left alone");
+    }
+    if !LOSSLESS_CODECS.contains(&info.codec.as_str()) {
+        return skip(&format!("{} is not lossless: left alone", if info.codec.is_empty() { "the audio" } else { &info.codec }));
+    }
+    let Some(bits) = info.bits.filter(|b| (8..=32).contains(b)) else { return skip("unknown bit depth: left alone") };
+    let out = work.join("conv.flac");
+    let mut args = crate::os_args!["-v", "error", "-y", "-i", src, "-map", "0:a:0", "-map", "0:v?", "-map_metadata", "0", "-c:a", "flac", "-compression_level", "12"];
+    args.extend(crate::os_args!["-sample_fmt", if bits <= 16 { "s16" } else { "s32" }]);
+    if bits > 16 && bits < 32 {
+        args.extend(crate::os_args!["-bits_per_raw_sample", bits.to_string()]);
+    }
+    args.extend(crate::os_args!["-c:v", "copy", "-disposition:v", "attached_pic", &out]);
+    if !tools::run(&ctx.tools.ffmpeg, args, None, Capture::None, audio_timeout(ctx, src), &ctx.gate)?.success || !out.is_file() {
+        return skip("could not convert it to FLAC");
+    }
+    let got = stream_info(ctx, &out)?;
+    let same_format = got.codec == "flac" && got.rate_layout == info.rate_layout && got.pictures == info.pictures
+        && flac_read(&out)?.as_ref().and_then(flac_format).is_some_and(|f| f.bits == bits);
+    if !same_format {
+        return skip("the FLAC would not have the same format or cover art: kept");
+    }
+    let want = audio_hash(ctx, src)?;
+    if want.is_none() || audio_hash(ctx, &out)? != want {
+        return skip("the FLAC does not decode to the same audio: kept");
+    }
+    let (before, after) = (tags(ctx, src)?, tags(ctx, &out)?);
+    if !before.zip(after).is_some_and(|(b, a)| b.is_subset(&a)) {
+        return skip("not every tag could be kept in FLAC: kept");
+    }
+    // The cover art is optimized like any FLAC's (the audio frames are copied as they are).
+    let art_work = work.join("art");
+    std::fs::create_dir_all(&art_work)?;
+    let art = flac(ctx, &out, &art_work)?;
+    let (best, extra) = match art.best {
+        Some(b) => (b, art.steps),
+        None => (out, Vec::new()),
+    };
+    let steps = std::iter::once(format!("{}->flac", info.codec)).chain(extra).collect();
+    Ok(Optimized { new_ext: Some("flac"), ..Optimized::found(Some(best), steps) })
 }
 
 // ---------------------------------------------------------------- WAV -> FLAC
@@ -800,6 +925,46 @@ mod tests {
     fn ff(ctx: &Ctx, args: &[&str]) {
         let ok = std::process::Command::new(&ctx.tools.ffmpeg).args(["-v", "error", "-y"]).args(args).status().unwrap().success();
         assert!(ok, "ffmpeg {args:?}");
+    }
+
+    /// ALAC (with tags and cover art), 24-bit AIFF, WavPack and TTA become FLACs that decode to
+    /// the same samples and keep the tags and the art; an .m4a holding AAC is left alone.
+    #[test]
+    fn lossless_audio_becomes_flac() {
+        let Some(c) = ctx() else {
+            eprintln!("skipping: tools not found");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("mo-lossless-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = |n: &str| dir.join(n).to_string_lossy().into_owned();
+        ff(&c, &["-f", "lavfi", "-i", "testsrc=s=300x300", "-frames:v", "1", "-q:v", "2", &p("cover.jpg")]);
+        let tone = ["-f", "lavfi", "-i", "sine=f=440:d=3"];
+        ff(&c, &[&tone[..], &["-i", &p("cover.jpg"), "-map", "0:a", "-map", "1:v", "-c:a", "alac", "-c:v", "copy", "-disposition:v", "attached_pic",
+            "-metadata", "title=Song", "-metadata", "artist=Band", "-metadata", "album=LP", "-metadata", "track=3", &p("a.m4a")]].concat());
+        ff(&c, &[&tone[..], &["-c:a", "pcm_s24be", "-metadata", "title=T", &p("b.aiff")]].concat());
+        ff(&c, &[&tone[..], &["-c:a", "wavpack", &p("c.wv")]].concat());
+        ff(&c, &[&tone[..], &["-c:a", "tta", &p("d.tta")]].concat());
+        ff(&c, &[&tone[..], &["-c:a", "aac", &p("e.m4a")]].concat());
+        for (name, converted) in [("a.m4a", true), ("b.aiff", true), ("c.wv", true), ("d.tta", true), ("e.m4a", false)] {
+            let src = dir.join(name);
+            let work = dir.join(format!("w-{name}"));
+            std::fs::create_dir_all(&work).unwrap();
+            let r = optimize(&c, Kind::LosslessAudio, &src, &work).unwrap();
+            if !converted {
+                assert!(r.best.is_none() && r.note.as_deref().is_some_and(|n| n.contains("not lossless")), "{name}: {:?}", r.note);
+                continue;
+            }
+            let out = r.best.unwrap_or_else(|| panic!("{name} not converted: {:?}", r.note));
+            assert_eq!(r.new_ext, Some("flac"));
+            assert_eq!(audio_hash(&c, &out).unwrap(), audio_hash(&c, &src).unwrap(), "{name}: samples");
+            let (a, b) = (tags(&c, &src).unwrap().unwrap(), tags(&c, &out).unwrap().unwrap());
+            assert!(a.is_subset(&b), "{name}: tags {a:?} vs {b:?}");
+            let (si, so) = (stream_info(&c, &src).unwrap(), stream_info(&c, &out).unwrap());
+            assert_eq!((si.bits, si.pictures, &si.rate_layout), (so.bits, so.pictures, &so.rate_layout), "{name}: format and art");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A game-rip WAV with loop points (`smpl` chunk) becomes a FLAC that keeps them: decoding

@@ -6,6 +6,8 @@ pub enum TaskbarProgress {
     Normal(u64),
     Paused(u64),
     Error,
+    /// Busy without a known end (scanning).
+    Indeterminate,
 }
 
 #[cfg(windows)]
@@ -37,7 +39,7 @@ impl Taskbar {
     }
 
     pub fn set(&mut self, progress: TaskbarProgress) {
-        use windows::Win32::UI::Shell::{TBPF_ERROR, TBPF_NOPROGRESS, TBPF_NORMAL, TBPF_PAUSED};
+        use windows::Win32::UI::Shell::{TBPF_ERROR, TBPF_INDETERMINATE, TBPF_NOPROGRESS, TBPF_NORMAL, TBPF_PAUSED};
         if self.last == Some(progress) {
             return;
         }
@@ -53,6 +55,7 @@ impl Taskbar {
                     .list
                     .SetProgressState(self.hwnd, TBPF_PAUSED)
                     .and_then(|_| self.list.SetProgressValue(self.hwnd, pct, 100)),
+                TaskbarProgress::Indeterminate => self.list.SetProgressState(self.hwnd, TBPF_INDETERMINATE),
                 TaskbarProgress::Error => self
                     .list
                     .SetProgressState(self.hwnd, TBPF_ERROR)
