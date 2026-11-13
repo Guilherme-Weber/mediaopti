@@ -409,7 +409,7 @@ export component AppWindow inherits Window {
     in property <bool> empty-folder;
     in property <string> folder-title: "No folder selected";
     in property <string> folder-path;
-    in property <string> folder-summary: "Choose a folder, or drop files and folders on this window.";
+    in property <string> folder-summary: "Choose one or more folders, or drop files and folders on this window.";
     in property <bool> busy;
     in property <bool> scanning;
     in property <bool> processing;
@@ -583,7 +583,7 @@ export component AppWindow inherits Window {
                             VerticalLayout {
                                 alignment: center;
                                 Button {
-                                    text: root.has-folder ? "Change folder" : "Choose folder";
+                                    text: root.has-folder ? "Change folders" : "Choose folders";
                                     primary: !root.has-folder || root.empty-folder;
                                     enabled: !root.busy;
                                     clicked => { root.choose-folder(); }

@@ -489,7 +489,7 @@ impl Controller {
         w.set_folder_summary(if has_folder || s.status == Status::Scanning {
             file_count_text(s).into()
         } else {
-            "Choose a folder, or drop files and folders on this window. Subfolders are included.".into()
+            "Choose one or more folders, or drop files and folders on this window. Subfolders are included.".into()
         });
         w.set_busy(busy);
         w.set_scanning(s.status == Status::Scanning);
@@ -810,13 +810,16 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
         window.on_choose_folder(move || {
             let Some(w) = weak.upgrade() else { return };
             let handle = w.window().window_handle();
+            // Several folders can be picked at once (Ctrl or Shift + click).
             let picked = rfd::FileDialog::new()
-                .set_title("Choose a folder with videos and images")
+                .set_title("Choose one or more folders (Ctrl + click for several)")
                 .set_parent(&handle)
-                .pick_folder();
-            match picked {
-                Some(dir) => engine.spawn_load_dir(dir),
-                None => engine.log("No folder selected"),
+                .pick_folders()
+                .unwrap_or_default();
+            match picked.len() {
+                0 => engine.log("No folder selected"),
+                1 => engine.spawn_load_dir(picked.into_iter().next().unwrap_or_default()),
+                _ => engine.spawn_load_items(picked),
             }
         });
     }

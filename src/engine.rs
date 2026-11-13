@@ -884,6 +884,13 @@ impl Engine {
         self.load_items(vec![dir], false).await;
     }
 
+    /// Several folders chosen at once: they replace what was loaded, like one folder (the start
+    /// folder becomes their common folder).
+    pub fn spawn_load_items(self: &Arc<Self>, items: Vec<PathBuf>) {
+        let engine = Arc::clone(self);
+        self.rt.spawn(async move { engine.load_items(items, false).await });
+    }
+
     /// Files and folders dropped on the window: added to the running batch's queues, or to
     /// what is loaded (the start folder becomes their common folder).
     pub fn spawn_add_items(self: &Arc<Self>, items: Vec<PathBuf>) {

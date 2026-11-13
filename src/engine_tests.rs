@@ -993,3 +993,29 @@ fn queue_runs_in_stages_and_types_can_be_skipped() {
     assert_eq!(s.type_progress.map(|t| (t.0, t.1)), [(1, 1), (2, 2), (0, 0), (2, 2)], "{logs}");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Several folders picked at once replace what was loaded; the start folder is their common one.
+#[test]
+fn several_chosen_folders_replace_the_queue() {
+    let Some(ff) = ffmpeg() else {
+        eprintln!("skipping: bundled ffmpeg not found");
+        return;
+    };
+    let root = test_dir("multi");
+    let (a, b, c) = (root.join("lib").join("a"), root.join("lib").join("b"), root.join("lib").join("c"));
+    for (d, n) in [(&a, "1.png"), (&b, "2.png"), (&c, "3.png")] {
+        std::fs::create_dir_all(d).unwrap();
+        make(&ff, &["-f", "lavfi", "-i", "testsrc=s=64x48", "-frames:v", "1"], &d.join(n));
+    }
+    let rt = runtime();
+    let (engine, _) = new_engine(&rt, &root, ff);
+    engine.apply_options(RawOptions { images: Some(1), ..opts("av1_nvenc", 1.0) });
+    rt.block_on(async {
+        engine.load_dir(a.clone()).await;
+        engine.load_items(vec![b.clone(), c.clone()], false).await;
+    });
+    let s = engine.snapshot();
+    assert_eq!(s.total_files, 2, "a's file replaced by b's and c's");
+    assert_eq!(s.dir.as_deref(), Some(root.join("lib").to_string_lossy().as_ref()));
+    let _ = std::fs::remove_dir_all(&root);
+}
