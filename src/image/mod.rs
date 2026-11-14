@@ -287,6 +287,16 @@ pub struct Ctx {
     pub progress: Option<std::sync::Arc<tools::Progress>>,
 }
 
+impl Ctx {
+    /// Shows what the job does now; `reads` are the files its tools will read whole (their
+    /// sizes give the percentage), empty if unknown.
+    pub fn phase(&self, name: &'static str, reads: &[&Path]) {
+        if let Some(p) = &self.progress {
+            p.begin(name, reads.iter().filter_map(|f| size(f)).sum());
+        }
+    }
+}
+
 pub struct Optimized {
     /// The smallest verified result, or `None` if nothing was smaller.
     pub best: Option<PathBuf>,

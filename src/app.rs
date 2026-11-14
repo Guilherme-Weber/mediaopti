@@ -318,6 +318,8 @@ struct Controller {
     state: StateDto,
     log_model: Rc<VecModel<SharedString>>,
     worker_model: Rc<VecModel<WorkerRow>>,
+    files_left: Rc<VecModel<FileRow>>,
+    files_right: Rc<VecModel<FileRow>>,
     metric_model: Rc<VecModel<Metric>>,
     log_revision: i32,
     taskbar: Option<Taskbar>,
@@ -614,17 +616,23 @@ impl Controller {
                 .into(),
                 progress: wk.percent as f32 / 100.0,
             }));
-            // Long single files (a big comic, a long FLAC) would otherwise look stuck.
-            for job in &s.slow_jobs {
-                let time = format_duration(std::time::Duration::from_secs(job.secs));
-                let (meta, progress) = match job.progress {
-                    Some((done, total)) => (format!("{done} of {total} pictures · {time}"), done as f32 / total.max(1) as f32),
-                    None => (format!("running for {time}"), 0.0),
-                };
-                workers.push(WorkerRow { title: format!("CPU · {}", job.name).into(), meta: meta.into(), progress });
-            }
         }
         sync_model(&self.worker_model, workers);
+        // Every file running on the CPU: its step and share done when known, else its time.
+        let (mut left, mut right) = (Vec::new(), Vec::new());
+        for (i, job) in s.cpu_jobs.iter().enumerate().filter(|_| processing) {
+            let time = format_duration(std::time::Duration::from_secs(job.secs));
+            let (meta, progress) = match (job.parts, job.phase) {
+                (Some((done, total)), _) => (format!("{done} of {total} pictures · {time}"), done as f32 / total.max(1) as f32),
+                (None, Some((phase, Some(f)))) => (format!("{phase} {:.0}% · {time}", f * 100.0), f),
+                (None, Some((phase, None))) => (format!("{phase} · {time}"), -1.0),
+                (None, None) => (time, -1.0),
+            };
+            let row = FileRow { name: job.name.as_str().into(), meta: meta.into(), progress };
+            if i % 2 == 0 { left.push(row) } else { right.push(row) }
+        }
+        sync_model(&self.files_left, left);
+        sync_model(&self.files_right, right);
 
         // Taskbar button progress
         let taskbar_pct = (fraction * 100.0).clamp(1.0, 99.0) as u64;
@@ -750,6 +758,9 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
     let metric_model = Rc::new(VecModel::<Metric>::default());
     window.set_log_lines(log_model.clone().into());
     window.set_workers(worker_model.clone().into());
+    let (files_left, files_right) = (Rc::new(VecModel::<FileRow>::default()), Rc::new(VecModel::<FileRow>::default()));
+    window.set_files_left(files_left.clone().into());
+    window.set_files_right(files_right.clone().into());
     window.set_metrics(metric_model.clone().into());
     let queue_model = Rc::new(VecModel::<QueueItem>::default());
     window.set_queue_items(queue_model.clone().into());
@@ -795,6 +806,8 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
             state: engine.snapshot(),
             log_model,
             worker_model,
+            files_left,
+            files_right,
             metric_model,
             log_revision: 0,
             taskbar: None,

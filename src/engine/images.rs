@@ -279,7 +279,9 @@ impl Engine {
             let (cpu2, p2) = (Arc::clone(&cpu), path.clone());
             let result = self
                 .blocking(move || {
-                    let ctx2 = &image::Ctx { progress: Some(progress), ..cpu2.for_file(&p2).clone() };
+                    let base = cpu2.for_file(&p2);
+                    let gate = image::tools::Gate { progress: Some(Arc::clone(&progress)), ..base.gate.clone() };
+                    let ctx2 = &image::Ctx { progress: Some(progress), gate, ..base.clone() };
                     // A slot is free unless a big job borrowed it: then wait for it back.
                     if ctx2.slots.as_ref().is_some_and(|s| !s.acquire(&ctx2.gate)) {
                         return ImageResult::Stopped;

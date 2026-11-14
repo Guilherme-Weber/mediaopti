@@ -154,6 +154,25 @@ pub fn set_std_process_suspended(child: &std::process::Child, suspended: bool) -
     }
 }
 
+/// Bytes `child` has read so far (all its reads: files and pipes).
+pub fn bytes_read(child: &std::process::Child) -> Option<u64> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Threading::{GetProcessIoCounters, IO_COUNTERS};
+        // SAFETY: the handle is the live process handle owned by `child`; `counters` is a
+        // plain struct the call fills in.
+        let mut counters: IO_COUNTERS = unsafe { std::mem::zeroed() };
+        let ok = unsafe { GetProcessIoCounters(child.as_raw_handle() as _, &mut counters) };
+        (ok != 0).then_some(counters.ReadTransferCount)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = child;
+        None
+    }
+}
+
 /// Free space (for this user) on the drive holding `path`.
 pub fn free_space(path: &Path) -> Option<u64> {
     #[cfg(windows)]

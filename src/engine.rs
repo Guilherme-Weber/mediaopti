@@ -37,8 +37,6 @@ pub use ffmpeg::locate_ffmpeg;
 const STATE_THROTTLE: Duration = Duration::from_millis(250);
 /// Kept free on a video's drive besides room for its new version.
 const VIDEO_DISK_RESERVE: u64 = 4 * 1024 * 1024 * 1024;
-/// CPU files running at least this long get their own progress row.
-const SLOW_JOB_SECS: u64 = 15;
 const HISTORY_SAVE_DELAY: Duration = Duration::from_secs(2);
 
 /// Memory needed before starting another ffmpeg while others run. A single 4K AV1 encode
@@ -124,9 +122,8 @@ pub struct StateDto {
     pub queue_counts: [(usize, u64); 4],
     /// Changes whenever the queue's content changes (the window then reloads its list).
     pub queue_revision: u64,
-    /// CPU files running for a while (a big comic, a long FLAC): name and seconds so far,
-    /// longest first.
-    pub slow_jobs: Vec<SlowJob>,
+    /// CPU files running now, in the order they started.
+    pub cpu_jobs: Vec<CpuJob>,
     /// This run by type (videos, audio, documents, images): finished, total, running now.
     pub type_progress: [(usize, usize, usize); 4],
     /// CPU work is waiting for free memory.
@@ -136,13 +133,14 @@ pub struct StateDto {
     pub telemetry: TelemetryDto,
 }
 
-/// A CPU file running for a while: its name, seconds so far, and its own progress (pages of
-/// a comic, images of a PDF) when known.
+/// A CPU file running now: its name, seconds so far, its parts done (pages of a comic, images
+/// of a PDF) and its current step with the share done, when known.
 #[derive(Clone, Debug)]
-pub struct SlowJob {
+pub struct CpuJob {
     pub name: String,
     pub secs: u64,
-    pub progress: Option<(usize, usize)>,
+    pub parts: Option<(usize, usize)>,
+    pub phase: Option<(&'static str, Option<f32>)>,
 }
 
 struct Inner {

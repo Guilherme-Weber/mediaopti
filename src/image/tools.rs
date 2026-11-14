@@ -21,6 +21,19 @@ pub struct Tools {
     pub ffmpeg: PathBuf,
 }
 
+/// The program a Scoop shim starts (`x.exe` next to `x.shim` holding `path = "..."`). Run
+/// directly, Pause suspends the tool itself (not just the shim) and its reads can be counted.
+fn shim_target(exe: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(exe.with_extension("shim")).ok()?;
+    // A shim that adds arguments is kept: running the target alone would drop them.
+    if text.lines().any(|l| l.trim_start().starts_with("args")) {
+        return None;
+    }
+    let line = text.lines().find_map(|l| l.trim().strip_prefix("path").map(str::trim))?;
+    let target = PathBuf::from(line.strip_prefix('=')?.trim().trim_matches('"'));
+    target.is_file().then_some(target)
+}
+
 impl Tools {
     /// Looks each tool up in: `<data_dir>\tools.json` (`{"pingo": "C:\\...\\pingo.exe"}`),
     /// a `tools` folder next to the executable, the project's `bin` folder (development),
@@ -57,7 +70,7 @@ impl Tools {
                 .cloned()
                 .or_else(|| dirs.iter().map(|d| d.join(&file)).find(|p| p.is_file()));
             if let Some(p) = found {
-                paths.insert(*name, p);
+                paths.insert(*name, shim_target(&p).unwrap_or(p));
             }
         }
         Self { paths, ffmpeg }
@@ -220,11 +233,13 @@ pub struct Ran {
 pub struct Gate {
     pub cancel: CancellationToken,
     pub paused: Option<tokio::sync::watch::Receiver<bool>>,
+    /// The job's progress: the bytes each tool reads are added to it.
+    pub progress: Option<std::sync::Arc<Progress>>,
 }
 
 impl Gate {
     pub fn new(cancel: CancellationToken, paused: Option<tokio::sync::watch::Receiver<bool>>) -> Self {
-        Self { cancel, paused }
+        Self { cancel, paused, progress: None }
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -247,14 +262,37 @@ impl Gate {
     }
 }
 
-/// Progress inside one job (a comic's pages, a PDF's images), shown next to its name.
+/// Progress inside one job, shown next to its name: parts done (a comic's pages, a PDF's
+/// images), and what it is doing now (`phase`) with the share of its input read so far.
 #[derive(Debug, Default)]
 pub struct Progress {
     pub done: std::sync::atomic::AtomicUsize,
     pub total: std::sync::atomic::AtomicUsize,
+    phase: std::sync::Mutex<&'static str>,
+    read: std::sync::atomic::AtomicU64,
+    expect: std::sync::atomic::AtomicU64,
 }
 
 impl Progress {
+    /// A new step: `expect` is how many bytes its tools will read (0: unknown).
+    pub fn begin(&self, phase: &'static str, expect: u64) {
+        *self.phase.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = phase;
+        self.read.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.expect.store(expect, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn add_read(&self, bytes: u64) {
+        self.read.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The step running now, and its share done (at most 99%) when its size is known.
+    pub fn phase(&self) -> Option<(&'static str, Option<f32>)> {
+        let phase = *self.phase.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let expect = self.expect.load(std::sync::atomic::Ordering::Relaxed);
+        let read = self.read.load(std::sync::atomic::Ordering::Relaxed);
+        (!phase.is_empty()).then(|| (phase, (expect > 0).then(|| (read as f32 / expect as f32).min(0.99))))
+    }
+
     pub fn set_total(&self, n: usize) {
         self.total.store(n, std::sync::atomic::Ordering::Relaxed);
     }
@@ -395,8 +433,19 @@ pub fn run(
 
     let started = Instant::now();
     let (mut suspended_at, mut paused_for) = (None::<Instant>, Duration::ZERO);
+    // Bytes read by the tool, added to the job's progress as they grow.
+    let mut reported = 0u64;
+    let mut report_reads = |child: &std::process::Child| {
+        if let Some(p) = &gate.progress {
+            let now = crate::system::bytes_read(child).unwrap_or(reported);
+            p.add_read(now.saturating_sub(reported));
+            reported = reported.max(now);
+        }
+    };
     let status = loop {
-        match child.try_wait() {
+        let exited = child.try_wait();
+        report_reads(&child);
+        match exited {
             Ok(Some(status)) => break Some(status),
             Ok(None) => {}
             Err(_) => break None,
@@ -446,6 +495,21 @@ macro_rules! os_args {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scoop_shims_resolve_to_their_program() {
+        let dir = std::env::temp_dir().join(format!("mediaopti-shim-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let (shim, real) = (dir.join("x.exe"), dir.join("real.exe"));
+        std::fs::write(&shim, b"").unwrap();
+        std::fs::write(&real, b"").unwrap();
+        assert_eq!(shim_target(&shim), None, "no .shim file");
+        std::fs::write(dir.join("x.shim"), format!("path = \"{}\"\r\n", real.display())).unwrap();
+        assert_eq!(shim_target(&shim), Some(real.clone()));
+        std::fs::write(dir.join("x.shim"), format!("path = \"{}\"\r\nargs = -q\r\n", real.display())).unwrap();
+        assert_eq!(shim_target(&shim), None, "extra arguments: keep the shim");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A paused tool is suspended, and the time paused doesn't count toward its timeout.
     #[test]

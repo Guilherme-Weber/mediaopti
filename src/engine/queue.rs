@@ -241,18 +241,20 @@ impl Inner {
             })
             .collect();
 
-        let mut slow_jobs: Vec<SlowJob> = self
-            .cpu_started
-            .iter()
-            .filter(|(_, t)| t.elapsed().as_secs() >= SLOW_JOB_SECS)
-            .map(|(p, t)| SlowJob {
-                name: self.display_name(p),
-                secs: t.elapsed().as_secs(),
-                progress: self.cpu_progress.get(p).and_then(|pr| pr.get()),
+        let mut started: Vec<(&PathBuf, &Instant)> = self.cpu_started.iter().collect();
+        started.sort_by_key(|(_, t)| **t);
+        let cpu_jobs = started
+            .into_iter()
+            .map(|(p, t)| {
+                let progress = self.cpu_progress.get(p);
+                CpuJob {
+                    name: self.display_name(p),
+                    secs: t.elapsed().as_secs(),
+                    parts: progress.and_then(|pr| pr.get()),
+                    phase: progress.and_then(|pr| pr.phase()),
+                }
             })
             .collect();
-        slow_jobs.sort_by_key(|j| std::cmp::Reverse(j.secs));
-        slow_jobs.truncate(4);
         let r = &self.run;
         let videos_running = self.workers.len();
         let type_progress = [
@@ -284,7 +286,7 @@ impl Inner {
                 (self.cpu_queues[2].len().saturating_sub(self.cpu_cursors[2]), self.queue_bytes[3]),
             ],
             queue_revision: self.queue_revision,
-            slow_jobs,
+            cpu_jobs,
             type_progress,
             cpu_waiting_memory: self.cpu_waiting_memory,
             scan_found: 0,

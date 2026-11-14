@@ -2,6 +2,13 @@
 
 import { Button, ComboBox, ListView, ScrollView, Switch } from "std-widgets.slint";
 
+// A file being processed on the CPU; `progress` < 0 when its share done isn't known.
+export struct FileRow {
+    name: string,
+    meta: string,
+    progress: float,
+}
+
 export struct WorkerRow {
     title: string,
     meta: string,
@@ -223,6 +230,19 @@ component ThinBar inherits Rectangle {
     }
 }
 
+// One line per file: name, what it is doing, and a short bar when its share done is known.
+component FileLine inherits HorizontalLayout {
+    in property <FileRow> file;
+    spacing: 8px;
+    min-height: 20px;
+    Text { text: root.file.name; font-size: 12px; color: Theme.text; overflow: elide; horizontal-stretch: 1; vertical-alignment: center; }
+    Text { text: root.file.meta; font-size: 11px; color: Theme.text-tertiary; horizontal-stretch: 0; vertical-alignment: center; }
+    Rectangle {
+        width: 48px;
+        if root.file.progress >= 0: ThinBar { y: (parent.height - self.height) / 2; width: parent.width; progress: root.file.progress; }
+    }
+}
+
 export struct QueueItem {
     name: string,
     kind: string,
@@ -430,6 +450,9 @@ export component AppWindow inherits Window {
     in property <string> overall-percent: "0%";
     in property <string> current-file: "No active file";
     in property <[WorkerRow]> workers;
+    // Files running on the CPU, in two columns (read across: left, right, left...).
+    in property <[FileRow]> files-left;
+    in property <[FileRow]> files-right;
     in property <[string]> log-lines;
     in property <[QueueCount]> queue-counts;
     in property <[QueueItem]> queue-items;
@@ -697,6 +720,20 @@ export component AppWindow inherits Window {
                                 Text { text: worker.meta; font-size: 12px; color: Theme.text-tertiary; horizontal-stretch: 0; }
                             }
                             ThinBar { progress: worker.progress; }
+                        }
+                        if root.files-left.length > 0: HorizontalLayout {
+                            spacing: 24px;
+                            padding-top: 4px;
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                alignment: LayoutAlignment.start;
+                                for f in root.files-left: FileLine { file: f; }
+                            }
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                alignment: LayoutAlignment.start;
+                                for f in root.files-right: FileLine { file: f; }
+                            }
                         }
                     }
 

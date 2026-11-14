@@ -94,6 +94,7 @@ fn optimize_art(ctx: &Ctx, data: &[u8], work: &Path) -> Result<Option<Art>, RunE
     if std::fs::create_dir_all(work).and_then(|()| std::fs::write(&file, data)).is_err() {
         return Ok(None);
     }
+    ctx.phase("cover art", &[]);
     let r = image::optimize(ctx, kind, &file, work)?;
     let Some(best) = r.best else { return Ok(None) };
     Ok(std::fs::read(best).ok().filter(|b| b.len() < data.len()).map(|b| (b, r.steps)))
@@ -281,8 +282,10 @@ fn audio_timeout(ctx: &Ctx, path: &Path) -> std::time::Duration {
 /// the candidate's run at the same time: each is one core, and a long album takes a while.
 fn same_audio(ctx: &Ctx, src: &Path, slot: &mut Option<Option<[u8; 32]>>, out: &Path) -> Result<bool, RunError> {
     let (want, got) = if let Some(cached) = *slot {
+        ctx.phase("verifying", &[out]);
         (cached, audio_hash(ctx, out)?)
     } else {
+        ctx.phase("verifying", &[src, out]);
         let (a, b) = std::thread::scope(|s| {
             let reference = s.spawn(|| audio_hash(ctx, src));
             let candidate = audio_hash(ctx, out);
@@ -408,12 +411,14 @@ fn ogg(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, AudioError> {
     let Some(optivorbis) = ctx.tools.get("optivorbis") else { return skip("optivorbis is missing") };
     let Some(info) = ogg_info(src)? else { return skip("not a single Vorbis stream (Opus, FLAC, video or chained Ogg): skipped") };
     let out = work.join("out.ogg");
+    ctx.phase("optimizing", &[src]);
     let ran = tools::run(optivorbis, crate::os_args!["-q", src, &out], Some(work), Capture::None, ctx.timeout, &ctx.gate)?;
     let before = std::fs::metadata(src).map_or(0, |s| s.len());
     let smaller = ran.success && std::fs::metadata(&out).is_ok_and(|m| worth_keeping(before, m.len()));
     if !smaller || ogg_info(&out)?.as_ref() != Some(&info) {
         return Ok(Optimized::nothing());
     }
+    ctx.phase("verifying", &[src, &out]);
     let (Some((want, want_len)), Some((got, got_len))) = (decoded(ctx, src, None)?, decoded(ctx, &out, None)?) else {
         return Ok(Optimized::nothing());
     };
@@ -523,6 +528,7 @@ fn lossless_to_flac(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, Aud
         args.extend(crate::os_args!["-bits_per_raw_sample", bits.to_string()]);
     }
     args.extend(crate::os_args!["-c:v", "copy", "-disposition:v", "attached_pic", &out]);
+    ctx.phase("converting", &[src]);
     if !tools::run(&ctx.tools.ffmpeg, args, None, Capture::None, audio_timeout(ctx, src), &ctx.gate)?.success || !out.is_file() {
         return skip("could not convert it to FLAC");
     }
@@ -532,6 +538,7 @@ fn lossless_to_flac(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, Aud
     if !same_format {
         return skip("the FLAC would not have the same format or cover art: kept");
     }
+    ctx.phase("verifying", &[src, &out]);
     let want = audio_hash(ctx, src)?;
     if want.is_none() || audio_hash(ctx, &out)? != want {
         return skip("the FLAC does not decode to the same audio: kept");
@@ -651,6 +658,7 @@ fn wav(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, AudioError> {
             args.push("--keep-foreign-metadata-if-present".into());
         }
         args.extend(crate::os_args!["--verify", "--silent", "-f", "-o", &out, src]);
+        ctx.phase("converting", &[src]);
         if tools::run(flac, args, Some(work), Capture::None, audio_timeout(ctx, src), &ctx.gate)?.success && out.is_file() {
             encoded = true;
             break;
@@ -660,6 +668,7 @@ fn wav(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, AudioError> {
         return skip("flac could not encode it");
     }
     let same_format = flac_read(&out)?.as_ref().and_then(flac_format).is_some_and(|f| f == format);
+    ctx.phase("verifying", &[src, &out]);
     let reference = audio_hash(ctx, src)?;
     if !same_format || reference.is_none() || audio_hash(ctx, &out)? != reference {
         return skip("the FLAC does not decode to the same audio: kept as WAV");
@@ -709,7 +718,8 @@ fn flac(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, AudioError> {
             let out = work.join("enc.flac");
             let mut args = flac_level(ctx);
             args.extend(crate::os_args!["--verify", "--silent", "-f", "-o", &out, &best]);
-            let ran = tools::run(flac, args, Some(work), Capture::None, audio_timeout(ctx, src), &ctx.gate)?;
+            ctx.phase("re-encoding", &[&best]);
+            let ran =tools::run(flac, args, Some(work), Capture::None, audio_timeout(ctx, src), &ctx.gate)?;
             if ran.success {
                 let size = std::fs::metadata(&out).map_or(u64::MAX, |m| m.len());
                 let original = std::fs::metadata(src)?.len();
