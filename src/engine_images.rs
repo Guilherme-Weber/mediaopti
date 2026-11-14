@@ -18,8 +18,7 @@ use std::time::Duration;
 /// machine runs out of commit, allocations fail and processes (this app included) abort.
 const IMAGE_MIN_FREE_COMMIT: u64 = 2 * 1024 * 1024 * 1024;
 
-/// Audio files are replaced when at least this much smaller, even below 0.5%.
-const AUDIO_MIN_GAIN: u64 = 64 * 1024;
+
 
 /// Log a progress line every this many images (one line per image would flood the log).
 const PROGRESS_EVERY: usize = 250;
@@ -73,11 +72,13 @@ impl CpuCtx {
     }
 }
 
-/// How many CPU files of each stage run at once with `slots` CPU slots: audio 2 (disk-heavy),
-/// documents half the slots (CPU-bound, but a PDF's renders and qpdf use memory; comic pages
-/// borrow the idle slots), images every slot.
+/// How many CPU files of each stage run at once with `slots` CPU slots: audio half the slots
+/// (decoding is one core per file; the files are read once, sequentially), documents half the
+/// slots (a PDF's renders and qpdf use memory; comic pages borrow the idle slots), images every
+/// slot.
 fn stage_limits(slots: usize) -> [usize; 3] {
-    [2, (slots / 2).max(2), usize::MAX]
+    let half = (slots / 2).max(2);
+    [half, half, usize::MAX]
 }
 
 enum CpuClaim {
@@ -133,7 +134,7 @@ impl Inner {
                 self.stage_logged[stage] = true;
                 let left = self.cpu_queues[stage].len() - cursor;
                 let (what, how) = match stage {
-                    0 => ("audio files", format!("{} at a time (disk-heavy)", limits[0])),
+                    0 => ("audio files", format!("{} at a time", limits[0])),
                     1 => ("documents", format!("{} at a time, comic pages on idle cores", limits[1])),
                     _ => ("images", "on every free core".to_string()),
                 };
@@ -555,18 +556,30 @@ pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, dispo
         return ImageResult::Kept { content: content_of(path), note: None };
     }
     let job = NEXT_JOB.fetch_add(1, Ordering::Relaxed);
-    let factor = if kind == image::Kind::Pdf { 16 } else { 4 };
+    // FLAC, MP3 and Ogg are read where they are (ffmpeg, flac and OptiVorbis open any path,
+    // and nothing writes to the original): a long album isn't copied to the temp folder first.
+    let in_place = matches!(kind, image::Kind::Flac | image::Kind::Mp3 | image::Kind::Ogg);
+    let factor = match kind {
+        image::Kind::Pdf => 16,
+        _ if in_place => 2,
+        _ => 4,
+    };
     let workdir = match WorkDir::new(path, state.0, factor, &opts.temp, &format!("mediaopti-img-{}-{job}", std::process::id())) {
         Ok(w) => w,
         Err(why) => return ImageResult::Skipped(why),
     };
     let work = workdir.path.clone();
-    // ASCII name: some tools can't open Unicode paths. A misnamed picture's copy gets its
-    // real extension (tools pick the format from it).
-    let src = work.join(format!("orig.{}", if kind == named { ext.as_str() } else { image::ext_of(kind) }));
-    if let Err(err) = std::fs::copy(path, &src) {
-        return ImageResult::Failed(format!("could not copy it to the temp folder: {err}"));
-    }
+    // Otherwise a copy with an ASCII name: some tools can't open Unicode paths. A misnamed
+    // picture's copy gets its real extension (tools pick the format from it).
+    let src = if in_place {
+        path.to_path_buf()
+    } else {
+        let copy = work.join(format!("orig.{}", if kind == named { ext.as_str() } else { image::ext_of(kind) }));
+        if let Err(err) = std::fs::copy(path, &copy) {
+            return ImageResult::Failed(format!("could not copy it to the temp folder: {err}"));
+        }
+        copy
+    };
     let before = state.0;
 
     let result = match image::optimize(ctx, kind, &src, &work) {
@@ -578,7 +591,7 @@ pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, dispo
     };
     // At least 0.5% smaller. Audio also counts 64 KiB: cover art is a small part of a
     // song, but its saving is lossless and verified, and adds up over a music library.
-    let min_gain = if kind.is_audio() { (before / 200).min(AUDIO_MIN_GAIN) } else { before / 200 };
+    let min_gain = if kind.is_audio() { (before / 200).min(crate::audio::MIN_GAIN) } else { before / 200 };
     let smaller = result.best.as_ref().map(|b| (b.clone(), std::fs::metadata(b).map_or(before, |m| m.len()))).filter(|(_, after)| before.saturating_sub(*after) >= min_gain.max(1));
     // The new name: a conversion's (only when it is smaller), or the real format's.
     let new_ext = match (&smaller, result.new_ext) {

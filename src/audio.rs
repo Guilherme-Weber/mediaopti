@@ -19,6 +19,15 @@ use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
+/// An audio file is replaced when the new version is at least this much smaller (or 0.5%).
+pub const MIN_GAIN: u64 = 64 * 1024;
+
+/// Whether `after` bytes is enough smaller than `before` to replace the file: checked before
+/// the slow verification (decoding the whole audio twice), so it isn't done for nothing.
+pub fn worth_keeping(before: u64, after: u64) -> bool {
+    before.saturating_sub(after) >= (before / 200).clamp(1, MIN_GAIN)
+}
+
 /// Tags or metadata bigger than this are left alone (they are read into memory).
 const MAX_META: u64 = 64 * 1024 * 1024;
 /// Pictures smaller than this aren't worth optimizing.
@@ -268,12 +277,22 @@ fn audio_timeout(ctx: &Ctx, path: &Path) -> std::time::Duration {
     ctx.timeout.max(std::time::Duration::from_secs(size / bytes_per_sec))
 }
 
-/// The decoded-audio hash of `src`, computed on first use (`None` if it can't be decoded).
-fn reference_audio(ctx: &Ctx, src: &Path, slot: &mut Option<Option<[u8; 32]>>) -> Result<Option<[u8; 32]>, RunError> {
-    if slot.is_none() {
-        *slot = Some(audio_hash(ctx, src)?);
-    }
-    Ok(slot.flatten())
+/// Whether `out` decodes to the same audio as `src`. The original's decode (kept in `slot`) and
+/// the candidate's run at the same time: each is one core, and a long album takes a while.
+fn same_audio(ctx: &Ctx, src: &Path, slot: &mut Option<Option<[u8; 32]>>, out: &Path) -> Result<bool, RunError> {
+    let (want, got) = if let Some(cached) = *slot {
+        (cached, audio_hash(ctx, out)?)
+    } else {
+        let (a, b) = std::thread::scope(|s| {
+            let reference = s.spawn(|| audio_hash(ctx, src));
+            let candidate = audio_hash(ctx, out);
+            (reference.join().unwrap_or(Ok(None)), candidate)
+        });
+        let want = a?;
+        *slot = Some(want);
+        (want, b?)
+    };
+    Ok(want.is_some() && got == want)
 }
 
 /// Written by libFLAC 1.4 or later: re-encoding gains almost nothing (about 0.1%).
@@ -390,7 +409,8 @@ fn ogg(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, AudioError> {
     let Some(info) = ogg_info(src)? else { return skip("not a single Vorbis stream (Opus, FLAC, video or chained Ogg): skipped") };
     let out = work.join("out.ogg");
     let ran = tools::run(optivorbis, crate::os_args!["-q", src, &out], Some(work), Capture::None, ctx.timeout, &ctx.gate)?;
-    let smaller = ran.success && std::fs::metadata(&out).is_ok_and(|m| m.len() < std::fs::metadata(src).map_or(0, |s| s.len()));
+    let before = std::fs::metadata(src).map_or(0, |s| s.len());
+    let smaller = ran.success && std::fs::metadata(&out).is_ok_and(|m| worth_keeping(before, m.len()));
     if !smaller || ogg_info(&out)?.as_ref() != Some(&info) {
         return Ok(Optimized::nothing());
     }
@@ -676,7 +696,7 @@ fn flac(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, AudioError> {
         let out = work.join("art.flac");
         write_with_tail(&out, &flac_header(&new_blocks), src, orig.audio_at)?;
         let size = std::fs::metadata(&out)?.len();
-        if size < best_size && flac_art_ok(ctx, &orig, reference_audio(ctx, src, &mut orig_audio)?, src, &out)? {
+        if worth_keeping(best_size, size) && flac_art_same_layout(&orig, src, &out)? && same_audio(ctx, src, &mut orig_audio, &out)? {
             (best, best_size) = (out, size);
             steps.push(art_label(n_art, &art_steps));
         }
@@ -692,7 +712,8 @@ fn flac(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, AudioError> {
             let ran = tools::run(flac, args, Some(work), Capture::None, audio_timeout(ctx, src), &ctx.gate)?;
             if ran.success {
                 let size = std::fs::metadata(&out).map_or(u64::MAX, |m| m.len());
-                if size < best_size && flac_encode_ok(ctx, reference_audio(ctx, src, &mut orig_audio)?, &best, &out)? {
+                let original = std::fs::metadata(src)?.len();
+                if size < best_size && worth_keeping(original, size) && flac_encode_same_tags(&best, &out)? && same_audio(ctx, src, &mut orig_audio, &out)? {
                     best = out;
                     steps.push(if ctx.max.flac_e { "flac-8pe" } else { "flac-8p" }.to_string());
                 }
@@ -714,9 +735,9 @@ fn tag_at_end(path: &Path) -> io::Result<bool> {
     Ok(id3v1 || tail.windows(8).any(|w| w == b"APETAGEX"))
 }
 
-/// The new file has the same blocks except for picture data, the same audio bytes, and
-/// still decodes to the same audio.
-fn flac_art_ok(ctx: &Ctx, orig: &Flac, orig_audio: Option<[u8; 32]>, src: &Path, out: &Path) -> Result<bool, AudioError> {
+/// The new file has the same blocks except for picture data, and the same audio bytes (the
+/// decode check follows separately).
+fn flac_art_same_layout(orig: &Flac, src: &Path, out: &Path) -> Result<bool, AudioError> {
     let Some(new) = flac_read(out)? else { return Ok(false) };
     let same_blocks = new.blocks.len() == orig.blocks.len()
         && new.blocks.iter().zip(&orig.blocks).all(|(n, o)| {
@@ -730,18 +751,18 @@ fn flac_art_ok(ctx: &Ctx, orig: &Flac, orig_audio: Option<[u8; 32]>, src: &Path,
                     n.1 == o.1
                 }
         });
-    Ok(same_blocks && same_tail(src, orig.audio_at, out, new.audio_at)? && orig_audio.is_some() && audio_hash(ctx, out)? == orig_audio)
+    Ok(same_blocks && same_tail(src, orig.audio_at, out, new.audio_at)?)
 }
 
-/// A re-encoded file must decode to the same audio and keep the tags and the CUESHEET,
-/// APPLICATION and PICTURE blocks exactly.
-fn flac_encode_ok(ctx: &Ctx, orig_audio: Option<[u8; 32]>, before: &Path, out: &Path) -> Result<bool, AudioError> {
+/// A re-encoded file must keep the tags and the CUESHEET, APPLICATION and PICTURE blocks
+/// exactly (the decode check follows separately).
+fn flac_encode_same_tags(before: &Path, out: &Path) -> Result<bool, AudioError> {
     let (Some(a), Some(b)) = (flac_read(before)?, flac_read(out)?) else { return Ok(false) };
     let kept = |f: &Flac| -> Vec<(u8, Vec<u8>)> { f.blocks.iter().filter(|b| matches!(b.0, 2 | 5 | 6)).cloned().collect() };
     let tags = |f: &Flac| -> Option<Vec<u8>> {
         f.blocks.iter().find(|b| b.0 == VORBIS_COMMENT).map(|b| vorbis_comments(&b.1).unwrap_or_default().to_vec())
     };
-    Ok(kept(&a) == kept(&b) && tags(&a) == tags(&b) && orig_audio.is_some() && audio_hash(ctx, out)? == orig_audio)
+    Ok(kept(&a) == kept(&b) && tags(&a) == tags(&b))
 }
 
 // ---------------------------------------------------------------- MP3
