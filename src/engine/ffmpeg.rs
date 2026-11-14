@@ -61,7 +61,8 @@ impl Engine {
         let permit = if let Ok(permit) = self.admission.clone().try_lock_owned() {
             permit
         } else {
-            self.reset_worker(worker_id, format!("{display} (waiting to start)"));
+            let step = self.worker_step(worker_id);
+            self.reset_worker(worker_id, display, "waiting to start");
             self.send_state(false);
             let permit = tokio::select! {
                 permit = self.admission.clone().lock_owned() => permit,
@@ -69,17 +70,18 @@ impl Engine {
                     return Attempt { status: AttemptStatus::Stopped, diag };
                 }
             };
-            self.reset_worker(worker_id, display.to_string());
+            self.reset_worker(worker_id, display, &step);
             permit
         };
         // A retry (AAC / CPU fallback) may come up while the batch is paused.
         if self.is_paused() {
-            self.reset_worker(worker_id, format!("{display} (paused)"));
+            let step = self.worker_step(worker_id);
+            self.reset_worker(worker_id, display, "paused");
             self.send_state(false);
             if !self.wait_while_paused(&cancel).await {
                 return Attempt { status: AttemptStatus::Stopped, diag };
             }
-            self.reset_worker(worker_id, display.to_string());
+            self.reset_worker(worker_id, display, &step);
         }
         if !self.wait_for_memory(worker_id, display, &cancel).await {
             return Attempt {

@@ -2,6 +2,21 @@
 
 use super::*;
 
+/// Counts a video job as completed when dropped (every way out of `process_one` after its
+/// encode), unless disarmed.
+struct Completion<'a> {
+    engine: &'a Engine,
+    armed: bool,
+}
+
+impl Drop for Completion<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.engine.lock().run.completed += 1;
+        }
+    }
+}
+
 impl Engine {
     pub(super) async fn process_one(self: &Arc<Self>, worker_id: u32) -> Outcome {
         let cancel = self.lock().cancel.clone();
@@ -92,7 +107,7 @@ impl Engine {
         }
 
         let tmp = args::temp_name(&input, worker_id);
-        self.reset_worker(worker_id, display.clone());
+        self.reset_worker(worker_id, &display, "encoding");
         self.log_remove(&tmp);
         self.send_state(true);
         self.log(format!("[Worker {worker_id}] Processing: {display}"));
@@ -160,7 +175,7 @@ impl Engine {
             self.log(format!(
                 "[Worker {worker_id}] NVENC hardware limit on {display}; falling back to CPU software encoder..."
             ));
-            self.reset_worker(worker_id, format!("{display} (CPU fallback)"));
+            self.reset_worker(worker_id, &display, "encoding on the CPU");
             attempt = self
                 .run_attempt(worker_id, &input, &tmp, &display, Mode::CpuFallback, 0)
                 .await;
@@ -177,7 +192,7 @@ impl Engine {
             self.log(format!(
                 "[Worker {worker_id}] Stream copy failed on {display}; retrying with AAC audio transcode..."
             ));
-            self.reset_worker(worker_id, format!("{display} (AAC fallback)"));
+            self.reset_worker(worker_id, &display, "encoding, audio as AAC");
             attempt = self
                 .run_attempt(worker_id, &input, &tmp, &display, Mode::TranscodeAudio, 0)
                 .await;
@@ -190,7 +205,7 @@ impl Engine {
             self.log(format!(
                 "[Worker {worker_id}] Hardware pipeline failed on {display}; attempting final CPU software fallback..."
             ));
-            self.reset_worker(worker_id, format!("{display} (CPU fallback)"));
+            self.reset_worker(worker_id, &display, "encoding on the CPU");
             attempt = self
                 .run_attempt(worker_id, &input, &tmp, &display, Mode::CpuFallback, 0)
                 .await;
@@ -227,7 +242,8 @@ impl Engine {
             AttemptStatus::Stopped => unreachable!(),
         };
 
-        self.lock().run.completed += 1;
+        // Counted as completed when this job ends (after a quality retry too), however it ends.
+        let mut completion = Completion { engine: self, armed: true };
 
         if code != 0 {
             self.lock().failed.insert(input.clone());
@@ -305,6 +321,7 @@ impl Engine {
                     // A GIF that doesn't make a smaller video stays a GIF, but is still
                     // optimized as an image (e.g. slideshow-like "process" GIFs).
                     if args::is_gif(&input) && self.lock().options.images != ImageMode::Off {
+                        completion.armed = false; // counted as an image instead
                         return self.gif_as_image(worker_id, &input, &display).await;
                     }
                     self.remember(&input, &input).await;
@@ -529,12 +546,13 @@ impl Engine {
     /// Waits until another encoder fits in memory. Returns false if Stop was pressed.
     pub(super) async fn wait_for_memory(&self, worker_id: u32, display: &str, cancel: &CancellationToken) -> bool {
         let mut announced = false;
+        let step = self.worker_step(worker_id);
         loop {
             let running = self.lock().running_processes;
             let memory = system::memory_status();
             if may_start_encoder(running, memory) {
                 if announced {
-                    self.reset_worker(worker_id, display.to_string());
+                    self.reset_worker(worker_id, display, &step);
                     self.log(format!("[Worker {worker_id}] Memory available again; starting {display}"));
                 }
                 return true;
@@ -545,7 +563,7 @@ impl Engine {
                 self.log(format!(
                     "[Worker {worker_id}] Waiting for free memory before starting {display} ({free_gb:.1} GB available)"
                 ));
-                self.reset_worker(worker_id, format!("{display} (waiting for memory)"));
+                self.reset_worker(worker_id, display, "waiting for memory");
             }
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(2)) => {}

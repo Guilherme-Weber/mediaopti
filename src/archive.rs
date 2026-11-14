@@ -224,6 +224,7 @@ fn repack(ctx: &Ctx, kind: Kind, src: &Path, work: &Path) -> Result<Optimized, E
         }
     }
     let ictx = inner_ctx(ctx, kind);
+    ctx.phase("pictures", &[]);
     if let Some(p) = &ctx.progress {
         let pictures = (0..zin.len()).filter(|&i| zin.name_for_index(i).is_some_and(|n| n.as_ref().is_ok_and(|n| image_kind(n).is_some()))).count();
         p.set_total(pictures);
@@ -400,10 +401,12 @@ fn cbr(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, Error> {
     let xdir = work.join("x");
     let mut out_arg = std::ffi::OsString::from("-o");
     out_arg.push(&xdir);
+    ctx.phase("extracting", &[src]);
     if !tools::run(sz, crate::os_args!["x", "-y", "-sccUTF-8", out_arg, src], None, Capture::None, ctx.timeout, &ctx.gate)?.success {
         return Ok(Optimized::skipped("7-Zip could not extract it"));
     }
     let ictx = inner_ctx(ctx, Kind::Cbr);
+    ctx.phase("pictures", &[]);
     if let Some(p) = &ctx.progress {
         p.set_total(files.iter().filter(|e| image_kind(&e.path).is_some()).count());
     }

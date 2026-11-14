@@ -179,7 +179,7 @@ impl Engine {
                 inner.job_opts(),
             )
         };
-        self.reset_worker(worker_id, format!("{display} (optimizing as GIF)"));
+        self.reset_worker(worker_id, display, "optimizing as GIF");
         self.send_state(false);
         let p = input.to_path_buf();
         // Video worker ids are 1-4; image-temp names use a separate range.
@@ -197,14 +197,13 @@ impl Engine {
             }
             _ => super::Outcome::Skipped,
         };
-        // Recorded like any finished image (history, savings, log). The video attempt already
-        // counted this file as completed, so that count is taken back.
+        // Recorded like any finished image (history, savings, log); the video job doesn't
+        // count it as completed (see `Completion`).
         {
             let mut inner = self.lock();
             inner.images_active += 1; // finish_image decrements it
             inner.run.images_total += 1;
             inner.run.stage_total[2] += 1;
-            inner.run.completed = inner.run.completed.saturating_sub(1);
         }
         self.finish_image(input, lossy, result);
         outcome

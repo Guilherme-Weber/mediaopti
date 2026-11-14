@@ -213,6 +213,7 @@ impl Inner {
         self.cpu_progress.clear();
         self.cpu_waiting_memory = false;
         self.workers.clear();
+        self.worker_files.clear();
         self.space_saved_mb = 0.0;
     }
 
@@ -224,19 +225,20 @@ impl Inner {
         let live = self.status != Status::Paused;
         let workers = self
             .workers
-            .iter()
-            .map(|(id, w)| {
+            .values()
+            .map(|w| {
                 let (fps, speed) = if live { (w.fps, w.speed) } else { (0.0, 0.0) };
                 total_fps += fps;
                 total_speed += speed;
                 let pct = w.percent.clamp(0.0, 100.0);
                 progress_sum += pct / 100.0;
                 WorkerDto {
-                    worker_id: *id,
                     file: w.file.clone(),
                     fps: fps.round() as i64,
                     speed: round1(speed),
                     percent: pct.round() as i64,
+                    step: w.step.clone(),
+                    secs: w.started.elapsed().as_secs(),
                 }
             })
             .collect();

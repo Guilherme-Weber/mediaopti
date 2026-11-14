@@ -84,11 +84,14 @@ struct RunStats {
 
 #[derive(Clone, Debug)]
 pub struct WorkerDto {
-    pub worker_id: u32,
     pub file: String,
     pub fps: i64,
     pub speed: f64,
     pub percent: i64,
+    /// What it does now ("encoding", "measuring quality at +4"...).
+    pub step: String,
+    /// Seconds since it started this file.
+    pub secs: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -177,6 +180,8 @@ struct Inner {
     failed: HashSet<PathBuf>,
     in_progress: HashSet<PathBuf>,
     workers: BTreeMap<u32, WorkerProgress>,
+    /// Each video worker's file and when it started it (kept while its row comes and goes).
+    worker_files: BTreeMap<u32, (String, Instant)>,
     running_processes: usize,
     gpu_enc: f64,
     gpu_vram_mb: f64,
@@ -279,6 +284,7 @@ impl Engine {
                 failed: HashSet::new(),
                 in_progress: HashSet::new(),
                 workers: BTreeMap::new(),
+                worker_files: BTreeMap::new(),
                 running_processes: 0,
                 gpu_enc: 0.0,
                 gpu_vram_mb: 0.0,

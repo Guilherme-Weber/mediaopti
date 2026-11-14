@@ -274,11 +274,14 @@ pub struct Progress {
 }
 
 impl Progress {
-    /// A new step: `expect` is how many bytes its tools will read (0: unknown).
+    /// A new step: `expect` is how many bytes its tools will read (0: unknown). Its parts
+    /// start again from none.
     pub fn begin(&self, phase: &'static str, expect: u64) {
         *self.phase.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = phase;
         self.read.store(0, std::sync::atomic::Ordering::Relaxed);
         self.expect.store(expect, std::sync::atomic::Ordering::Relaxed);
+        self.done.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.total.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn add_read(&self, bytes: u64) {

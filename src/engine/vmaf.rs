@@ -99,7 +99,7 @@ impl Engine {
             let boost = STEPS[k];
             tried[k] = true;
             self.log_remove(tmp);
-            self.reset_worker(worker_id, format!("{display} (quality retry +{boost})"));
+            self.reset_worker(worker_id, display, &format!("quality retry +{boost}"));
             let attempt = self.run_attempt(worker_id, input, tmp, display, mode, boost).await;
             match attempt.status {
                 AttemptStatus::Stopped => {
@@ -124,7 +124,7 @@ impl Engine {
                 }
                 return finish(self, best, &notes).await;
             }
-            self.reset_worker(worker_id, format!("{display} (measuring quality at +{boost})"));
+            self.reset_worker(worker_id, display, &format!("measuring quality at +{boost}"));
             self.send_state(false);
             let mut measured = match self.measure_vmaf(input, tmp, duration_sec, None).await {
                 Err(Stopped) => {

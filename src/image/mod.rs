@@ -449,6 +449,7 @@ pub fn optimize(ctx: &Ctx, kind: Kind, src: &Path, work: &Path) -> Result<Optimi
         Kind::Jpg if ver.segs.is_none() => return skip("not a JPEG"),
         _ => {}
     }
+    ctx.phase("lossless", &[]);
     let mut chain = match kind {
         Kind::Png => png_chain(ctx, work, src, src, &ver)?,
         Kind::Jpg => jpg_chain(ctx, work, src, &ver)?,
@@ -460,7 +461,8 @@ pub fn optimize(ctx: &Ctx, kind: Kind, src: &Path, work: &Path) -> Result<Optimi
         }
         _ => unreachable!("handled above"),
     };
-    if ctx.lossy && ctx.tools.has("ssimulacra2") {
+    if ctx.lossy && ctx.tools.has("ssimulacra2") && matches!(kind, Kind::Png | Kind::Jpg) {
+        ctx.phase("lossy search", &[]);
         match kind {
             Kind::Png => lossy_png(ctx, work, src, &mut chain, &ver)?,
             Kind::Jpg => lossy_jpeg(ctx, work, src, &mut chain, &ver)?,
@@ -493,6 +495,7 @@ fn to_png(ctx: &Ctx, kind: Kind, src: &Path, work: &Path) -> Result<Optimized, R
         return Ok(Optimized::skipped("too large to convert"));
     }
     let Some(deep) = more_than_8_bits(kind, src) else { return Ok(Optimized::skipped("not a BMP/TGA image")) };
+    ctx.phase("converting", &[]);
     let ffmpeg = &ctx.tools.ffmpeg;
     let decode = |args: Vec<OsString>, capture: Capture| -> Result<Option<tools::Ran>, RunError> {
         let mut a = crate::os_args!["-v", "error", "-i", src, "-frames:v", "1"];

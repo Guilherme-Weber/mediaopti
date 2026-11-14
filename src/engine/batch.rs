@@ -417,10 +417,26 @@ impl Engine {
         });
     }
 
-    pub(super) fn reset_worker(&self, worker_id: u32, label: String) {
-        self.lock()
-            .workers
-            .insert(worker_id, WorkerProgress::new(label));
+    /// Shows `display` on the worker's row doing `step`, from 0%. The file's time keeps
+    /// counting from its first step.
+    pub(super) fn reset_worker(&self, worker_id: u32, display: &str, step: &str) {
+        let mut inner = self.lock();
+        let started = match inner.worker_files.get(&worker_id) {
+            Some((file, t)) if file == display => *t,
+            _ => {
+                inner.worker_files.insert(worker_id, (display.to_string(), Instant::now()));
+                Instant::now()
+            }
+        };
+        let mut w = WorkerProgress::new(display);
+        w.step = step.to_string();
+        w.started = started;
+        inner.workers.insert(worker_id, w);
+    }
+
+    /// The worker's step now ("encoding" if it has none).
+    pub(super) fn worker_step(&self, worker_id: u32) -> String {
+        self.lock().workers.get(&worker_id).map_or_else(|| "encoding".to_string(), |w| w.step.clone())
     }
 
     pub(super) fn release_tracking(&self, worker_id: u32, input: &Path) {

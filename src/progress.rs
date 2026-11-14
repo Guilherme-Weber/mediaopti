@@ -44,6 +44,10 @@ pub struct WorkerProgress {
     pub percent: f64,
     pub last_encoded_sec: f64,
     pub last_progress_at: Instant,
+    /// What the worker does now ("encoding", "measuring quality at +4"...).
+    pub step: String,
+    /// When the worker started this file.
+    pub started: Instant,
 }
 
 impl WorkerProgress {
@@ -56,6 +60,8 @@ impl WorkerProgress {
             percent: 0.0,
             last_encoded_sec: 0.0,
             last_progress_at: Instant::now(),
+            step: "encoding".to_string(),
+            started: Instant::now(),
         }
     }
 }

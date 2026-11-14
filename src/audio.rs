@@ -95,7 +95,7 @@ fn optimize_art(ctx: &Ctx, data: &[u8], work: &Path) -> Result<Option<Art>, RunE
         return Ok(None);
     }
     ctx.phase("cover art", &[]);
-    let r = image::optimize(ctx, kind, &file, work)?;
+    let r = image::optimize(&Ctx { progress: None, ..ctx.clone() }, kind, &file, work)?;
     let Some(best) = r.best else { return Ok(None) };
     Ok(std::fs::read(best).ok().filter(|b| b.len() < data.len()).map(|b| (b, r.steps)))
 }

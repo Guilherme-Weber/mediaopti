@@ -606,29 +606,28 @@ impl Controller {
                 };
                 workers.push(row((*name).into(), done, total, meta));
             }
-            workers.extend(t.workers.iter().map(|wk| WorkerRow {
-                title: format!("Worker {} · {}", wk.worker_id, wk.file).into(),
-                meta: if wk.fps > 0 {
-                    format!("{}% · {} fps ({}x)", wk.percent, wk.fps, wk.speed)
-                } else {
-                    format!("{}%", wk.percent)
-                }
-                .into(),
-                progress: wk.percent as f32 / 100.0,
-            }));
         }
         sync_model(&self.worker_model, workers);
-        // Every file running on the CPU: its step and share done when known, else its time.
+        // Every file being worked on, videos first, one line each in the same form: its step,
+        // its share done when known, and its time so far.
+        let mut files: Vec<FileRow> = Vec::new();
+        if processing {
+            for wk in &t.workers {
+                let share = (wk.percent > 0).then(|| wk.percent as f32 / 100.0);
+                let fps = (wk.fps > 0).then(|| format!("{} fps ({}x)", wk.fps, wk.speed));
+                files.push(file_row(&wk.file, &wk.step, share, fps, wk.secs));
+            }
+            for job in &s.cpu_jobs {
+                let (step, share) = match (job.phase, job.parts) {
+                    (Some((phase, _)), Some((done, total))) => (format!("{phase} {done} of {total}"), Some(done as f32 / total.max(1) as f32)),
+                    (Some((phase, share)), None) => (phase.to_string(), share),
+                    (None, _) => ("starting".to_string(), None),
+                };
+                files.push(file_row(&job.name, &step, share, None, job.secs));
+            }
+        }
         let (mut left, mut right) = (Vec::new(), Vec::new());
-        for (i, job) in s.cpu_jobs.iter().enumerate().filter(|_| processing) {
-            let time = format_duration(std::time::Duration::from_secs(job.secs));
-            let (meta, progress) = match (job.parts, job.phase) {
-                (Some((done, total)), _) => (format!("{done} of {total} pictures · {time}"), done as f32 / total.max(1) as f32),
-                (None, Some((phase, Some(f)))) => (format!("{phase} {:.0}% · {time}", f * 100.0), f),
-                (None, Some((phase, None))) => (format!("{phase} · {time}"), -1.0),
-                (None, None) => (time, -1.0),
-            };
-            let row = FileRow { name: job.name.as_str().into(), meta: meta.into(), progress };
+        for (i, row) in files.into_iter().enumerate() {
             if i % 2 == 0 { left.push(row) } else { right.push(row) }
         }
         sync_model(&self.files_left, left);
@@ -658,6 +657,20 @@ impl Controller {
 }
 
 /// Updates rows in place when the length is unchanged (avoids rebuilding list items).
+/// One file's line: "verifying 45% · 120 fps · 0:12"; the bar only when the share is known
+/// (a step with parts already says "12 of 150", so no percentage is added).
+fn file_row(name: &str, step: &str, share: Option<f32>, extra: Option<String>, secs: u64) -> FileRow {
+    let mut meta = step.to_string();
+    if let Some(f) = share.filter(|_| !step.contains(" of ")) {
+        meta += &format!(" {:.0}%", f * 100.0);
+    }
+    for part in extra.into_iter().chain(std::iter::once(format_duration(std::time::Duration::from_secs(secs)))) {
+        meta += " · ";
+        meta += &part;
+    }
+    FileRow { name: name.into(), meta: meta.into(), progress: share.unwrap_or(-1.0) }
+}
+
 fn sync_model<T: Clone + PartialEq + 'static>(model: &VecModel<T>, rows: Vec<T>) {
     if model.row_count() == rows.len() {
         for (i, row) in rows.into_iter().enumerate() {

@@ -92,6 +92,7 @@ pub fn optimize(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, RunErro
     if file_contains(src, b"/ByteRange").map_err(|e| RunError::Failed(e.to_string()))? {
         return Ok(Optimized::skipped("digitally signed: skipped"));
     }
+    ctx.phase("reading", &[]);
     let Some(reference) = Reference::read(ctx, src)? else { return Ok(Optimized::skipped("qpdf cannot read it")) };
     let rewrite = crate::os_args![
         "--object-streams=generate", "--compress-streams=y", "--recompress-flate", "--compression-level=9",
@@ -113,11 +114,15 @@ pub fn optimize(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, RunErro
             let mut u = OsString::from("--update-from-json=");
             u.push(&update.json);
             args.extend([u, src.into(), out.clone().into()]);
+            ctx.phase("rewriting", &[]);
             let ran = qpdf(ctx, args, Capture::None)?;
             let ok = ran.success
                 && size(&out) < src_size
                 && reference.accepts(ctx, &out)?
-                && (update.lossy == 0 || pages_look_same(ctx, src, &out, &dir.join("render"))?);
+                && (update.lossy == 0 || {
+                    ctx.phase("checking pages", &[]);
+                    pages_look_same(ctx, src, &out, &dir.join("render"))?
+                });
             if ok {
                 let mut label = "qpdf".to_string();
                 if update.lossless > 0 {
@@ -134,6 +139,7 @@ pub fn optimize(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, RunErro
     let out = work.join("rewrite.pdf");
     let mut args = rewrite;
     args.extend([src.into(), out.clone().into()]);
+    ctx.phase("rewriting", &[]);
     let ok = qpdf(ctx, args, Capture::None)?.success && size(&out) < src_size && reference.accepts(ctx, &out)?;
     Ok(if ok { Optimized::found(Some(out), vec!["qpdf".into()]) } else { Optimized::nothing() })
 }
@@ -254,6 +260,7 @@ fn optimize_images(ctx: &Ctx, src: &Path, work: &Path, lossy: bool) -> Result<Op
         .collect();
     let keep_ratio = 1.0 - ctx.lossy_min_gain;
     let (mut update, mut n_lossless, mut n_lossy) = (Map::new(), 0, 0);
+    ctx.phase("pictures", &[]);
     if let Some(p) = &ctx.progress {
         let images = objects.values().filter(|o| o.pointer("/stream/dict/~1Subtype").and_then(Value::as_str) == Some("/Image")).count();
         p.set_total(images);
