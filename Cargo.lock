@@ -2545,7 +2545,7 @@ dependencies = [
 
 [[package]]
 name = "mediaopti"
-version = "3.0.5"
+version = "3.0.6"
 dependencies = [
  "blake2",
  "crc32fast",
