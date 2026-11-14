@@ -211,7 +211,7 @@ pub fn ext_of(kind: Kind) -> &'static str {
 pub struct Max {
     /// PNG: oxipng `-o max` instead of `-o 4`.
     pub oxipng_max: bool,
-    /// PNG: ECT after oxipng (`-9` under 2 MP, `-6` above).
+    /// PNG: ECT `-6` after oxipng.
     pub png_ect: bool,
     /// PNG lossy: pingo `-quality` as a third method.
     pub png_pingo: bool,
@@ -235,7 +235,7 @@ impl Max {
     /// The parts used by the Maximum setting: those that paid off when each was measured
     /// alone on random samples of the author's library (2026-11-11, lossy images):
     /// - ECT on PNG (-9 under 2 MP, -6 above): 80 real PNGs -2.57% -> -2.87%, Kodak 36.85% ->
-    ///   37.05%, for about a quarter more time.
+    ///   37.05%, for about a quarter more time. Since 2026-11-14 always -6 (speed).
     ///
     /// Left out: oxipng `-o max` (+0.03 points, +77% time), pingo as a lossy PNG method (0),
     /// every JPEG part (0 on 80 real JPEGs; the q50 search +65% time), PDF JPEGs below q85 (0
@@ -566,11 +566,10 @@ fn png_chain<'a>(ctx: &'a Ctx, work: &Path, src: &Path, restore_from: &Path, ver
     )?;
     if ctx.max.png_ect && !apng {
         let strict = ctx.strict_alpha;
-        // -9 costs ~5x the time of -6: worth it on smaller pictures (Pictures sample: -0.50%
-        // vs -0.26% under 2 MP), less so on big ones (-0.39% vs -0.29%).
-        let level = if png::pixels(src).is_some_and(|px| px >= 2_000_000) { "-6" } else { "-9" };
+        // -6, not -9: -9 costs ~5x the time (Pictures sample: -0.50% vs -0.26% under 2 MP,
+        // -0.39% vs -0.29% above), and ECT was ~38% of all tool time on a lossy image run.
         let args = |o: &Path| {
-            let mut a = crate::os_args![level, "-quiet"];
+            let mut a = crate::os_args!["-6", "-quiet"];
             if strict {
                 a.push("--strict".into()); // keeps fully transparent pixels
             }
