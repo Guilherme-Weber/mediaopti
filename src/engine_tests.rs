@@ -92,6 +92,7 @@ fn opts(encoder: &str, concurrency: f64) -> RawOptions {
         videos: None,
         docs: None,
         gpu_decoding: None,
+        drop_data: None,
         max_parts: None,
     }
 }
@@ -539,10 +540,11 @@ fn historical_problem_files_are_handled() {
     let logs = rec.logs.lock().unwrap().join("\n");
     println!("{logs}");
 
-    // WMV: converted to MP4 with AAC audio, original removed.
-    let wmv_out = videos.join("Developer Diary.mp4");
+    // WMV: its WMA audio can't go into MP4 as it is, so it becomes an MKV with the audio
+    // copied (never re-encoded), original removed.
+    let wmv_out = videos.join("Developer Diary.mkv");
     assert!(wmv_out.exists() && !videos.join("Developer Diary.wmv").exists(), "{logs}");
-    assert_eq!(audio_codec(&ff, &wmv_out).as_deref(), Some("aac"), "{logs}");
+    assert!(audio_codec(&ff, &wmv_out).is_some_and(|c| c.starts_with("wma")), "{logs}");
     // Sticker GIF: below NVENC's minimum size, so it must take the CPU fallback and finish
     // cleanly (converted, or kept when the MP4 isn't smaller), never fail.
     assert!(logs.contains("NVENC hardware limit on sticker.gif"), "{logs}");
@@ -610,11 +612,11 @@ fn hard_links_are_left_alone_and_small_gifs_stay_gifs() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// A GIF the video path can't use still goes through the GIF optimizer: one whose video
-/// encode fails (its temp name is taken by a folder, so ffmpeg can't write) and one that is no
-/// longer animated when its turn comes. Neither is counted as failed or remembered as a video.
+/// Only a GIF whose video was not smaller goes through the GIF optimizer. One whose video
+/// encode fails (its temp name is taken by a folder, so ffmpeg can't write) or that is no
+/// longer animated when its turn comes is left as it is, now and in later runs.
 #[test]
-fn gifs_the_video_path_cannot_use_are_optimized_as_gifs() {
+fn gifs_the_video_path_fails_on_are_left_alone() {
     let Some(ff) = ffmpeg() else {
         eprintln!("skipping: bundled ffmpeg not found");
         return;
@@ -628,41 +630,47 @@ fn gifs_the_video_path_cannot_use_are_optimized_as_gifs() {
     // Every video attempt (NVENC, then x264) writes to this name: a folder makes them fail.
     let blocked = crate::args::temp_name(&broken, 1);
     std::fs::create_dir_all(&blocked).unwrap();
+    let (broken_before, still_bytes) = (std::fs::read(&broken).unwrap(), {
+        make(&ff, &["-f", "lavfi", "-i", "testsrc2=size=320x240:rate=1:duration=1", "-frames:v", "1"], &root.join("still-frame.gif"));
+        std::fs::read(root.join("still-frame.gif")).unwrap()
+    });
 
     let rt = runtime();
     let (engine, rec) = new_engine(&rt, &root, ff.clone());
-    // Every GIF is a video job (limit 0); images lossless so the GIF optimizer runs.
+    // Every GIF is a video job (limit 0); images on, so the GIF optimizer could run.
     let raw = || RawOptions { images: Some(1), ..opts("av1_nvenc", 1.0) };
     rt.block_on(async {
         engine.apply_options(raw());
         engine.load_dir(media.clone()).await;
         assert_eq!(engine.snapshot().pending_files, 2);
         // Queued as an animated GIF; a single still frame by the time it is encoded.
-        make(&ff, &["-f", "lavfi", "-i", "testsrc2=size=320x240:rate=1:duration=1", "-frames:v", "1"], &still);
+        std::fs::write(&still, &still_bytes).unwrap();
         engine.clone().run_batch(raw()).await;
     });
     let logs = rec.logs.lock().unwrap().join("\n");
     println!("{logs}");
-    assert!(logs.contains("broken.gif: the video encode failed"), "{logs}");
-    assert!(logs.contains("still.gif: not an animated GIF for the video encoder"), "{logs}");
-    assert_eq!(logs.matches("optimizing it as a GIF instead").count(), 2, "{logs}");
-    assert!(!logs.contains("remembered in history"), "{logs}");
-    let s = engine.snapshot();
-    assert_eq!(s.failed_this_run, 0, "{logs}");
-    assert!(broken.exists() && still.exists(), "both stay GIFs");
+    assert!(logs.contains("for broken.gif (remembered in history)"), "{logs}");
+    assert!(logs.contains("Skipped still.gif: it is no longer an animated GIF"), "{logs}");
+    assert!(!logs.contains("[Images]") && !logs.contains("stays a GIF"), "no GIF pass: {logs}");
+    assert_eq!(engine.snapshot().failed_this_run, 1, "{logs}");
+    assert_eq!(std::fs::read(&broken).unwrap(), broken_before);
+    assert_eq!(std::fs::read(&still).unwrap(), still_bytes);
     std::fs::remove_dir(&blocked).unwrap();
 
-    // Both are remembered as done: a second scan queues nothing.
+    // Next scan: the failed GIF is not sent to the GIF optimizer; the changed one (not
+    // remembered) is placed as what it is now, a still image.
     let (engine2, _) = new_engine(&rt, &root, ff);
     engine2.apply_options(raw());
     rt.block_on(engine2.load_dir(media));
-    assert_eq!(engine2.snapshot().pending_files, 0, "{logs}");
+    let s = engine2.snapshot();
+    assert_eq!(s.pending_files, 1, "{logs}");
+    let queued = engine2.queue_preview(10);
+    assert!(queued.len() == 1 && queued[0].0.contains("still.gif") && queued[0].1 == "Image", "{queued:?}");
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// A big GIF remembered as a video without going through the GIF optimizer (images were off)
-/// gets the GIF optimizer once images are on, without another video encode; after that it is
-/// known.
+/// A big GIF whose video was not smaller while images were off gets the GIF optimizer once
+/// images are on, without another video encode; after that it is known.
 #[test]
 fn a_gif_remembered_as_video_gets_the_gif_optimizer_later() {
     let Some(ff) = ffmpeg() else {
@@ -673,9 +681,8 @@ fn a_gif_remembered_as_video_gets_the_gif_optimizer_later() {
     let media = root.join("media");
     std::fs::create_dir_all(&media).unwrap();
     let gif = media.join("anim.gif");
-    make(&ff, &["-f", "lavfi", "-i", "testsrc2=size=320x240:rate=10:duration=3"], &gif);
-    let blocked = crate::args::temp_name(&gif, 1);
-    std::fs::create_dir_all(&blocked).unwrap();
+    // A few hundred bytes of flat colour: no MP4 is that small.
+    make(&ff, &["-f", "lavfi", "-i", "color=c=red:size=320x240:rate=2:duration=2"], &gif);
     let rt = runtime();
     let run = |images: u32| {
         let (engine, rec) = new_engine(&rt, &root, ff.clone());
@@ -688,20 +695,116 @@ fn a_gif_remembered_as_video_gets_the_gif_optimizer_later() {
             (pending, rec.logs.lock().unwrap().join("\n"))
         })
     };
-    // Images off: the failed encode is remembered as a video.
+    // Images off: not smaller as a video, remembered as one.
     let (pending, logs) = run(0);
+    println!("{logs}");
     assert_eq!(pending, 1, "{logs}");
-    assert!(logs.contains("remembered in history"), "{logs}");
+    assert!(logs.contains("Video was not smaller for anim.gif"), "{logs}");
     // Images on: straight to the GIF optimizer, no encode.
     let (pending, logs) = run(1);
     println!("{logs}");
     assert_eq!(pending, 1, "{logs}");
     assert!(!logs.contains("Processing: anim.gif"), "no second video encode: {logs}");
-    assert!(logs.contains("anim.gif"), "{logs}");
+    assert!(logs.contains("[Images]") && logs.contains("anim.gif"), "{logs}");
     // Done now.
     let (pending, logs) = run(1);
     assert_eq!(pending, 0, "{logs}");
-    std::fs::remove_dir(&blocked).unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Nothing besides the picture is lost: an MKV keeps both audio tracks, its subtitles,
+/// chapters and attached font; an AVI (audio re-encoded) keeps both audio tracks; a WebM
+/// with WebVTT subtitles (not possible in MP4) becomes an MKV that keeps them.
+#[test]
+fn videos_keep_audio_tracks_subtitles_attachments_and_chapters() {
+    let Some(ff) = ffmpeg() else {
+        eprintln!("skipping: bundled ffmpeg not found");
+        return;
+    };
+    let root = test_dir("keep-streams");
+    let media = root.join("media");
+    std::fs::create_dir_all(&media).unwrap();
+    let (srt, vtt, chap, font) = (root.join("s.srt"), root.join("s.vtt"), root.join("c.txt"), root.join("f.ttf"));
+    std::fs::write(&srt, "1\n00:00:00,000 --> 00:00:02,000\nhello\n").unwrap();
+    std::fs::write(&vtt, "WEBVTT\n\n00:00.000 --> 00:02.000\nhello\n").unwrap();
+    std::fs::write(&chap, ";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=2000\ntitle=One\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=2000\nEND=4000\ntitle=Two\n").unwrap();
+    std::fs::write(&font, "not really a font").unwrap();
+    let (src, a1, a2) = ("testsrc2=size=640x360:rate=30:duration=4,noise=alls=30:allf=t", "sine=f=440:d=4", "sine=f=880:d=4");
+    let (s, v, c, f) = (srt.to_str().unwrap(), vtt.to_str().unwrap(), chap.to_str().unwrap(), font.to_str().unwrap());
+    // Lossless video so every one gets smaller.
+    make(&ff, &["-f", "lavfi", "-i", src, "-f", "lavfi", "-i", a1, "-f", "lavfi", "-i", a2, "-i", s, "-i", c,
+        "-map", "0:v", "-map", "1:a", "-map", "2:a", "-map", "3:s", "-map_metadata", "4", "-map_chapters", "4",
+        "-attach", f, "-metadata:s:t", "mimetype=application/x-truetype-font",
+        "-c:v", "libx264", "-qp", "0", "-c:a", "aac", "-c:s", "srt"], &media.join("show.mkv"));
+    make(&ff, &["-f", "lavfi", "-i", src, "-f", "lavfi", "-i", a1, "-f", "lavfi", "-i", a2,
+        "-map", "0:v", "-map", "1:a", "-map", "2:a", "-c:v", "mpeg4", "-q:v", "1", "-c:a", "mp3"], &media.join("old.avi"));
+    make(&ff, &["-f", "lavfi", "-i", src, "-f", "lavfi", "-i", a1, "-i", v,
+        "-map", "0:v", "-map", "1:a", "-map", "2:s", "-c:v", "libvpx-vp9", "-lossless", "1", "-c:a", "libopus", "-c:s", "webvtt"], &media.join("clip.webm"));
+
+    let rt = runtime();
+    let (engine, rec) = new_engine(&rt, &root, ff.clone());
+    rt.block_on(async {
+        engine.apply_options(opts("av1_nvenc", 2.0));
+        engine.load_dir(media.clone()).await;
+        engine.clone().run_batch(opts("av1_nvenc", 2.0)).await;
+    });
+    let logs = rec.logs.lock().unwrap().join("\n");
+    println!("{logs}");
+    assert_eq!(engine.snapshot().failed_this_run, 0, "{logs}");
+    let probe = |p: &Path| {
+        let out = Command::new(&ff).args(["-hide_banner", "-i"]).arg(p).output().unwrap();
+        crate::args::Streams::parse(&String::from_utf8_lossy(&out.stderr))
+    };
+    let show = probe(&media.join("show.mkv"));
+    assert_eq!((show.audio, show.subtitles.len(), show.attachments, show.chapters), (2, 1, 1, 2), "{show:?}\n{logs}");
+    let old = probe(&media.join("old.mp4"));
+    assert_eq!(old.audio, 2, "{old:?}\n{logs}");
+    assert!(!media.join("old.avi").exists() && !media.join("clip.webm").exists(), "{logs}");
+    let clip = probe(&media.join("clip.mkv"));
+    assert_eq!((clip.audio, clip.subtitles.as_slice()), (1, ["webvtt".to_string()].as_slice()), "{clip:?}\n{logs}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Audio is never lost or downmixed: PCM in a MOV becomes FLAC in an MKV (checked to
+/// decode to the same samples), AC3 5.1 in an AVI is copied into the MP4 with its six
+/// channels, and an HDR10 video keeps its transfer and static metadata.
+#[test]
+fn audio_is_kept_or_made_flac_and_hdr10_is_kept() {
+    let Some(ff) = ffmpeg() else {
+        eprintln!("skipping: bundled ffmpeg not found");
+        return;
+    };
+    let root = test_dir("audio-hdr");
+    let media = root.join("media");
+    std::fs::create_dir_all(&media).unwrap();
+    let src = "testsrc2=size=640x360:rate=30:duration=3,noise=alls=30:allf=t";
+    make(&ff, &["-f", "lavfi", "-i", src, "-f", "lavfi", "-i", "sine=f=440:d=3", "-c:v", "libx264", "-qp", "0", "-c:a", "pcm_s16le"], &media.join("camera.mov"));
+    make(&ff, &["-f", "lavfi", "-i", src, "-f", "lavfi", "-i", "sine=f=440:d=3", "-c:v", "mpeg4", "-q:v", "1", "-af", "aformat=channel_layouts=5.1", "-c:a", "ac3"], &media.join("film.avi"));
+    make(&ff, &["-f", "lavfi", "-i", src, "-vf", "format=yuv420p10le", "-c:v", "libx265", "-x265-params",
+        "log-level=0:lossless=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):max-cll=1000,400:hdr10=1"],
+        &media.join("hdr10.mkv"));
+
+    let rt = runtime();
+    let (engine, rec) = new_engine(&rt, &root, ff.clone());
+    rt.block_on(async {
+        engine.apply_options(opts("av1_nvenc", 2.0));
+        engine.load_dir(media.clone()).await;
+        engine.clone().run_batch(opts("av1_nvenc", 2.0)).await;
+    });
+    let logs = rec.logs.lock().unwrap().join("\n");
+    println!("{logs}");
+    assert_eq!(engine.snapshot().failed_this_run, 0, "{logs}");
+    assert_eq!(engine.snapshot().compressed_this_run, 3, "{logs}");
+    let probe = |p: &Path| {
+        let out = Command::new(&ff).args(["-hide_banner", "-i"]).arg(p).output().unwrap();
+        crate::args::Streams::parse(&String::from_utf8_lossy(&out.stderr))
+    };
+    let camera = probe(&media.join("camera.mkv"));
+    assert_eq!(camera.audio_codecs, ["flac"], "{camera:?}\n{logs}");
+    let film = probe(&media.join("film.mp4"));
+    assert_eq!((film.audio_codecs.as_slice(), film.audio_channels.as_slice()), (["ac3".to_string()].as_slice(), [6].as_slice()), "{film:?}\n{logs}");
+    let hdr = probe(&media.join("hdr10.mkv"));
+    assert!(hdr.hdr, "{hdr:?}\n{logs}");
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -1178,6 +1281,7 @@ fn real_folder_run() {
         videos: None,
         docs: None,
         gpu_decoding: None,
+        drop_data: None,
         max_parts: None,
     };
     let t = std::time::Instant::now();

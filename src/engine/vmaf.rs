@@ -124,10 +124,11 @@ impl Engine {
             ratio * 100.0
         ));
         // The best passing output is parked under another temp name while stronger steps run.
-        let keep = args::temp_name(input, worker_id + 1000);
+        let ext = args::ext_lower(tmp);
+        let keep = args::temp_name_with(input, worker_id + 1000, &ext);
         // Parked outputs while paused: named after the file, not the worker (another worker
         // may resume it).
-        let (park_keep, park_encoded) = (args::temp_name(input, 7000), args::temp_name(input, 7001));
+        let (park_keep, park_encoded) = (args::temp_name_with(input, 7000, &ext), args::temp_name_with(input, 7001, &ext));
         let parked_keep = memo.keep.take();
         let mut best: Option<(u32, f64, f64)> = None;
         let mut tried = [false; STEPS.len()];

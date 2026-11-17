@@ -49,6 +49,7 @@ impl Engine {
         };
         options.cq_boost = cq_boost;
         options.gpu_decode = gpu_decode;
+        options.streams = self.lock().job_streams.get(input).cloned().unwrap_or_default();
         let jobs = u64::from(options.concurrency.max(1));
         let nvenc = options.encoder.ends_with("_nvenc");
         let ffmpeg_args = args::build_ffmpeg_args(input, tmp, &options, mode);
@@ -344,6 +345,154 @@ impl Engine {
         let out = cmd.output().await.ok()?;
         gpu_decodable_stream(&String::from_utf8_lossy(&out.stderr))
     }
+
+    /// What `path` holds besides its picture (audio, subtitles, attachments, covers,
+    /// chapters) and its length, from `ffmpeg -i`.
+    pub(super) async fn probe_streams(&self, path: &Path) -> args::Streams {
+        let mut cmd = tokio::process::Command::new(&self.ffmpeg_path);
+        cmd.args(["-hide_banner", "-i"]).arg(path).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true);
+        system::configure_background_command(&mut cmd, true);
+        let mut streams = match cmd.output().await {
+            Ok(out) => args::Streams::parse(&String::from_utf8_lossy(&out.stderr)),
+            Err(_) => args::Streams::default(),
+        };
+        if streams.hdr {
+            // HDR10's static metadata travels with the frames: read from the first one.
+            let mut cmd = tokio::process::Command::new(&self.ffmpeg_path);
+            cmd.args(["-hide_banner", "-i"])
+                .arg(path)
+                .args(["-map", "0:V:0", "-frames:v", "1", "-vf", "showinfo", "-f", "null", "-"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+            system::configure_background_command(&mut cmd, true);
+            if let Ok(out) = cmd.output().await {
+                let text = String::from_utf8_lossy(&out.stderr).to_ascii_lowercase();
+                streams.mastering = text.contains("mastering display");
+                streams.light_level = text.contains("content light level");
+            }
+        }
+        streams
+    }
+
+    /// Whether audio track `index` of `a` and `b` decodes to the same samples (compared as
+    /// 32-bit PCM, so 16- and 24-bit sources and their FLAC compare alike).
+    pub(super) async fn same_audio_track(&self, a: &Path, b: &Path, index: usize) -> bool {
+        let md5 = |p: &Path| {
+            let mut cmd = tokio::process::Command::new(&self.ffmpeg_path);
+            cmd.args(["-hide_banner", "-v", "error", "-i"])
+                .arg(p)
+                .args(["-map", &format!("0:a:{index}"), "-c:a", "pcm_s32le", "-f", "md5", "-"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .kill_on_drop(true);
+            system::configure_background_command(&mut cmd, true);
+            async move { cmd.output().await.ok().filter(|o| o.status.success()).map(|o| o.stdout) }
+        };
+        let (x, y) = (md5(a).await, md5(b).await);
+        x.is_some() && x == y
+    }
+
+    /// Frame count and length in seconds of the first video stream, read from its packets
+    /// (no decoding, so fast even for big files). `None` when it can't be read.
+    pub(super) async fn video_timing(&self, path: &Path) -> Option<(u64, f64)> {
+        let mut cmd = tokio::process::Command::new(&self.ffmpeg_path);
+        cmd.args(["-hide_banner", "-v", "error", "-i"])
+            .arg(path)
+            .args(["-map", "0:v:0", "-c", "copy", "-f", "framemd5", "-"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        system::configure_background_command(&mut cmd, true);
+        let out = cmd.output().await.ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        packet_timing(&String::from_utf8_lossy(&out.stdout))
+    }
+}
+
+/// Frame count and length from ffmpeg's framemd5 listing of packets: `#tb 0: 1/100`, then
+/// `stream, dts, pts, duration, size, hash` per packet.
+pub(super) fn packet_timing(listing: &str) -> Option<(u64, f64)> {
+    let mut tb = None;
+    let (mut count, mut start, mut end) = (0u64, i64::MAX, i64::MIN);
+    for line in listing.lines() {
+        if let Some(rest) = line.strip_prefix("#tb 0:") {
+            let (n, d) = rest.trim().split_once('/')?;
+            tb = Some(n.trim().parse::<f64>().ok()? / d.trim().parse::<f64>().ok()?);
+            continue;
+        }
+        if line.starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+        let f: Vec<&str> = line.split(',').map(str::trim).collect();
+        if f.len() < 5 || f[0] != "0" {
+            continue;
+        }
+        let (pts, duration) = (f[2].parse::<i64>().ok()?, f[3].parse::<i64>().ok()?);
+        count += 1;
+        start = start.min(pts);
+        end = end.max(pts + duration);
+    }
+    (count > 0).then(|| (count, (end - start) as f64 * tb.unwrap_or(0.0)))
+}
+
+/// What a new version of a video lost compared with the original, if anything: audio
+/// tracks, subtitles, attachments, cover pictures, chapters, or more than a second (or 1%)
+/// of its length. Only shorter counts: old containers (TS, AVI) often declare a wrong length,
+/// and the new one states the real one.
+pub(super) fn streams_lost(before: &args::Streams, after: &args::Streams) -> Option<String> {
+    let mut lost = Vec::new();
+    for (what, b, a) in [
+        ("audio tracks", before.audio, after.audio),
+        ("subtitles", before.subtitles.len(), after.subtitles.len()),
+        ("attachments", before.attachments, after.attachments),
+        ("cover pictures", before.covers.len(), after.covers.len()),
+        ("chapters", before.chapters, after.chapters),
+    ] {
+        if a < b {
+            lost.push(format!("{} of {b} {what}", b - a));
+        }
+    }
+    let tmcd = |s: &args::Streams| s.data.iter().filter(|t| *t == "tmcd").count();
+    if tmcd(after) < tmcd(before) {
+        lost.push("its timecode track".into());
+    }
+    for (what, b, a) in [
+        ("its HDR transfer", before.hdr, after.hdr),
+        ("its HDR10 mastering display metadata", before.mastering, after.mastering),
+        ("its HDR10 content light level", before.light_level, after.light_level),
+    ] {
+        if b && !a {
+            lost.push(what.into());
+        }
+    }
+    match (before.duration, after.duration) {
+        (Some(b), Some(a)) if b - a > (b * 0.01).max(1.0) => lost.push(format!("its length ({b:.1} s -> {a:.1} s)")),
+        (Some(_), None) => lost.push("its length (unreadable)".into()),
+        _ => {}
+    }
+    (!lost.is_empty()).then(|| lost.join(", "))
+}
+
+/// Why a GIF's video doesn't keep its animation, if it doesn't: another number of frames, or
+/// a length off by more than half a frame (at most 50 ms). Unreadable counts as a mismatch.
+pub(super) fn timing_mismatch(gif: Option<(u64, f64)>, video: Option<(u64, f64)>) -> Option<String> {
+    let ((gf, gs), (vf, vs)) = match (gif, video) {
+        (Some(g), Some(v)) => (g, v),
+        (None, _) => return Some("the GIF's frames could not be read".into()),
+        (_, None) => return Some("the video's frames could not be read".into()),
+    };
+    let tolerance = (gs / gf.max(1) as f64 / 2.0).min(0.05);
+    if gf != vf || (gs - vs).abs() > tolerance {
+        Some(format!("GIF {gf} frames, {gs:.2} s; video {vf} frames, {vs:.2} s"))
+    } else {
+        None
+    }
 }
 
 /// How long ffmpeg gets to quit after "q" before it is killed (it took ~1.6 s for a 4K
@@ -395,6 +544,40 @@ pub(super) fn gpu_decodable_stream(report: &str) -> Option<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::gpu_decodable_stream as ok;
+    use super::{packet_timing, timing_mismatch};
+
+    #[test]
+    fn lost_streams_are_named() {
+        use crate::args::Streams;
+        let before = Streams { audio: 2, subtitles: vec!["subrip".into()], attachments: 1, covers: vec![4], chapters: 3, duration: Some(600.0), ..Streams::default() };
+        assert_eq!(super::streams_lost(&before, &before), None);
+        let longer = Streams { audio: 3, duration: Some(900.0), ..before.clone() };
+        assert_eq!(super::streams_lost(&before, &longer), None, "more is fine");
+        let close = Streams { duration: Some(595.0), ..before.clone() };
+        assert_eq!(super::streams_lost(&before, &close), None, "within 1%");
+        let after = Streams { audio: 1, subtitles: vec![], chapters: 0, duration: Some(500.0), ..before.clone() };
+        let why = super::streams_lost(&before, &after).unwrap();
+        assert!(why.contains("1 of 2 audio tracks") && why.contains("1 of 1 subtitles") && why.contains("3 of 3 chapters") && why.contains("600.0 s -> 500.0 s"), "{why}");
+        assert!(super::streams_lost(&before, &Streams::default()).unwrap().contains("unreadable"));
+    }
+
+    #[test]
+    fn gif_and_video_timing_are_compared() {
+        // A GIF (1/100 s) of 3 frames: 10, 10 and 50 hundredths.
+        let gif = "#format: frame checksums\n#tb 0: 1/100\n#stream#, dts, pts, duration, size, hash\n\
+                   0, 0, 0, 10, 100, aa\n0, 10, 10, 10, 90, bb\n0, 20, 20, 50, 80, cc\n";
+        let close = |t: Option<(u64, f64)>| t.is_some_and(|(n, s)| n == 3 && (s - 0.7).abs() < 1e-9);
+        assert!(close(packet_timing(gif)), "{:?}", packet_timing(gif));
+        // The same timing in an MP4 (1/12800), B-frames out of order.
+        let mp4 = "#tb 0: 1/12800\n0, -2560, 0, 1280, 50, a\n0, -1280, 2560, 6400, 40, b\n0, 0, 1280, 1280, 30, c\n";
+        assert!(close(packet_timing(mp4)), "{:?}", packet_timing(mp4));
+        assert_eq!(timing_mismatch(Some((3, 0.7)), Some((3, 0.7))), None);
+        assert_eq!(timing_mismatch(Some((3, 0.7)), Some((3, 0.72))), None, "within half a frame");
+        assert!(timing_mismatch(Some((3, 0.7)), Some((2, 0.7))).is_some(), "a frame lost");
+        assert!(timing_mismatch(Some((3, 0.7)), Some((3, 1.2))).is_some(), "timing changed");
+        assert!(timing_mismatch(Some((3, 0.7)), None).is_some(), "unreadable video");
+        assert_eq!(packet_timing("#tb 0: 1/100\n"), None);
+    }
 
     #[test]
     fn gpu_decoding_only_for_checked_streams() {

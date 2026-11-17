@@ -18,15 +18,13 @@ impl Drop for Completion<'_> {
 }
 
 impl Engine {
-    /// A GIF the video path can't use (not smaller, the encode failed, damaged to ffmpeg, no
-    /// free name): it stays a GIF and goes through the GIF optimizer, whose own checks decide.
-    /// `None`: not a GIF, or images are off. `why` is logged when not empty.
-    async fn gif_fallback(self: &Arc<Self>, worker_id: u32, input: &Path, display: &str, why: &str) -> Option<Outcome> {
+    /// A GIF whose video was not smaller: it stays a GIF and goes through the GIF optimizer,
+    /// whose own checks decide. Only then: a GIF the video path failed on (encode error,
+    /// damaged, not animated, no free name) is left as it is (`remember_without_gif_pass`).
+    /// `None`: not a GIF, or images are off.
+    async fn gif_fallback(self: &Arc<Self>, worker_id: u32, input: &Path, display: &str) -> Option<Outcome> {
         if !args::is_gif(input) || self.lock().options.images == ImageMode::Off {
             return None;
-        }
-        if !why.is_empty() {
-            self.log(format!("[Worker {worker_id}] {display}: {why}; optimizing it as a GIF instead"));
         }
         let outcome = self.gif_as_image(worker_id, input, display).await;
         if !matches!(outcome, Outcome::Stopped) {
@@ -35,6 +33,16 @@ impl Engine {
             self.add_processed(input);
         }
         Some(outcome)
+    }
+
+    /// A GIF the video path failed on is done for the GIF optimizer too (both image modes),
+    /// so `Inner::place` doesn't send it there later: only GIFs whose video wasn't smaller go.
+    fn remember_without_gif_pass(&self, input: &Path) {
+        if args::is_gif(input) {
+            let mut inner = self.lock();
+            inner.history.add_image(input, crate::image::mode(true));
+            inner.history.add_image(input, crate::image::mode(false));
+        }
     }
 
     pub(super) async fn process_one(self: &Arc<Self>, worker_id: u32) -> Outcome {
@@ -110,36 +118,56 @@ impl Engine {
                 })
                 .await;
             if !valid {
+                // The scan sends still and tiny GIFs to the images: this one changed since
+                // (replaced on disk). Not remembered: the next scan places it as it is now.
                 self.lock().in_progress.remove(&input);
-                // Changed since the scan (or never checked): the GIF optimizer decides.
-                if let Some(outcome) = self.gif_fallback(worker_id, &input, &display, "not an animated GIF for the video encoder").await {
-                    return outcome;
-                }
-                self.remember(&input, &input).await;
                 {
                     let mut inner = self.lock();
                     inner.run.completed += 1;
                     inner.run.skipped_larger += 1;
                 }
                 self.log(format!(
-                    "[Worker {worker_id}] Skipped static or tiny spacer GIF: {display}"
+                    "[Worker {worker_id}] Skipped {display}: it is no longer an animated GIF (changed since the scan); it will be checked again next time"
                 ));
                 self.send_state(false);
                 return Outcome::Skipped;
             }
         }
 
-        let tmp = args::temp_name(&input, worker_id);
+        // What it holds besides the picture decides the container (MKV when MP4 can't
+        // hold it) and is carried over by every attempt, then checked in the result.
+        let streams = if args::is_gif(&input) { args::Streams::default() } else { self.probe_streams(&input).await };
+        let drop_data = self.lock().options.drop_data;
+        if let Some(blocked) = streams.blocker(drop_data) {
+            self.lock().in_progress.remove(&input);
+            // Kept out of history when the Advanced option could let it through later.
+            if blocked.permanent {
+                self.remember(&input, &input).await;
+            }
+            {
+                let mut inner = self.lock();
+                inner.run.completed += 1;
+                inner.run.skipped_larger += 1;
+            }
+            let hint = if blocked.permanent { "" } else { " (Advanced: Remove data tracks lets it be optimized without them)" };
+            self.log(format!("[Worker {worker_id}] Skipped {display}: it holds {}; left as it is{hint}", blocked.why));
+            self.send_state(false);
+            return Outcome::Skipped;
+        }
+        let dropped = streams.dropped_data();
+        if !dropped.is_empty() {
+            self.log(format!("[Worker {worker_id}] {display}: its data tracks ({}) are left out (Advanced option)", dropped.join(", ")));
+        }
+        let tmp = args::temp_name_with(&input, worker_id, &args::output_ext(&input, &streams));
+        self.lock().job_streams.insert(input.clone(), streams.clone());
         self.reset_worker(worker_id, &display, "encoding");
         self.log_remove(&tmp);
         self.send_state(true);
         self.log(format!("[Worker {worker_id}] Processing: {display}"));
 
-        let initial_mode = if args::needs_immediate_audio_transcode(&input) {
-            Mode::TranscodeAudio
-        } else {
-            Mode::Primary
-        };
+        // Audio is copied (MKV takes what MP4 can't); re-encoding it is only the retry when
+        // the muxer refuses it.
+        let initial_mode = Mode::Primary;
         // Paused before: what it had finished (dropped if the settings changed meanwhile).
         let mut memo = {
             let mut inner = self.lock();
@@ -193,11 +221,8 @@ impl Engine {
         if attempt.diag.corrupt_input && !attempt.diag.out_of_memory {
             self.release_tracking(worker_id, &input);
             self.log_remove(&tmp);
-            // gifsicle may still read it; its result is checked frame by frame.
-            if let Some(outcome) = self.gif_fallback(worker_id, &input, &display, "ffmpeg reported damaged data").await {
-                return outcome;
-            }
             self.remember(&input, &input).await;
+            self.remember_without_gif_pass(&input);
             {
                 let mut inner = self.lock();
                 inner.run.completed += 1;
@@ -316,12 +341,9 @@ impl Engine {
             for line in &attempt.diag.error_lines {
                 self.log(line.clone());
             }
-            if let Some(outcome) = self.gif_fallback(worker_id, &input, &display, &format!("the video encode failed (ffmpeg exit code {code})")).await {
-                completion.armed = false; // counted as an image instead
-                return outcome;
-            }
             self.lock().failed.insert(input.clone());
             self.remember(&input, &input).await; // Remember unrecoverable files so future runs skip them
+            self.remember_without_gif_pass(&input);
             self.lock().run.failed += 1;
             self.log(format!(
                 "[Worker {worker_id}] ffmpeg exited with code {code} for {display} (remembered in history)"
@@ -397,7 +419,7 @@ impl Engine {
                     ));
                     // A GIF that doesn't make a smaller video stays a GIF, but is still
                     // optimized as an image (e.g. slideshow-like "process" GIFs).
-                    if let Some(outcome) = self.gif_fallback(worker_id, &input, &display, "").await {
+                    if let Some(outcome) = self.gif_fallback(worker_id, &input, &display).await {
                         completion.armed = false; // counted as an image instead
                         return outcome;
                     }
@@ -406,6 +428,37 @@ impl Engine {
                     self.send_state(false);
                     return Outcome::Skipped;
                 }
+            }
+        }
+        // A GIF's video must keep its animation: same frames, same length. Its frame timing
+        // is passed through (no -fps_mode cfr for GIFs), so the two must match. Any other
+        // video must keep everything else it held (audio tracks, subtitles, attachments,
+        // covers, chapters) and its length.
+        let lost = if args::is_gif(&input) {
+            let (gif_timing, video_timing) = (self.video_timing(&input).await, self.video_timing(&tmp).await);
+            super::ffmpeg::timing_mismatch(gif_timing, video_timing).map(|why| format!("doesn't match the GIF ({why})"))
+        } else {
+            let after = self.probe_streams(&tmp).await;
+            let mut why = super::ffmpeg::streams_lost(&streams, &after);
+            // PCM made FLAC must decode to exactly the original samples.
+            for (i, codec) in streams.audio_codecs.iter().enumerate() {
+                if why.is_none() && args::is_integer_pcm(codec) && !self.same_audio_track(&input, &tmp, i).await {
+                    why = Some(format!("audio track {} (its FLAC doesn't decode to the original PCM)", i + 1));
+                }
+            }
+            why.map(|why| format!("lost {why}"))
+        };
+        self.lock().job_streams.remove(&input);
+        {
+            if let Some(why) = lost {
+                self.log_remove(&tmp);
+                self.lock().failed.insert(input.clone());
+                self.remember(&input, &input).await;
+                self.remember_without_gif_pass(&input);
+                self.lock().run.failed += 1;
+                self.log(format!("[Worker {worker_id}] The new version of {display} {why}; kept the original (remembered in history)"));
+                self.send_state(true);
+                return Outcome::Failed;
             }
         }
         let saved_mb = (in_size - out_size) / (1024.0 * 1024.0);
@@ -464,11 +517,8 @@ impl Engine {
                 }
                 if tries > 20 {
                     self.log_remove(&tmp);
-                    if let Some(outcome) = self.gif_fallback(worker_id, &input, &display, "no free name for the video").await {
-                        completion.armed = false;
-                        return outcome;
-                    }
                     self.remember(&input, &input).await;
+                    self.remember_without_gif_pass(&input);
                     self.lock().run.skipped_larger += 1;
                     self.log(format!("[Worker {worker_id}] No free name for the new version of {display}; kept the original"));
                     self.send_state(false);

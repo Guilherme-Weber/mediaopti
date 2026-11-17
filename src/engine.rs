@@ -206,6 +206,9 @@ struct Inner {
     release: CancellationToken,
     /// Video jobs that Pause ended, with what they had finished (taken up on Resume).
     resume: std::collections::HashMap<PathBuf, vmaf::VideoResume>,
+    /// What each video being encoded holds besides its picture (`args::Streams`), read once
+    /// per job: every attempt carries it over and the result is checked against it.
+    job_streams: std::collections::HashMap<PathBuf, args::Streams>,
     power: Option<PowerGuard>,
     /// Workers of the running batch, awaited by `run_batch` (files added during a run can
     /// start more).
@@ -314,6 +317,7 @@ impl Engine {
                 cancel: CancellationToken::new(),
                 release: CancellationToken::new(),
                 resume: std::collections::HashMap::new(),
+                job_streams: std::collections::HashMap::new(),
                 power: None,
                 handles: Vec::new(),
                 video_ids: std::collections::BTreeSet::new(),

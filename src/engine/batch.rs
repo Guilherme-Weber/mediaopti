@@ -198,6 +198,7 @@ impl Engine {
         {
             let was_stopped = inner.stop_requested;
             inner.cpu = None;
+            inner.job_streams.clear();
             for (_, memo) in inner.resume.drain() {
                 memo.discard();
             }

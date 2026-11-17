@@ -486,6 +486,7 @@ export component AppWindow inherits Window {
     in property <bool> update-running;
     // ---- advanced page (reached from About)
     in-out property <bool> gpu-decoding: true;
+    in-out property <bool> drop-data: false;
     in-out property <[AdvPart]> adv-parts;
     in property <bool> adv-default: true;
 
@@ -1383,6 +1384,27 @@ export component AppWindow inherits Window {
                                 text: root.gpu-decoding ? "On" : "Off";
                                 enabled: !root.locked;
                                 checked <=> root.gpu-decoding;
+                                toggled => { root.advanced-changed(); }
+                            }
+                        }
+                    }
+
+                    Card {
+                        SectionTitle { glyph: "\u{E74D}"; text: "Remove data tracks"; }
+                        HorizontalLayout {
+                            spacing: 12px;
+                            Text {
+                                text: "Videos with a data track no container can carry over (GoPro telemetry, iPhone metadata) are left as they are. On, they are optimized and lose that track: GPS, sensor and camera data in it is gone. QuickTime VR panoramas and Dolby Vision are always left alone.";
+                                font-size: 13px;
+                                color: Theme.text-secondary;
+                                wrap: word-wrap;
+                                horizontal-stretch: 1;
+                                vertical-alignment: center;
+                            }
+                            Switch {
+                                text: root.drop-data ? "On" : "Off";
+                                enabled: !root.locked;
+                                checked <=> root.drop-data;
                                 toggled => { root.advanced-changed(); }
                             }
                         }
