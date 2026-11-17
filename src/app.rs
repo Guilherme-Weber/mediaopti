@@ -500,6 +500,33 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
         });
     }
 
+    // Closing during a batch: the window stays (titled "Stopping…") until the encoders have
+    // quit and any replacement in progress has finished, then closes. It used to vanish at
+    // once while the app went on for up to half a minute, and starting it again meanwhile
+    // said it was already running.
+    {
+        let engine = engine.clone();
+        let closing = std::cell::Cell::new(false);
+        window.window().on_close_requested(move || {
+            if closing.get() {
+                return slint::CloseRequestResponse::KeepWindowShown;
+            }
+            if !engine.busy() {
+                return slint::CloseRequestResponse::HideWindow;
+            }
+            closing.set(true);
+            engine.log("Closing once the running jobs have stopped (encoders are asked to quit; this can take a few seconds)");
+            engine.in_background(|e| {
+                e.stop();
+                e.shutdown();
+                let _ = slint::invoke_from_event_loop(|| {
+                    let _ = slint::quit_event_loop();
+                });
+            });
+            slint::CloseRequestResponse::KeepWindowShown
+        });
+    }
+
     let result = window.run();
 
     engine.shutdown();

@@ -386,6 +386,13 @@ impl Engine {
     }
 
     /// Called when the app exits: stops ffmpeg and saves history.
+    /// Whether closing now would have to wait: a batch runs, an encoder is quitting, or an
+    /// original is being replaced.
+    pub fn busy(&self) -> bool {
+        let inner = self.lock();
+        inner.working || inner.running_processes > 0 || REPLACING.load(Ordering::SeqCst) > 0
+    }
+
     pub fn shutdown(&self) {
         {
             let mut inner = self.lock();

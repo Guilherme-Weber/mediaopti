@@ -316,6 +316,7 @@ impl Controller {
         w.set_window_title(match s.status {
             Status::Running => format!("{pct}% · mediaopti"),
             Status::Paused => format!("Paused {pct}% · mediaopti"),
+            Status::Stopping => "Stopping… · mediaopti".to_string(),
             _ => "mediaopti".to_string(),
         }
         .into());
