@@ -62,21 +62,54 @@ pub fn install_panic_hook(dir: PathBuf) {
         let _ = fs::create_dir_all(&dir);
         let path = dir.join(format!("crash-{}.txt", system::local_timestamp_compact()));
         let thread = std::thread::current();
+        let (base, frames) = return_addresses();
         let report = format!(
-            "mediaopti {}: internal error (panic) at {}\r\nthread: {}\r\n{info}\r\n\r\nbacktrace:\r\n{}\r\n",
+            "mediaopti {}: internal error (panic) at {}\r\nthread: {}\r\n{info}\r\n\r\nbacktrace:\r\n{}\r\n\
+             addresses (mediaopti.exe at {base:#x}; with the release's saved .pdb, address - base = offset):\r\n{}\r\n",
             env!("CARGO_PKG_VERSION"),
             system::local_datetime(),
             thread.name().unwrap_or("unnamed"),
             std::backtrace::Backtrace::force_capture(),
+            frames.iter().map(|a| format!("{a:#x}")).collect::<Vec<_>>().join(" "),
         );
         let _ = fs::write(&path, report);
         default_hook(info);
     }));
 }
 
+/// The executable's load address and the current thread's return addresses. Releases ship
+/// without their .pdb (it names the build machine's paths), so the report's function names
+/// stop at the standard library; these let the release's saved .pdb place every frame.
+fn return_addresses() -> (usize, Vec<usize>) {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace;
+        use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+        let mut frames = [std::ptr::null_mut(); 62];
+        // SAFETY: the buffer holds 62 pointers, as passed; no hash is asked for.
+        let n = unsafe { RtlCaptureStackBackTrace(0, 62, frames.as_mut_ptr(), std::ptr::null_mut()) };
+        // SAFETY: a null name asks for the executable's own module, which is always loaded.
+        let base = unsafe { GetModuleHandleW(std::ptr::null()) } as usize;
+        (base, frames[..usize::from(n)].iter().map(|&f| f as usize).collect())
+    }
+    #[cfg(not(windows))]
+    {
+        (0, Vec::new())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A report's raw addresses include frames of the executable itself (after its base).
+    #[cfg(windows)]
+    #[test]
+    fn return_addresses_point_into_the_executable() {
+        let (base, frames) = return_addresses();
+        assert!(base != 0 && frames.len() > 2);
+        assert!(frames.iter().any(|&f| f > base && f - base < 256 << 20), "{base:#x} {frames:x?}");
+    }
 
     #[test]
     fn appends_and_rotates() {

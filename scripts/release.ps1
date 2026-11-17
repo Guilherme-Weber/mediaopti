@@ -71,6 +71,11 @@ try {
     $zip = Join-Path $root "dist\mediaopti-$Version-win64.zip"
     if (-not (Test-Path $zip)) { throw "$zip was not made" }
     # (package.ps1 refuses an executable that names this machine's user folder or checkout.)
+    # The .pdb stays here, never published (it names this machine's paths): with it, the raw
+    # addresses of a user's crash-*.txt report give file and line.
+    $symbols = Join-Path $root 'dist\symbols'
+    New-Item -ItemType Directory -Force $symbols | Out-Null
+    Copy-Item (Join-Path $root 'target\package\release\mediaopti.pdb') (Join-Path $symbols "mediaopti-$Version.pdb")
     $sha = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
     Write-Host "$zip  sha256:$sha"
 
