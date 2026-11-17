@@ -720,7 +720,7 @@ mod tests {
 
     #[test]
     fn cq_boost_raises_cq_and_crf_with_caps() {
-        let p = Path::new(r"C:.mp4");
+        let p = Path::new(r"C:\v\a.mp4");
         let tmp = temp_name(p, 1);
         let mut o = Options { crf: 20, ..Options::default() };
         o.cq_boost = 8;

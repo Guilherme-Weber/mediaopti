@@ -104,7 +104,7 @@ pub fn version_of(name: &str, program: &Path) -> Option<String> {
 }
 
 /// The version recorded in a `versions.json` next to the tool or one folder up (the release
-/// zip has `toolsersions.json`, written by scripts/package.ps1).
+/// zip has `tools\versions.json`, written by scripts/package.ps1).
 fn recorded_version(name: &str, program: &Path) -> Option<String> {
     program.ancestors().skip(1).take(2).find_map(|d| {
         let text = std::fs::read_to_string(d.join("versions.json")).ok()?;

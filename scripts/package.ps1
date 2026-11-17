@@ -55,7 +55,7 @@ if (-not $NoTools) {
         @{ dir = 'gifsicle'; app = 'gifsicle'; licence = 'GPL-2.0'; src = 'https://github.com/kohler/gifsicle'; files = @('gifsicle.exe') },
         @{ dir = 'libjxl'; app = 'libjxl'; licence = 'BSD-3-Clause'; src = 'https://github.com/libjxl/libjxl'
            files = @('bin\ssimulacra2.exe=ssimulacra2.exe', 'licenses\LICENSE.libjxl=LICENSE.txt') },
-        # Built from google/jpegli by scripts/build-jpegli.ps1 (version in binersions.json).
+        # Built from google/jpegli by scripts/build-jpegli.ps1 (version in bin\versions.json).
         @{ dir = 'jpegli'; app = $null; version = $jpegliVersion; licence = 'BSD-3-Clause'; src = 'https://github.com/google/jpegli'
            files = @('bin:cjpegli.exe=cjpegli.exe', 'bin:jpegli-LICENSE.txt=LICENSE.txt') },
         @{ dir = 'flac'; app = 'flac'; licence = 'GPL-2.0 (flac tool), BSD-3-Clause (libFLAC)'; src = 'https://github.com/xiph/flac'; files = @('flac.exe', 'libFLAC.dll') },
