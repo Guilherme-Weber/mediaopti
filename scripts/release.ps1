@@ -70,11 +70,7 @@ try {
     Run { & (Join-Path $PSScriptRoot 'package.ps1') } 'package'
     $zip = Join-Path $root "dist\mediaopti-$Version-win64.zip"
     if (-not (Test-Path $zip)) { throw "$zip was not made" }
-    # A release must not look for tools in this checkout (the development bin folder). Build
-    # paths under target\ (panic locations of generated code) are not lookups.
-    $exeText = [System.Text.Encoding]::Latin1.GetString([System.IO.File]::ReadAllBytes((Join-Path $root 'target\release\mediaopti.exe')))
-    $lookups = [regex]::Matches($exeText, [regex]::Escape($root) + '(?!\\target\\)', 'IgnoreCase')
-    if ($lookups.Count -gt 0) { throw "the release executable looks in this checkout ($root)" }
+    # (package.ps1 refuses an executable that names this machine's user folder or checkout.)
     $sha = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
     Write-Host "$zip  sha256:$sha"
 

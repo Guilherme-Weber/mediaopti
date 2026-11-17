@@ -18,8 +18,26 @@ if (-not (Test-Path $ffmpeg)) {
     & (Join-Path $PSScriptRoot 'fetch-ffmpeg.ps1')
 }
 
-cargo build --release
-if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }
+# Paths of this machine (the user folder, holding Cargo's sources of the dependencies, and
+# this checkout) are written into the executable for panic messages: replaced by neutral
+# ones. A separate target folder keeps the everyday build's cache.
+$profileDir = [Environment]::GetFolderPath('UserProfile')
+$cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $profileDir '.cargo' }
+$savedFlags, $savedTarget = $env:RUSTFLAGS, $env:CARGO_TARGET_DIR
+$env:RUSTFLAGS = "--remap-path-prefix=$profileDir=~ --remap-path-prefix=$cargoHome=cargo --remap-path-prefix=$root=mediaopti"
+$env:CARGO_TARGET_DIR = Join-Path $root 'target\package'
+try {
+    cargo build --release
+    if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }
+} finally {
+    $env:RUSTFLAGS, $env:CARGO_TARGET_DIR = $savedFlags, $savedTarget
+}
+$exePath = Join-Path $root 'target\package\release\mediaopti.exe'
+$exeText = [System.Text.Encoding]::Latin1.GetString([System.IO.File]::ReadAllBytes($exePath))
+foreach ($private in @($profileDir, $root)) {
+    $found = [regex]::Matches($exeText, [regex]::Escape($private), 'IgnoreCase').Count
+    if ($found -gt 0) { throw "the executable still names $private ($found times)" }
+}
 
 $version = (Select-String -Path (Join-Path $root 'Cargo.toml') -Pattern '^version = "(.+)"' |
     Select-Object -First 1).Matches[0].Groups[1].Value
@@ -29,7 +47,7 @@ $zip = Join-Path $root "dist\$name.zip"
 
 Remove-Item $stage, $zip -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force $stage | Out-Null
-Copy-Item (Join-Path $root 'target\release\mediaopti.exe') $stage
+Copy-Item $exePath $stage
 Copy-Item $ffmpeg $stage
 Copy-Item (Join-Path $root 'bin\ffmpeg-LICENSE.txt') $stage -ErrorAction SilentlyContinue
 Copy-Item (Join-Path $root 'LICENSE') $stage
