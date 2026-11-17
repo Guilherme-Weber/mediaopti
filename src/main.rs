@@ -15,6 +15,7 @@ mod pdf;
 mod progress;
 mod system;
 mod taskbar;
+mod toolver;
 mod update;
 
 fn main() -> Result<(), slint::PlatformError> {

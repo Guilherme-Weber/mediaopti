@@ -848,19 +848,50 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
         let weak = window.as_weak();
         std::thread::spawn(move || {
             let lines = engine.download_missing_tools();
-            if lines.is_empty() {
-                return;
-            }
             for line in lines {
                 engine.log(line);
             }
             let (found, missing) = engine.tool_lists();
             let (found, missing) = (found.join(", "), missing.join(", "));
+            let w2 = weak.clone();
             let _ = slint::invoke_from_event_loop(move || {
-                if let Some(w) = weak.upgrade() {
+                if let Some(w) = w2.upgrade() {
                     w.set_tools_found(found.as_str().into());
                     w.set_tools_missing(missing.as_str().into());
                 }
+            });
+            // Then the versions, and new pingo/beeim versions (at most once a week).
+            tool_info(&engine, &weak, false);
+        });
+    }
+    {
+        let engine = engine.clone();
+        let weak = window.as_weak();
+        window.on_check_tools(move || {
+            let (engine, weak) = (engine.clone(), weak.clone());
+            std::thread::spawn(move || tool_info(&engine, &weak, true));
+        });
+    }
+    {
+        let engine = engine.clone();
+        let weak = window.as_weak();
+        window.on_install_tools(move || {
+            let Some(w) = weak.upgrade() else { return };
+            if w.get_busy() || w.get_processing() || w.get_tools_checking() {
+                return;
+            }
+            w.set_tools_checking(true);
+            let (engine, weak) = (engine.clone(), weak.clone());
+            std::thread::spawn(move || {
+                match crate::toolver::install_newer(engine.data_dir()) {
+                    Ok(done) if !done.is_empty() => {
+                        engine.reload_tools();
+                        engine.log(format!("Installed the new {} from css-ig.net", done.join(" and ")));
+                    }
+                    Ok(_) => {}
+                    Err(why) => engine.log(format!("Could not install the new tool versions ({why})")),
+                }
+                tool_info(&engine, &weak, false);
             });
         });
     }
@@ -1191,6 +1222,52 @@ fn save_advanced(w: &AppWindow, engine: &Arc<Engine>, prefs_path: &Path) {
     prefs.save(prefs_path);
     w.set_adv_default(prefs.advanced_are_defaults());
     engine.apply_options_in_background(prefs.to_raw());
+}
+
+/// Shows each tool's version on the About page, and newer pingo/beeim versions (looked for
+/// when `force` or a week has passed). Blocking: call from a background thread.
+fn tool_info(engine: &Arc<Engine>, weak: &slint::Weak<AppWindow>, force: bool) {
+    let w0 = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(w) = w0.upgrade() {
+            w.set_tools_checking(true);
+        }
+    });
+    let tools = engine.tools();
+    let rows: Vec<(String, String, String)> = crate::toolver::list(&tools, engine.data_dir())
+        .into_iter()
+        .map(|t| (t.name.to_string(), t.version, t.source.to_string()))
+        .collect();
+    let newer = crate::toolver::check_downloaded(&tools, engine.data_dir(), force);
+    let text = match &newer {
+        Ok(n) if n.is_empty() => "pingo and beeim are up to date.".to_string(),
+        Ok(n) => {
+            let what: Vec<String> = n
+                .iter()
+                .map(|t| match &t.have {
+                    Some(h) => format!("{} {} (now {h})", t.name, t.available),
+                    None => format!("{} {}", t.name, t.available),
+                })
+                .collect();
+            let line = format!("New version available: {}", what.join(", "));
+            engine.log(format!("{line} (About > Tools > Install)"));
+            line
+        }
+        Err(why) => format!("Could not look for new pingo and beeim versions ({why})."),
+    };
+    let available = newer.as_ref().is_ok_and(|n| !n.is_empty());
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        let Some(w) = weak.upgrade() else { return };
+        let model: Vec<ToolRow> = rows
+            .into_iter()
+            .map(|(name, version, source)| ToolRow { name: name.into(), version: version.into(), source: source.into() })
+            .collect();
+        w.set_tool_rows(ModelRc::new(VecModel::from(model)));
+        w.set_tools_new_text(text.into());
+        w.set_tools_new(available);
+        w.set_tools_checking(false);
+    });
 }
 
 /// Asks GitHub for a newer release in the background and shows the answer on the About page.

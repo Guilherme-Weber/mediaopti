@@ -50,6 +50,9 @@ Updates: at start-up mediaopti checks the latest GitHub release. When a newer ve
 **About** page offers **Update and restart**, which downloads the release zip, verifies its
 SHA-256 against the checksum GitHub publishes, and replaces the program files in place (all or
 nothing). Settings and history are kept. It is available only while no batch is queued or running.
+The same page lists each tool with its version. The included tools are updated with mediaopti's
+releases; pingo and beeim are checked for new versions once a week and installed only when
+**Install** is clicked.
 
 **About > Advanced options** holds settings meant for testing and troubleshooting, with a warning:
 GPU decoding on or off, removing data tracks no container can carry over (GoPro telemetry,

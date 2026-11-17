@@ -45,6 +45,7 @@ function Get-FromZip([string]$Url, [string[]]$Names) {
 }
 
 Write-Host "Downloading cjpegli (libjxl 0.11.2, GitHub) ..."
+# cjpegli: libjxl 0.11.2 is the last release that includes it (jpegli has no releases yet).
 Get-FromZip 'https://github.com/libjxl/libjxl/releases/download/v0.11.2/jxl-x64-windows-static.zip' @('cjpegli.exe')
 
 Write-Host "Downloading OptiVorbis 0.3.2 (GitHub) ..."

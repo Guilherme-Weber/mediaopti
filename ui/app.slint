@@ -9,6 +9,13 @@ export struct FileRow {
     progress: float,
 }
 
+// One external tool on the About page.
+export struct ToolRow {
+    name: string,
+    version: string,
+    source: string,
+}
+
 // One maximum-effort part on the Advanced page.
 export struct AdvPart {
     name: string,
@@ -545,6 +552,13 @@ export component AppWindow inherits Window {
     callback open-logs();
     callback check-update();
     callback install-update();
+    callback check-tools();
+    callback install-tools();
+    in property <[ToolRow]> tool-rows;
+    // New pingo/beeim versions: a line, whether they can be installed, a check running.
+    in property <string> tools-new-text;
+    in property <bool> tools-new;
+    in property <bool> tools-checking;
     callback open-release-page();
     callback toggle-part(int);
     callback advanced-changed();
@@ -1265,10 +1279,35 @@ export component AppWindow inherits Window {
 
                     Card {
                         SectionTitle { glyph: "\u{E90F}"; text: "Tools"; }
-                        Text { text: "Found: " + root.tools-found; font-size: 13px; color: Theme.text-secondary; wrap: word-wrap; }
+                        if root.tool-rows.length == 0: Text { text: "Found: " + root.tools-found; font-size: 13px; color: Theme.text-secondary; wrap: word-wrap; }
+                        for row in root.tool-rows: HorizontalLayout {
+                            spacing: 12px;
+                            Text { text: row.name; font-size: 13px; color: Theme.text; width: 96px; }
+                            Text { text: row.version; font-size: 13px; color: Theme.text-secondary; width: 110px; overflow: elide; }
+                            Text { text: row.source; font-size: 12px; color: Theme.text-tertiary; horizontal-stretch: 1; overflow: elide; vertical-alignment: center; }
+                        }
+                        HorizontalLayout {
+                            spacing: 12px;
+                            Text {
+                                text: root.tools-checking ? "Looking for new pingo and beeim versions…" : root.tools-new-text;
+                                font-size: 13px;
+                                font-weight: root.tools-new ? 600 : 400;
+                                color: root.tools-new ? Theme.text : Theme.text-secondary;
+                                wrap: word-wrap;
+                                horizontal-stretch: 1;
+                                vertical-alignment: center;
+                            }
+                            if !root.tools-new && !root.tools-checking: LinkText { text: "Check again"; clicked => { root.check-tools(); } }
+                            if root.tools-new: Button {
+                                text: "Install";
+                                primary: true;
+                                enabled: !root.locked && !root.tools-checking;
+                                clicked => { root.install-tools(); }
+                            }
+                        }
                         if root.tools-missing != "": Text { text: "Missing (their steps are skipped): " + root.tools-missing; font-size: 13px; color: Theme.caution; wrap: word-wrap; }
                         Text {
-                            text: "Run scripts\\fetch-tools.ps1 to install them. pingo and beeim (css-ig.net) are free for private use and are never bundled; the other tools come with their licences (THIRD-PARTY.txt in the release).";
+                            text: "The included tools are updated with mediaopti's releases, after testing (licences in THIRD-PARTY.txt). pingo and beeim (css-ig.net) are free for private use and are never bundled: the app downloads them and looks for new versions once a week, but installs one only when you click Install. Every result is verified either way. Run scripts\\fetch-tools.ps1 to install missing tools.";
                             font-size: 12px;
                             color: Theme.text-tertiary;
                             wrap: word-wrap;

@@ -114,7 +114,7 @@ pub fn download_missing(found: &Tools, data_dir: &Path) -> Vec<String> {
     lines
 }
 
-fn download_tool(name: &str, url: &str, dir: &Path) -> Result<PathBuf, String> {
+pub(crate) fn download_tool(name: &str, url: &str, dir: &Path) -> Result<PathBuf, String> {
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let zip_path = dir.join(format!("{name}.download.zip"));
     let exe_tmp = dir.join(format!("{name}.download.exe"));

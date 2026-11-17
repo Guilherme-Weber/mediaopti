@@ -55,6 +55,10 @@ if (-not $NoTools) {
     )
     $notice = @('Third-party tools in tools\ (unmodified binaries; source code at the addresses below).',
                 'pingo and beeim (css-ig.net) are not included: they may not be redistributed.', '')
+    # Each packaged program's version, for the About page (some print none themselves).
+    $versions = [ordered]@{}
+    # cjpegli comes from libjxl 0.11.2, the last release that includes it (fetch-tools.ps1).
+    $cjpegliVersion = '0.11.2'
     foreach ($t in $tools) {
         $to = Join-Path $stage "tools\$($t.dir)"
         New-Item -ItemType Directory -Force $to | Out-Null
@@ -73,12 +77,20 @@ if (-not $NoTools) {
             foreach ($i in $items) {
                 $target = if ($as) { Join-Path $to $as } else { Join-Path $to $i.Name }
                 Copy-Item $i.FullName $target
+                if ($target.EndsWith('.exe')) {
+                    $exe = [IO.Path]::GetFileNameWithoutExtension($target)
+                    $versions[$exe] = if ($exe -eq 'cjpegli') { $cjpegliVersion } else { $tv }
+                }
             }
         }
-        $notice += "$($t.dir) $tv - $($t.licence) - $($t.src)"
+        $line = "$($t.dir) $tv - $($t.licence) - $($t.src)"
+        if ($t.dir -eq 'libjxl') { $line += " (cjpegli $cjpegliVersion, the last libjxl release that includes it)" }
+        $notice += $line
     }
     $notice += 'FFmpeg (ffmpeg.exe) - see ffmpeg-LICENSE.txt - https://ffmpeg.org'
     $notice | Set-Content (Join-Path $stage 'THIRD-PARTY.txt') -Encoding utf8
+    # Without a byte-order mark (Windows PowerShell's utf8 adds one).
+    [IO.File]::WriteAllText((Join-Path $stage 'tools\versions.json'), ($versions | ConvertTo-Json), (New-Object Text.UTF8Encoding $false))
 }
 
 Compress-Archive -Path "$stage\*" -DestinationPath $zip

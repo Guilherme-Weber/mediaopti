@@ -401,6 +401,16 @@ impl Engine {
         lines
     }
 
+    /// Looks for the tools again (after new versions were put in place).
+    pub fn reload_tools(&self) {
+        let found = image::tools::Tools::discover(self.ffmpeg_path.clone(), &self.data_dir);
+        *self.image_tools.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = found;
+    }
+
+    pub fn data_dir(&self) -> &std::path::Path {
+        &self.data_dir
+    }
+
     /// The external tools found at start-up, and the missing ones.
     pub fn tool_lists(&self) -> (Vec<&'static str>, Vec<&'static str>) {
         let tools = self.tools();
