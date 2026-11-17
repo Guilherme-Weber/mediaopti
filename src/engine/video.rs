@@ -168,7 +168,13 @@ impl Engine {
 
         // Audio is copied (MKV takes what MP4 can't); re-encoding it is only the retry when
         // the muxer refuses it.
-        let initial_mode = Mode::Primary;
+        // A picture smaller than NVENC takes goes straight to x264 (the NVENC attempts
+        // would only fail first).
+        let too_small_for_nvenc = {
+            let encoder = self.lock().options.encoder.clone();
+            encoder.ends_with("_nvenc") && streams.size.is_some_and(|size| !args::nvenc_fits(&encoder, size))
+        };
+        let initial_mode = if too_small_for_nvenc { Mode::CpuFallback } else { Mode::Primary };
         // Paused before: what it had finished (dropped if the settings changed meanwhile).
         let mut memo = {
             let mut inner = self.lock();
@@ -186,6 +192,7 @@ impl Engine {
         let primary_done = memo.primary;
         let gpu = match primary_done {
             Some((_, _, _, gpu)) => gpu,
+            None if too_small_for_nvenc => None,
             None => self.gpu_decodable(&input).await,
         };
         let mut attempt = match primary_done {
@@ -246,7 +253,7 @@ impl Engine {
                 && inner.working
         };
         let encoder_is_nvenc = self.lock().options.encoder.ends_with("_nvenc");
-        let mut tried_cpu = false;
+        let mut tried_cpu = too_small_for_nvenc;
 
         // Tiny GIF/sticker or stream rejected by the NVENC hardware -> CPU x264.
         if can_retry(self, &attempt) && attempt.diag.nvenc_unsupported {

@@ -99,9 +99,20 @@ pub struct Streams {
     /// HDR10+ dynamic metadata on the first frame (filled by the engine, HDR files only).
     pub hdr10_plus: bool,
     pub dolby_vision: bool,
+    /// The main picture's size.
+    pub size: Option<(u32, u32)>,
     /// The container's own tags (recording date, place, camera, title...), keys in lower
     /// case; the format's bookkeeping (`major_brand`, `encoder`...) is left out.
     pub tags: Vec<(String, String)>,
+}
+
+/// Whether NVENC takes a picture of this size (after rounding down to even sides, as the
+/// encode does). Measured on an RTX 5070 Ti: AV1 and HEVC need 130 px on each side, H.264
+/// a width of 146 and a height of 130; smaller ones fail to start ("Frame dimension").
+pub fn nvenc_fits(encoder: &str, (w, h): (u32, u32)) -> bool {
+    let (w, h) = (w & !1, h & !1);
+    let min_w = if encoder == "h264_nvenc" { 146 } else { 130 };
+    w >= min_w && h >= 130
 }
 
 /// Tags the muxer writes for itself: not the file's content.
@@ -154,7 +165,8 @@ impl Streams {
                 continue;
             }
             if in_tags && !line.starts_with("Duration: ") {
-                if let Some((k, v)) = line.split_once(':').filter(|_| line != "Metadata:") {
+                // Tags are indented under "Metadata:"; anything else (an ffmpeg warning) isn't one.
+                if let Some((k, v)) = line.split_once(':').filter(|_| raw.starts_with("    ")) {
                     let key = k.trim().to_ascii_lowercase();
                     if key.is_empty() {
                         if let Some(last) = s.tags.last_mut() {
@@ -200,6 +212,10 @@ impl Streams {
                 } else if rest.contains(": Video:") && !main_video {
                     main_video = true;
                     s.hdr = rest.contains("smpte2084") || rest.contains("arib-std-b67");
+                    s.size = rest.split([' ', ',']).find_map(|t| {
+                        let (w, h) = t.split_once('x')?;
+                        Some((w.parse().ok()?, h.parse().ok()?))
+                    });
                 }
             }
         }
@@ -886,6 +902,7 @@ mod tests {
             \x20   com.apple.quicktime.location.ISO6709: +12.3456-045.6789+010.000/\n\
             \x20   com.apple.quicktime.make: Apple\n    comment         : line one\n                    : line two\n\
             \x20   encoder         : Lavf61\n\
+            [mov,mp4,m4a,3gp,3g2,mj2 @ 0000020] stream 0, timescale not set: odd\n\
             \x20 Duration: 00:00:02.00, start: 0.000000, bitrate: 1 kb/s\n\
             \x20 Stream #0:0[0x1](und): Video: h264 (High) (avc1), yuv420p, 640x360, 30 fps\n\
             \x20   Metadata:\n      handler_name    : Core Media Video\n";
@@ -900,6 +917,10 @@ mod tests {
         assert!(a.contains("-movflags +faststart+use_metadata_tags"), "{a}");
         let x = build_ffmpeg_args(Path::new("IMG_0001.MOV"), Path::new("out.mp4"), &Options { encoder: "libx264".into(), ..o }, Mode::Primary).join(" ");
         assert!(x.contains("-map_metadata 0") && x.contains("+use_metadata_tags"), "{x}");
+        let tiny = "  Stream #0:0[0x1](und): Video: h264 (High) (avc1 / 0x31637661), yuv420p(progressive), 74x74, 8 kb/s, 1.90 fps\n";
+        assert_eq!(Streams::parse(tiny).size, Some((74, 74)));
+        assert!(!nvenc_fits("av1_nvenc", (74, 74)) && !nvenc_fits("av1_nvenc", (1920, 129)) && nvenc_fits("av1_nvenc", (130, 130)));
+        assert!(!nvenc_fits("h264_nvenc", (144, 400)) && nvenc_fits("h264_nvenc", (146, 130)) && nvenc_fits("hevc_nvenc", (131, 131)));
         let hdr10_plus = Streams { hdr10_plus: true, ..Streams::default() };
         assert!(hdr10_plus.blocker(true).is_some_and(|b| b.why.contains("HDR10+") && b.permanent));
     }
