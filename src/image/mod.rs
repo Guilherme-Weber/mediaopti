@@ -178,6 +178,21 @@ pub fn ext_is(real: &str, ext: &str) -> bool {
 /// Whether two pictures show the same thing: identical pixels and frame timing, or (single
 /// frames of the same size) SSIMULACRA2 at or above the target. Used before removing one of
 /// two files that would get the same name.
+/// Width × height of a PNG, JPEG or GIF, from its header (whatever its extension says).
+/// `None` for other files, or a JPEG whose frame header is past its first megabyte.
+pub fn pixel_count(path: &Path) -> Option<u64> {
+    let mut head = Vec::new();
+    std::io::Read::read_to_end(&mut std::io::Read::take(std::fs::File::open(path).ok()?, 1 << 20), &mut head).ok()?;
+    let be32 = |at: usize| Some(u64::from(u32::from_be_bytes(head.get(at..at + 4)?.try_into().ok()?)));
+    let le16 = |at: usize| Some(u64::from(u16::from_le_bytes(head.get(at..at + 2)?.try_into().ok()?)));
+    match sniff_picture(path)? {
+        Kind::Png => Some(be32(16)? * be32(20)?),
+        Kind::Jpg => jpeg::dimensions(&head).map(|(w, h)| u64::from(w) * u64::from(h)),
+        Kind::Gif => Some(le16(6)? * le16(8)?),
+        _ => None,
+    }
+}
+
 /// Whether two pictures carry the same metadata either way (whichever stays must not lose
 /// anything the other has): JPEG APPn/COM segments, PNG text and colour chunks. Pictures of
 /// different formats (a BMP and its PNG) have nothing comparable and count as the same.
@@ -1162,6 +1177,33 @@ mod tests {
         let args = crate::os_args!["-v", "error", "-f", "lavfi", "-i", "color=s=1000x1000:d=64:r=1", "-pix_fmt", "rgba", "-f", "rawvideo", "-"];
         let ran = tools::run(&t.ffmpeg, args, None, Capture::BytesUpTo(16 << 20), Duration::from_secs(60), &tools::Gate::default()).unwrap();
         assert!(!ran.success && ran.stdout.is_empty());
+    }
+
+    /// Picture sizes come from the headers, by content (a JPEG named .png is still a JPEG).
+    #[test]
+    fn pixel_counts_from_headers() {
+        let dir = std::env::temp_dir().join(format!("mo-pixels-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+        png.extend(13_481u32.to_be_bytes());
+        png.extend(12_136u32.to_be_bytes());
+        png.extend([8, 6, 0, 0, 0, 0, 0, 0, 0]);
+        let mut jpg = vec![0xFF, 0xD8, 0xFF, 0xE1, 0, 4, 0, 0];
+        jpg.extend([0xFF, 0xC2, 0, 11, 8]);
+        jpg.extend(3000u16.to_be_bytes()); // height
+        jpg.extend(4000u16.to_be_bytes()); // width
+        jpg.extend([1, 1, 0x11, 0, 0xFF, 0xDA, 0, 2]);
+        let mut gif = b"GIF89a".to_vec();
+        gif.extend(320u16.to_le_bytes());
+        gif.extend(240u16.to_le_bytes());
+        gif.extend([0, 0, 0]);
+        for (name, data, want) in [("a.png", png, 13_481 * 12_136), ("a.png.jpg", jpg.clone(), 12_000_000), ("jpeg.png", jpg, 12_000_000), ("a.gif", gif, 76_800)] {
+            std::fs::write(dir.join(name), data).unwrap();
+            assert_eq!(pixel_count(&dir.join(name)), Some(want), "{name}");
+        }
+        std::fs::write(dir.join("a.txt"), b"not a picture").unwrap();
+        assert_eq!(pixel_count(&dir.join("a.txt")), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

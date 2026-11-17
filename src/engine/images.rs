@@ -106,6 +106,7 @@ impl Inner {
             busy: None,
             note: None,
             warn: None,
+            lossless_only: Arc::default(),
         }
     }
 
@@ -289,6 +290,7 @@ impl Engine {
             let progress = Arc::new(image::tools::Progress::default());
             self.lock().cpu_progress.insert(path.clone(), Arc::clone(&progress));
             let (cpu2, p2) = (Arc::clone(&cpu), path.clone());
+            let lossless_only = Arc::clone(&opts.lossless_only);
             let job_cancel = self.lock().release.clone();
             let result = self
                 .blocking(move || {
@@ -319,7 +321,7 @@ impl Engine {
                     r
                 })
                 .await;
-            self.finish_image(&path, lossy, result);
+            self.finish_image(&path, lossy && !lossless_only.load(Ordering::Relaxed), result);
             let mut inner = self.lock();
             inner.cpu_active[stage] = inner.cpu_active[stage].saturating_sub(1);
         }
@@ -467,6 +469,37 @@ impl Engine {
     }
 }
 
+/// Memory a visually lossless search takes per pixel: measured on 2026-11-17 with a
+/// 164-megapixel JPEG (ssimulacra2 alone 15.6 GB; the job's processes 23.2 GB at once, about
+/// 141 bytes a pixel). The fixed 2 GB admission per file let such a job run out of memory.
+const LOSSY_BYTES_PER_PIXEL: u64 = 150;
+/// From this estimate on, a lossy search is a big job: one at a time, with its memory free.
+const BIG_LOSSY_JOB: u64 = 4 << 30;
+/// Commit memory left for everything else while a big lossy search runs.
+const BIG_LOSSY_RESERVE: u64 = 2 << 30;
+
+/// Whether a big lossy search needing `need` bytes fits in the commit memory `available`
+/// now (unknown counts as fitting).
+fn big_lossy_fits(need: u64, available: Option<u64>) -> bool {
+    available.is_none_or(|a| a >= need + BIG_LOSSY_RESERVE)
+}
+
+/// Waits for the other big lossy search to end (one at a time). `None` on Stop.
+fn one_big_lossy_job(gate: &image::tools::Gate) -> Option<std::sync::MutexGuard<'static, ()>> {
+    static BIG_LOSSY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    loop {
+        match BIG_LOSSY.try_lock() {
+            Ok(guard) => return Some(guard),
+            Err(std::sync::TryLockError::Poisoned(p)) => return Some(p.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
+        if !gate.wait_while_paused() {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
 /// Runs one CPU job so that a panic in it (a bug, a malformed file nobody foresaw) fails that
 /// file only, not remembered: the worker, its CPU slot and the counters carry on as for any
 /// failure.
@@ -609,6 +642,9 @@ pub(super) struct JobOpts {
     pub note: Option<NoteContent>,
     /// Logs a problem that doesn't change the result (dates that could not be restored).
     pub warn: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    /// Set when the file got the lossless pass only (a lossy search too big for the free
+    /// memory): it is remembered as done losslessly, so a later run can try the lossy pass.
+    pub lossless_only: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Restores a replaced file's dates and flags, logging (through `opts.warn`) when it can't.
@@ -677,6 +713,31 @@ pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, dispo
         }
         return ImageResult::Kept { content: content_of(path), note: None };
     }
+    // A big picture's visually lossless search runs alone, and only with its memory free;
+    // otherwise this file gets the lossless pass only (and is tried again later).
+    let pictured = matches!(kind, image::Kind::Png | image::Kind::Jpg | image::Kind::Bmp | image::Kind::Tga);
+    let lossy_need = if ctx.lossy && pictured { image::pixel_count(path).map_or(0, |px| px * LOSSY_BYTES_PER_PIXEL) } else { 0 };
+    let _big_job = if lossy_need >= BIG_LOSSY_JOB {
+        let Some(guard) = one_big_lossy_job(&ctx.gate) else { return ImageResult::Stopped };
+        Some(guard)
+    } else {
+        None
+    };
+    let lossless_ctx;
+    let ctx = if lossy_need >= BIG_LOSSY_JOB && !big_lossy_fits(lossy_need, system::memory_status().map(|m| m.available_commit)) {
+        opts.lossless_only.store(true, Ordering::Relaxed);
+        if let Some(warn) = &opts.warn {
+            warn(format!(
+                "{}: its visually lossless pass needs about {:.0} GB of free memory; lossless only this time",
+                path.display(),
+                lossy_need as f64 / 1_073_741_824.0
+            ));
+        }
+        lossless_ctx = image::Ctx { lossy: false, ..ctx.clone() };
+        &lossless_ctx
+    } else {
+        ctx
+    };
     let job = NEXT_JOB.fetch_add(1, Ordering::Relaxed);
     // FLAC, MP3 and Ogg are read where they are (nothing writes to the original): a long
     // album isn't copied to the temp folder first. Not under a path longer than the classic
@@ -855,6 +916,20 @@ fn keep_smaller_copy(path: &Path, existing: &Path, smaller: Option<&(PathBuf, u6
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The 164-megapixel JPEG of the 2026-11-17 corpus needs ~23 GB for its lossy search: with
+    /// the ~8 GB of commit this machine has free at idle it gets the lossless pass only; with
+    /// enough free it runs. Unknown free memory doesn't stop it.
+    #[test]
+    fn big_lossy_searches_need_their_memory_free() {
+        let need = std::hint::black_box(13_481 * 12_136) * LOSSY_BYTES_PER_PIXEL;
+        assert!(need > 22 << 30, "a big job");
+        assert!(!big_lossy_fits(need, Some(8 << 30)));
+        assert!(big_lossy_fits(need, Some(40 << 30)));
+        assert!(big_lossy_fits(need, None));
+        // A 24-megapixel photo is no big job.
+        assert!(std::hint::black_box(6000 * 4000) * LOSSY_BYTES_PER_PIXEL < BIG_LOSSY_JOB);
+    }
 
     /// A job too big for the temp drive's free space works on the file's own drive, in a
     /// hidden folder that disappears with the job. (Only a reservation: nothing is written.)

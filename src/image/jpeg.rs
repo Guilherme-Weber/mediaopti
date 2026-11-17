@@ -145,6 +145,20 @@ pub fn without_adobe(segs: &Segments) -> Segments {
 /// The frame (SOF) marker of a JPEG: 0xC0 baseline, 0xC1 extended, 0xC2 progressive...
 /// `None` if none comes before the first scan (damaged or not a JPEG).
 pub fn frame_marker(data: &[u8]) -> Option<u8> {
+    frame(data).map(|(m, _)| m)
+}
+
+/// Width and height from a JPEG's frame header.
+pub fn dimensions(data: &[u8]) -> Option<(u32, u32)> {
+    let (_, at) = frame(data)?;
+    // Length (2), precision (1), height (2), width (2).
+    let h = u16::from_be_bytes([*data.get(at + 5)?, *data.get(at + 6)?]);
+    let w = u16::from_be_bytes([*data.get(at + 7)?, *data.get(at + 8)?]);
+    Some((u32::from(w), u32::from(h)))
+}
+
+/// The frame marker and where its segment starts (at its 0xFF).
+fn frame(data: &[u8]) -> Option<(u8, usize)> {
     if !data.starts_with(&[0xFF, 0xD8]) {
         return None;
     }
@@ -165,7 +179,7 @@ pub fn frame_marker(data: &[u8]) -> Option<u8> {
             }
             0xDA | 0xD9 => return None,
             // C4 (Huffman tables), C8 (reserved) and CC (arithmetic conditioning) aren't frames.
-            0xC0..=0xCF if !matches!(m, 0xC4 | 0xC8 | 0xCC) => return Some(m),
+            0xC0..=0xCF if !matches!(m, 0xC4 | 0xC8 | 0xCC) => return Some((m, i)),
             _ => {}
         }
         let len = usize::from(u16::from_be_bytes([data[i + 2], data[i + 3]]));
