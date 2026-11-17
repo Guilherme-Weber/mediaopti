@@ -41,6 +41,8 @@ pub(super) struct ScanResult {
     pub(super) sizes: Vec<u64>,
     pub(super) cleaned_orphans: usize,
     pub(super) unreadable: usize,
+    /// Empty (0-byte) media files: nothing to optimize, left out of the queue.
+    pub(super) empty: usize,
     pub(super) messages: Vec<String>,
 }
 
@@ -83,6 +85,7 @@ pub(super) fn scan_folder(roots: &[PathBuf], exclude: Option<&Path>, temp: Optio
         messages.push(format!("Removed {cleaned_work} leftover work folder(s) from an earlier run that did not finish"));
     }
     let mut unreadable = 0;
+    let mut empty = 0;
     let mut with_sizes = Vec::new();
     let mut static_gifs = HashSet::new();
 
@@ -132,7 +135,7 @@ pub(super) fn scan_folder(roots: &[PathBuf], exclude: Option<&Path>, temp: Optio
                 found.fetch_add(1, Ordering::Relaxed);
                 with_sizes.push((entry.into_path(), meta.len()));
             }
-            Ok(_) => {}
+            Ok(_) => empty += 1,
             Err(err) => messages.push(format!("Could not read {}: {err}", entry.path().display())),
         }
     }
@@ -166,6 +169,7 @@ pub(super) fn scan_folder(roots: &[PathBuf], exclude: Option<&Path>, temp: Optio
         sizes,
         cleaned_orphans,
         unreadable,
+        empty,
         messages,
     }
 }
@@ -278,6 +282,9 @@ impl Engine {
         };
         for msg in &result.messages {
             self.log(msg.clone());
+        }
+        if result.empty > 0 {
+            self.log(format!("{} empty (0-byte) file(s) left out: nothing to optimize", result.empty));
         }
         if result.unreadable > 0 {
             self.log(format!("{} files or folders could not be read (permissions or broken links) and were skipped", result.unreadable));

@@ -378,15 +378,15 @@ impl Engine {
                     });
                 }
                 ImageResult::Kept { content, note } => {
-                    inner.run.skipped_larger += 1;
+                    inner.run.kept += 1;
                     remember(&mut inner, content);
                     log = Some(match note {
-                        Some(note) => format!("{tag} Skipped {display}: {note}"),
+                        Some(note) => format!("{tag} Kept {display}: {note}"),
                         None => format!("{tag} Kept {display} (already optimal)"),
                     });
                 }
                 ImageResult::Renamed { to, content } => {
-                    inner.run.skipped_larger += 1;
+                    inner.run.kept += 1;
                     inner.history.add_image(&to, mode);
                     if let Some((hash, size)) = content {
                         inner.history.add_content(hash, size, mode);
@@ -410,7 +410,7 @@ impl Engine {
                     });
                 }
                 ImageResult::Skipped(why) => {
-                    inner.run.skipped_larger += 1;
+                    inner.run.skipped += 1;
                     log = Some(format!("{tag} Skipped {display}: {why}"));
                 }
                 ImageResult::Failed(err) => {
@@ -829,7 +829,11 @@ pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, dispo
         (_, None) => fix_to,
     };
     if smaller.is_none() && new_ext.is_none() {
-        return ImageResult::Kept { content: content_of(path), note: result.note };
+        // A cut-off picture is "kept" too, but not because it is already optimal.
+        let note = result.note.or_else(|| {
+            image::looks_cut_off(kind, path).then(|| "it looks cut off (damaged: its data ends early); left as it is".to_string())
+        });
+        return ImageResult::Kept { content: content_of(path), note };
     }
     if file_state(path) != Some(state) {
         return ImageResult::Skipped("it changed while it was being optimized (it will be processed next time)".into());

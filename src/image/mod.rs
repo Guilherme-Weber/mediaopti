@@ -157,6 +157,20 @@ pub fn has_data_after_end(kind: Kind, path: &Path) -> bool {
     end.is_some_and(|e| d.get(e..).is_some_and(|rest| rest.iter().any(|&b| b != 0)))
 }
 
+/// Whether a JPEG, PNG or GIF looks cut off: its structure can't be followed to its end
+/// marker (a download that stopped, a damaged copy). Some valid files lack the marker too,
+/// so this only explains why nothing smaller was made; it never stops a file.
+pub fn looks_cut_off(kind: Kind, path: &Path) -> bool {
+    let Ok(d) = std::fs::read(path) else { return false };
+    let end = match kind {
+        Kind::Jpg => jpeg::end_of_image(&d),
+        Kind::Gif => gif_end(&d),
+        Kind::Png => png::end_of_image(&d),
+        _ => return false,
+    };
+    end.is_none()
+}
+
 /// The real extension of a picture by its content ("png", "jpg", "gif", "webp", "bmp"), for
 /// renaming misnamed files. `None` for anything else.
 pub fn real_picture_ext(path: &Path) -> Option<&'static str> {

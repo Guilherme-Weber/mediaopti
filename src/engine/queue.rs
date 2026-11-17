@@ -323,7 +323,8 @@ impl Inner {
             run_total: self.run.total,
             completed_this_run: self.run.completed,
             compressed_this_run: self.run.compressed,
-            skipped_larger_this_run: self.run.skipped_larger,
+            kept_this_run: self.run.kept,
+            skipped_this_run: self.run.skipped,
             failed_this_run: self.run.failed,
             space_saved_mb: round1(self.space_saved_mb),
             queue_counts: [

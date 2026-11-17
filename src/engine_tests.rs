@@ -145,7 +145,7 @@ fn full_batch_handles_every_file_kind() {
     assert_eq!(s.completed_this_run, 5, "{logs}");
     assert_eq!(s.compressed_this_run, 3, "{logs}"); // big.mp4, clip.mov, anim.gif
     assert_eq!(s.failed_this_run, 1, "{logs}"); // broken.mp4
-    assert_eq!(s.skipped_larger_this_run, 1, "{logs}"); // voice.mp4
+    assert_eq!(s.kept_this_run, 1, "{logs}"); // voice.mp4
 
     let big_after = std::fs::metadata(&big).unwrap();
     assert!(big_after.len() < big_before, "big.mp4 was not compressed");
@@ -335,7 +335,7 @@ fn pause_ends_ffmpeg_and_resume_finishes() {
     println!("{logs}");
     let s = engine.snapshot();
     assert_eq!(s.status, Status::Done, "{logs}");
-    assert_eq!(s.compressed_this_run + s.skipped_larger_this_run, 2, "{logs}");
+    assert_eq!(s.compressed_this_run + s.kept_this_run, 2, "{logs}");
     assert_eq!(s.failed_this_run, 0, "{logs}");
     assert!(logs.contains("Paused: 1 file(s) in progress stopped"), "{logs}");
     assert!(logs.contains("Resumed"), "{logs}");
@@ -389,7 +389,7 @@ fn pause_releases_memory_and_resume_redoes_the_files() {
     assert_eq!(s.status, Status::Done, "{logs}");
     // Every file done exactly once: none lost, none counted twice.
     assert_eq!(s.completed_this_run, 3, "{logs}");
-    assert_eq!(s.compressed_this_run + s.skipped_larger_this_run, 3, "{logs}");
+    assert_eq!(s.compressed_this_run + s.kept_this_run, 3, "{logs}");
     assert_eq!(s.failed_this_run, 0, "{logs}");
     assert!(logs.contains("on Resume its encode starts again"), "{logs}");
     let left: Vec<_> = std::fs::read_dir(&videos).unwrap().filter_map(Result::ok).map(|e| e.file_name()).collect();
@@ -1254,6 +1254,49 @@ fn wav_becomes_flac_only_when_safe() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// What a batch tells: empty files are counted when scanned, a cut-off picture says so
+/// instead of "already optimal", and files left for later (hard links) count as skipped, not
+/// as kept.
+#[test]
+fn empty_cut_off_and_skipped_files_are_told_apart() {
+    let Some(ff) = ffmpeg() else {
+        eprintln!("skipping: bundled ffmpeg not found");
+        return;
+    };
+    let tools = crate::image::tools::Tools::discover(ff.clone(), &std::env::temp_dir());
+    if !["jpegtran", "djpeg", "oxipng"].iter().all(|t| tools.has(t)) {
+        eprintln!("skipping: image tools not found");
+        return;
+    }
+    let root = test_dir("tellapart");
+    let media = root.join("media");
+    std::fs::create_dir_all(&media).unwrap();
+    std::fs::write(media.join("empty.png"), b"").unwrap();
+    let whole = root.join("whole.jpg");
+    make(&ff, &["-f", "lavfi", "-i", "testsrc2=s=640x480", "-frames:v", "1", "-q:v", "2"], &whole);
+    let data = std::fs::read(&whole).unwrap();
+    std::fs::write(media.join("cut.jpg"), &data[..data.len() * 55 / 100]).unwrap();
+    make(&ff, &["-f", "lavfi", "-i", "testsrc=s=64x48", "-frames:v", "1", "-compression_level", "0"], &media.join("linked.png"));
+    std::fs::hard_link(media.join("linked.png"), media.join("linked again.png")).unwrap();
+
+    let rt = runtime();
+    let (engine, rec) = new_engine(&rt, &root, ff);
+    let raw = || RawOptions { images: Some(1), ..opts("libx264", 1.0) };
+    rt.block_on(async {
+        engine.apply_options(raw());
+        engine.load_dir(media.clone()).await;
+        engine.clone().run_batch(raw()).await;
+    });
+    let logs = rec.logs.lock().unwrap().join("\n");
+    println!("{logs}");
+    assert!(logs.contains("1 empty (0-byte) file(s) left out"), "{logs}");
+    assert!(logs.contains("Kept cut.jpg: it looks cut off"), "{logs}");
+    let s = engine.snapshot();
+    assert_eq!(s.skipped_this_run, 2, "the two names of one file\n{logs}");
+    assert!(logs.contains("skipped for now 2"), "{logs}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Files in a folder whose path is longer than 260 characters are processed like any other:
 /// tools that can't open such paths (flac.exe) work on a short copy, and the originals go to
 /// a (just as long) backup folder.
@@ -1530,9 +1573,9 @@ fn real_folder_run() {
     }
     let s = engine.snapshot();
     println!(
-        "== {:.0}s | done {} (images {}) | smaller {} | kept {} | failed {} | saved {} MB",
+        "== {:.0}s | done {} (images {}) | smaller {} | kept {} | skipped {} | failed {} | saved {} MB",
         t.elapsed().as_secs_f64(), s.completed_this_run, s.type_progress[1..].iter().map(|t| t.0).sum::<usize>(),
-        s.compressed_this_run, s.skipped_larger_this_run, s.failed_this_run, s.space_saved_mb
+        s.compressed_this_run, s.kept_this_run, s.skipped_this_run, s.failed_this_run, s.space_saved_mb
     );
 }
 

@@ -81,7 +81,10 @@ struct RunStats {
     total: usize,
     completed: usize,
     compressed: usize,
-    skipped_larger: usize,
+    /// Left as they were and remembered: nothing smaller to make, or never to be processed.
+    kept: usize,
+    /// Left for later, not remembered (no disk space, changed meanwhile, a hard link...).
+    skipped: usize,
     failed: usize,
     images_total: usize,
     images_done: usize,
@@ -129,7 +132,8 @@ pub struct StateDto {
     pub run_total: usize,
     pub completed_this_run: usize,
     pub compressed_this_run: usize,
-    pub skipped_larger_this_run: usize,
+    pub kept_this_run: usize,
+    pub skipped_this_run: usize,
     pub failed_this_run: usize,
     pub space_saved_mb: f64,
     /// Files waiting, by type (videos, audio, documents, images): count and bytes.

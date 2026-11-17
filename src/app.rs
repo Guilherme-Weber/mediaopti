@@ -1524,8 +1524,8 @@ fn folder_name(dir: &str) -> String {
 fn idle_file_text(s: &StateDto) -> String {
     match s.status {
         Status::Done if s.run_total > 0 => format!(
-            "Batch complete · {} compressed · {} skipped · {} failed",
-            s.compressed_this_run, s.skipped_larger_this_run, s.failed_this_run
+            "Batch complete · {} made smaller · {} kept · {} skipped · {} failed",
+            s.compressed_this_run, s.kept_this_run, s.skipped_this_run, s.failed_this_run
         ),
         Status::Done => "Batch complete".into(),
         Status::Ready if s.pending_files > 0 => "Ready to process".into(),

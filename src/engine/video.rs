@@ -125,7 +125,7 @@ impl Engine {
                     let mut inner = self.lock();
                     inner.in_progress.remove(&input);
                     inner.run.completed += 1;
-                    inner.run.skipped_larger += 1;
+                    inner.run.skipped += 1;
                 }
                 let gb = |b: u64| b as f64 / 1_073_741_824.0;
                 self.log(format!(
@@ -142,7 +142,7 @@ impl Engine {
             {
                 let mut inner = self.lock();
                 inner.run.completed += 1;
-                inner.run.skipped_larger += 1;
+                inner.run.skipped += 1;
             }
             self.log(format!(
                 "[Worker {worker_id}] Skipped {display}: it is a hard link ({links} names for one file)"
@@ -167,7 +167,7 @@ impl Engine {
                 {
                     let mut inner = self.lock();
                     inner.run.completed += 1;
-                    inner.run.skipped_larger += 1;
+                    inner.run.skipped += 1;
                 }
                 self.log(format!(
                     "[Worker {worker_id}] Skipped {display}: it is no longer an animated GIF (changed since the scan); it will be checked again next time"
@@ -190,10 +190,15 @@ impl Engine {
             {
                 let mut inner = self.lock();
                 inner.run.completed += 1;
-                inner.run.skipped_larger += 1;
+                if blocked.permanent {
+                    inner.run.kept += 1;
+                } else {
+                    inner.run.skipped += 1;
+                }
             }
             let hint = if blocked.permanent { "" } else { " (Advanced: Remove data tracks lets it be optimized without them)" };
-            self.log(format!("[Worker {worker_id}] Skipped {display}: it holds {}; left as it is{hint}", blocked.why));
+            let verb = if blocked.permanent { "Kept" } else { "Skipped" };
+            self.log(format!("[Worker {worker_id}] {verb} {display}: it holds {}; left as it is{hint}", blocked.why));
             self.send_state(false);
             return Outcome::Skipped;
         }
@@ -257,10 +262,10 @@ impl Engine {
             {
                 let mut inner = self.lock();
                 inner.run.completed += 1;
-                inner.run.skipped_larger += 1;
+                inner.run.kept += 1;
             }
             self.log(format!(
-                "[Worker {worker_id}] Skipped audio-only file (no video stream): {display}"
+                "[Worker {worker_id}] Kept audio-only file (no video stream): {display}"
             ));
             self.send_state(false);
             return Outcome::Skipped;
@@ -474,7 +479,7 @@ impl Engine {
                         return outcome;
                     }
                     self.remember(&input, &input).await;
-                    self.lock().run.skipped_larger += 1;
+                    self.lock().run.kept += 1;
                     self.send_state(false);
                     return Outcome::Skipped;
                 }
@@ -559,7 +564,7 @@ impl Engine {
                         // The other copy is being encoded right now: leave both, compared next time.
                         Ok(true) if self.lock().in_progress.contains(&final_target) => {
                             self.log_remove(&tmp);
-                            self.lock().run.skipped_larger += 1;
+                            self.lock().run.skipped += 1;
                             self.log(format!(
                                 "[Worker {worker_id}] Skipped {display}: {} has the same content and is being encoded at the same time; compared next time",
                                 final_target.file_name().unwrap_or_default().to_string_lossy()
@@ -575,7 +580,7 @@ impl Engine {
                     self.log_remove(&tmp);
                     self.remember(&input, &input).await;
                     self.remember_without_gif_pass(&input);
-                    self.lock().run.skipped_larger += 1;
+                    self.lock().run.kept += 1;
                     self.log(format!("[Worker {worker_id}] No free name for the new version of {display}; kept the original"));
                     self.send_state(false);
                     return Outcome::Skipped;
@@ -589,7 +594,7 @@ impl Engine {
             if claimed {
                 system::release_claim(&final_target);
             }
-            self.lock().run.skipped_larger += 1;
+            self.lock().run.skipped += 1;
             self.log_remove(&tmp);
             self.log(format!(
                 "[Worker {worker_id}] {display} changed while it was being encoded; left unchanged (it will be processed next time)"

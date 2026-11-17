@@ -181,8 +181,8 @@ impl Engine {
             self.log(format!("Stopped after an ffmpeg startup error; saved {saved} MB"));
         } else {
             self.log(format!(
-                "Done. Made smaller {}, kept as they were {}, failed {}. Saved {saved} MB total",
-                run.compressed, run.skipped_larger, run.failed
+                "Done. Made smaller {}, kept as they were {}, skipped for now {}, failed {}. Saved {saved} MB total",
+                run.compressed, run.kept, run.skipped, run.failed
             ));
             if run.images_total > 0 {
                 self.log(format!(
