@@ -162,9 +162,19 @@ impl History {
     pub fn contains_image(&self, file: &Path, lossy: bool, strip: bool) -> bool {
         let lossiness: &[bool] = if lossy { &[true] } else { &[true, false] };
         let stripped: &[bool] = if strip { &[true] } else { &[true, false] };
-        lossiness
-            .iter()
-            .any(|&l| stripped.iter().any(|&s| self.hashes.contains(&hash_image_path(file, crate::image::mode(l, s)))))
+        // The path is hashed once; each mode continues from that state (a queue rebuild
+        // checks every file of the library, up to four modes each).
+        let mut path_part = Sha256::new();
+        path_part.update(file.to_string_lossy().as_bytes());
+        path_part.update([0u8]);
+        lossiness.iter().any(|&l| {
+            stripped.iter().any(|&s| {
+                let mut h = path_part.clone();
+                h.update(crate::image::mode(l, s).as_bytes());
+                let key: Hash = h.finalize().into();
+                self.hashes.contains(&key)
+            })
+        })
     }
 
     /// Whether some processed file had exactly this size (only those are worth hashing).
@@ -350,6 +360,24 @@ pub fn import_imageopti(imageopti_dir: &Path, data_dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Checking an image hashes its path once and continues per mode: every mode must still
+    /// find the entries written with the full key (the history's format is unchanged).
+    #[test]
+    fn image_checks_find_every_mode() {
+        let file = Path::new(r"F:\Pictures\Á pasta\foto 1.png");
+        for lossy in [false, true] {
+            for strip in [false, true] {
+                let mut h = History::load(temp(&format!("modes-{lossy}-{strip}")).join("processedFiles.txt"));
+                h.hashes.insert(hash_image_path(file, crate::image::mode(lossy, strip)));
+                // A lossy entry covers both requests; a stripped one covers any.
+                assert!(h.contains_image(file, lossy, strip), "{lossy} {strip}");
+                assert_eq!(h.contains_image(file, true, strip), lossy, "{lossy} {strip}");
+                assert_eq!(h.contains_image(file, lossy, true), strip, "{lossy} {strip}");
+                assert!(!h.contains_image(Path::new(r"F:\other.png"), false, false));
+            }
+        }
+    }
 
     fn temp(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("mo-history-{name}-{}", std::process::id()));
