@@ -53,12 +53,12 @@ Avisos do pedantic, por tipo:
 
 | Métrica | Corpus (40 arquivos, 250 MB) | Vídeo de 2,1 GB |
 |---|---|---|
-| Tempo total | **877 s** | em andamento na entrega deste relatório |
-| Arquivos | 38 entram na fila (o PNG de 0 byte e o TIFF não) | — |
-| Resultado | 10 menores, 27 mantidos, 1 falha (o MP4 truncado, esperado) | — |
-| Redução de tamanho | 262.553.817 → 251.471.551 bytes (**−11,1 MB, −4,2%**) | — |
-| Pico de memória privada da árvore de processos | **23.218 MB** (sustentado entre 13:57 e 14:00) | — |
-| Pico de commit do sistema | 37.829 MB (início: 15.387 MB) | — |
+| Tempo total | **877 s** | **4.108 s** (preset + 3 passos do retry com VMAF) |
+| Arquivos | 38 entram na fila (o PNG de 0 byte e o TIFF não) | 1 |
+| Resultado | 10 menores, 27 mantidos, 1 falha (o MP4 truncado, esperado) | 1 menor |
+| Redução de tamanho | 262.553.817 → 251.471.551 bytes (**−11,1 MB, −4,2%**) | 2.197.772.157 → 1.534.471.124 bytes (**−632,6 MB, −30,2%**) |
+| Pico de memória privada da árvore de processos | **23.218 MB** (sustentado entre 13:57 e 14:00) | 1.723 MB |
+| Pico de commit do sistema | 37.829 MB (início: 15.387 MB) | 22.037 MB (início: 14.424 MB) |
 | Binário release | 15.068.672 bytes (14,4 MiB); PDB separado de 6,3 MB | — |
 
 Leitura dos números:
@@ -85,7 +85,7 @@ Leitura dos números:
 | MP4 de 84×120 | x264 + retry VMAF, −20% | OK |
 | WAV ADPCM | Mantido (não é PCM inteiro) | OK |
 
-**0-1. Pico de memória sem atribuição**
+**0-1. Pico de memória** (atribuído na Fase A, A0: medido isolado, o JPEG de 164 MP sozinho chega a 23.187 MB, com o `ssimulacra2.exe` em 15,6 GB; os 4 vídeos com retry VMAF juntos, 3.682 MB. Correção em `e62ddd9`)
 - Onde: admissão em images.rs:19 e 218-238 (2 GB fixos por arquivo de CPU), vmaf.rs:452, video.rs:728.
 - O que aconteceu: a árvore de processos chegou a 23,2 GB de memória privada, e o commit do sistema subiu 22,4 GB acima do início. Hoje havia ~34 GB de commit livre. Com os ~8 GB livres registrados no CLAUDE.local para esta máquina, a falta de commit teria abortado o processo, matando NVENC à força.
 - Suspeitos: o JPEG de 164 MP (ssimulacra2/decodificação em float de 164 MP × 3 canais) ou os retries VMAF simultâneos (3 vídeos com VMAF na mesma janela).
