@@ -551,6 +551,39 @@ pub(super) fn volume_root(path: &Path) -> Option<PathBuf> {
     path.ancestors().last().filter(|r| r.has_root()).map(Path::to_path_buf)
 }
 
+/// Space a job holds on a drive while it runs (a video's new version written next to its
+/// original), counted in `RESERVED` with the work folders' so jobs at once share the space.
+pub(super) struct DiskReservation {
+    root: PathBuf,
+    bytes: u64,
+}
+
+impl DiskReservation {
+    /// Reserves `bytes` on `path`'s drive if its free space, less what other jobs reserved
+    /// there, leaves `keep` more. `Err(free)`: the drive's free space for them now.
+    pub(super) fn take(path: &Path, bytes: u64, keep: u64) -> Result<Self, u64> {
+        let Some(root) = volume_root(path) else { return Ok(Self { root: PathBuf::new(), bytes: 0 }) };
+        let mut reserved = RESERVED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let taken: u64 = reserved.iter().filter(|(r, _)| *r == root).map(|(_, n)| n).sum();
+        if let Some(free) = system::free_space(path) {
+            if free < taken + bytes + keep {
+                return Err(free.saturating_sub(taken));
+            }
+        }
+        reserved.push((root.clone(), bytes));
+        Ok(Self { root, bytes })
+    }
+}
+
+impl Drop for DiskReservation {
+    fn drop(&mut self) {
+        let mut reserved = RESERVED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(i) = reserved.iter().position(|(r, n)| *r == self.root && *n == self.bytes) {
+            reserved.swap_remove(i);
+        }
+    }
+}
+
 /// Hidden folder on a file's own drive for its work files when the temp drive is short on
 /// space (its name starts with a dot, so scans skip it).
 pub(super) const DRIVE_WORK_DIR: &str = ".mediaopti-temp";
@@ -919,6 +952,19 @@ fn keep_smaller_copy(path: &Path, existing: &Path, smaller: Option<&(PathBuf, u6
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Jobs on one drive share its free space: a second reservation of most of it waits,
+    /// and a reservation's space comes back when it ends.
+    #[test]
+    fn disk_reservations_share_a_drive() {
+        let dir = std::env::temp_dir();
+        let free = system::free_space(&dir).unwrap();
+        let most = free / 10 * 6;
+        let first = DiskReservation::take(&dir, most, 0).unwrap();
+        assert!(DiskReservation::take(&dir, most, 0).is_err(), "the drive is already 60% promised");
+        drop(first);
+        assert!(DiskReservation::take(&dir, most, 0).is_ok());
+    }
 
     /// The 164-megapixel JPEG of the 2026-11-17 corpus needs ~23 GB for its lossy search: with
     /// the ~8 GB of commit this machine has free at idle it gets the lossless pass only; with

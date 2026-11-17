@@ -115,24 +115,28 @@ impl Engine {
             .await;
         // Like the CPU files' work folders: the new version (and the quality retry's second
         // one) is written next to the original, so its drive needs room for about twice it.
+        // Held for the whole job, so videos encoding at once on one drive share its space.
         let size = source_state.map_or(0, |s| s.0);
-        let free = system::free_space(input.parent().unwrap_or(&input));
-        if free.is_some_and(|f| f < size.saturating_mul(2) + VIDEO_DISK_RESERVE) {
-            {
-                let mut inner = self.lock();
-                inner.in_progress.remove(&input);
-                inner.run.completed += 1;
-                inner.run.skipped_larger += 1;
+        let disk = super::images::DiskReservation::take(input.parent().unwrap_or(&input), size.saturating_mul(2), VIDEO_DISK_RESERVE);
+        let _disk = match disk {
+            Ok(d) => d,
+            Err(free) => {
+                {
+                    let mut inner = self.lock();
+                    inner.in_progress.remove(&input);
+                    inner.run.completed += 1;
+                    inner.run.skipped_larger += 1;
+                }
+                let gb = |b: u64| b as f64 / 1_073_741_824.0;
+                self.log(format!(
+                    "[Worker {worker_id}] Skipped {display}: its drive has {:.1} GB free for it, about {:.1} GB is needed (it will be tried next time)",
+                    gb(free),
+                    gb(size.saturating_mul(2) + VIDEO_DISK_RESERVE)
+                ));
+                self.send_state(false);
+                return Outcome::Skipped;
             }
-            let gb = |b: u64| b as f64 / 1_073_741_824.0;
-            self.log(format!(
-                "[Worker {worker_id}] Skipped {display}: its drive has {:.1} GB free, about {:.1} GB is needed (it will be tried next time)",
-                gb(free.unwrap_or(0)),
-                gb(size.saturating_mul(2) + VIDEO_DISK_RESERVE)
-            ));
-            self.send_state(false);
-            return Outcome::Skipped;
-        }
+        };
         if links > 1 {
             self.lock().in_progress.remove(&input);
             {
