@@ -29,7 +29,7 @@ const MIN_LOSSY_JPEG: u64 = 8192;
 const MIN_LOSSY_QUALITY: f64 = 85.0;
 
 fn qpdf(ctx: &Ctx, args: Vec<OsString>, capture: Capture) -> Result<tools::Ran, RunError> {
-    let program = ctx.tools.get("qpdf").ok_or_else(|| RunError::Failed("qpdf is missing".into()))?;
+    let program = ctx.tools.get("qpdf").ok_or_else(|| RunError::Unavailable("qpdf is missing".into()))?;
     tools::run(program, args, None, capture, ctx.timeout, &ctx.gate)
 }
 

@@ -50,6 +50,9 @@ pub(super) enum ImageResult {
     OutOfMemory,
     /// Could not be done (disk, permissions): not remembered, tried again next run.
     Failed(String),
+    /// A tool could not run (missing, would not start, timed out): not the file's fault, so
+    /// not remembered; many in a row leave the rest of the CPU queue for the next run.
+    ToolUnavailable(String),
     /// Processing this file failed: remembered, not retried.
     Broken(String),
     Stopped,
@@ -191,7 +194,7 @@ impl Engine {
         self.lock().workers.remove(&worker_id);
         let outcome = match &result {
             ImageResult::Stopped => super::Outcome::Stopped,
-            ImageResult::Failed(_) => super::Outcome::Failed,
+            ImageResult::Failed(_) | ImageResult::ToolUnavailable(_) => super::Outcome::Failed,
             ImageResult::Smaller { before, after, .. } => {
                 self.log(format!(
                     "[Worker {worker_id}] {display} stays a GIF: {:.0}% smaller as an image",
@@ -322,7 +325,7 @@ impl Engine {
     fn finish_image(self: &Arc<Self>, path: &Path, lossy: bool, result: ImageResult) {
         let mode = image::mode(lossy, self.lock().options.strip);
         let mut remembered = false;
-        let mut log = None;
+        let (mut log, mut extra) = (None, None);
         let tag = match image::kind_of(path).map(image::Kind::stage) {
             Some(0) => "[Audio]",
             Some(1) => "[Documents]",
@@ -334,6 +337,9 @@ impl Engine {
             inner.in_progress.remove(path);
             inner.cpu_started.remove(path);
             let display = inner.display_name(path);
+            if !matches!(result, ImageResult::Stopped | ImageResult::ToolUnavailable(_)) {
+                inner.run.tools_failing = 0;
+            }
             if !matches!(result, ImageResult::Stopped) {
                 inner.run.completed += 1;
                 inner.run.images_done += 1;
@@ -404,6 +410,27 @@ impl Engine {
                     inner.failed.insert(path.to_path_buf());
                     log = Some(format!("{tag} Failed on {display}: {err}"));
                 }
+                ImageResult::ToolUnavailable(err) => {
+                    inner.run.failed += 1;
+                    inner.failed.insert(path.to_path_buf());
+                    inner.run.tools_failing += 1;
+                    log = Some(format!("{tag} Failed on {display}: {err} (a tool problem, not the file's: tried again next run)"));
+                    if inner.run.tools_failing == TOOL_FAILURES_TO_STOP {
+                        let mut left = 0;
+                        for s in 0..3 {
+                            let n = inner.cpu_queues[s].len() - inner.cpu_cursors[s];
+                            inner.cpu_cursors[s] = inner.cpu_queues[s].len();
+                            inner.run.stage_total[s] = inner.run.stage_total[s].saturating_sub(n);
+                            left += n;
+                        }
+                        inner.run.total = inner.run.total.saturating_sub(left);
+                        inner.run.images_total = inner.run.images_total.saturating_sub(left);
+                        extra = Some(format!(
+                            "Tools kept failing to start or finish ({TOOL_FAILURES_TO_STOP} files in a row); \
+                             the {left} image, audio and document file(s) not started are left for the next run"
+                        ));
+                    }
+                }
                 ImageResult::Broken(err) => {
                     inner.run.failed += 1;
                     inner.failed.insert(path.to_path_buf());
@@ -430,12 +457,16 @@ impl Engine {
         if remembered {
             self.schedule_history_save();
         }
-        for line in log.into_iter().chain(progress) {
+        for line in log.into_iter().chain(extra).chain(progress) {
             self.log(line);
         }
         self.send_state(false);
     }
 }
+
+/// CPU files in a row whose tools could not run before the rest of the CPU queue is left for
+/// the next run (a quarantined or broken tool would otherwise fail every file).
+const TOOL_FAILURES_TO_STOP: usize = 20;
 
 /// Before a CPU job that ran out of memory is tried again: up to a minute for
 /// `IMAGE_MIN_FREE_COMMIT` twice over. False on Stop (or a Pause that released the job).
@@ -654,6 +685,7 @@ pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, dispo
         // The file itself couldn't be processed (a tool failed on it): remembered, like a
         // video whose encode failed, so it isn't retried on every run.
         Err(RunError::Failed(err)) => return ImageResult::Broken(err),
+        Err(RunError::Unavailable(err)) => return ImageResult::ToolUnavailable(err),
     };
     // At least 0.5% smaller. Audio also counts 64 KiB: cover art is a small part of a
     // song, but its saving is lossless and verified, and adds up over a music library.
@@ -684,6 +716,7 @@ pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, dispo
                     Ok(s) => s,
                     Err(RunError::Cancelled) => return ImageResult::Stopped,
                     Err(RunError::Failed(e)) => return ImageResult::Failed(e),
+                    Err(RunError::Unavailable(e)) => return ImageResult::ToolUnavailable(e),
                 };
                 if same {
                     // The other copy is being processed right now (a.wav and a.flac in one

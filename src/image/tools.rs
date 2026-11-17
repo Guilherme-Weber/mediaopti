@@ -373,7 +373,11 @@ impl Slots {
 #[derive(Debug)]
 pub enum RunError {
     Cancelled,
+    /// The file couldn't be processed (a tool failed on it).
     Failed(String),
+    /// A tool couldn't do its work for reasons that aren't the file's: missing, would not
+    /// start (quarantined by an antivirus, a missing DLL), or ran past its time limit.
+    Unavailable(String),
 }
 
 /// Runs a tool to completion, killing it on Stop or after `timeout`, suspending it while
@@ -406,7 +410,7 @@ pub fn run(
         if matches!(e.raw_os_error(), Some(8 | 1455)) {
             gate.short_of_memory.store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        RunError::Failed(format!("could not start {}: {e}", program.display()))
+        RunError::Unavailable(format!("could not start {}: {e}", program.display()))
     })?;
     crate::system::assign_std_child_to_job(&child);
 
@@ -490,7 +494,7 @@ pub fn run(
             return if gate.is_cancelled() {
                 Err(RunError::Cancelled)
             } else {
-                Err(RunError::Failed(format!("{} timed out", program.display())))
+                Err(RunError::Unavailable(format!("{} timed out", program.display())))
             };
         }
         std::thread::sleep(Duration::from_millis(15));

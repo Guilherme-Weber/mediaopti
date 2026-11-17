@@ -1254,6 +1254,51 @@ fn wav_becomes_flac_only_when_safe() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Tools that can't start (quarantined by an antivirus, a missing DLL) are not the files'
+/// fault: the files are not remembered as broken, and after a run of such failures the
+/// remaining CPU files are left for the next run instead of all failing.
+#[test]
+fn tools_that_cannot_start_do_not_mark_files_broken() {
+    let Some(ff) = ffmpeg() else {
+        eprintln!("skipping: bundled ffmpeg not found");
+        return;
+    };
+    let root = test_dir("toolfail");
+    let media = root.join("media");
+    std::fs::create_dir_all(&media).unwrap();
+    // More files than can be running when the 20th failure ends the queue (one per core).
+    const FILES: usize = 60;
+    for i in 0..FILES {
+        make(&ff, &["-f", "lavfi", "-i", &format!("color=c=0x{:02x}6040:s=64x48", i * 4), "-frames:v", "1", "-compression_level", "0"], &media.join(format!("p{i:02}.png")));
+    }
+    // Every PNG optimizer is "installed" but is not a program.
+    let data = root.join("appdata");
+    std::fs::create_dir_all(&data).unwrap();
+    let bad = data.join("broken.exe");
+    std::fs::write(&bad, b"not a program").unwrap();
+    let tools: std::collections::HashMap<&str, &Path> = ["pingo", "beeim", "oxipng", "ect"].iter().map(|t| (*t, bad.as_path())).collect();
+    std::fs::write(data.join("tools.json"), serde_json::to_string(&tools).unwrap()).unwrap();
+
+    let rt = runtime();
+    let (engine, rec) = new_engine(&rt, &root, ff);
+    let raw = || RawOptions { images: Some(1), ..opts("libx264", 1.0) };
+    rt.block_on(async {
+        engine.apply_options(raw());
+        engine.load_dir(media.clone()).await;
+        engine.clone().run_batch(raw()).await;
+    });
+    let logs = rec.logs.lock().unwrap().join("\n");
+    assert!(!logs.contains("will not retry"), "{logs}");
+    assert!(logs.contains("could not start"), "{logs}");
+    assert!(logs.contains("kept failing to start"), "{logs}");
+    let failed = engine.snapshot().failed_this_run;
+    assert!((20..FILES).contains(&failed), "the rest is left for the next run: {failed} failed\n{logs}");
+    // Nothing was remembered: all of them are still to do.
+    rt.block_on(engine.load_dir(media));
+    assert_eq!(engine.snapshot().pending_files, FILES, "{logs}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A file already at the new name with the same picture or video, but without something the
 /// original has (an audio track, a JPEG comment), is not "the same content": the original's
 /// new version gets its own name and nothing is lost.

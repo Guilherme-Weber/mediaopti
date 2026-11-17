@@ -89,6 +89,8 @@ struct RunStats {
     /// CPU files by stage (audio, documents, images): queued this run, and finished.
     stage_total: [usize; 3],
     stage_done: [usize; 3],
+    /// CPU files in a row whose tools could not run (`ImageResult::ToolUnavailable`).
+    tools_failing: usize,
 }
 
 #[derive(Clone, Debug)]
