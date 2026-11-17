@@ -44,6 +44,10 @@ fn parse_segments(data: &[u8]) -> Option<Segments> {
             break;
         }
         let len = u16::from_be_bytes([data[i + 2], data[i + 3]]) as usize;
+        // The length counts its own 2 bytes: below that the header is damaged.
+        if len < 2 {
+            return None;
+        }
         let end = (i + 2 + len).min(data.len());
         if (0xE0..=0xEF).contains(&m) || m == 0xFE {
             segs.push((m, data[i + 4..end].to_vec()));
@@ -286,6 +290,21 @@ mod tests {
         assert!(meta_ok(&orig, &kept, true));
         assert!(!meta_ok(&orig, &kept, false), "comment lost while keeping metadata");
         assert!(meta_ok(&orig, &orig, false));
+    }
+
+    /// A damaged header whose APPn/COM length is below 2 (the length counts its own 2 bytes)
+    /// is not a JPEG we can read, and must not panic (a panic aborts the app in release).
+    #[test]
+    fn segment_length_below_two_is_rejected() {
+        for len in [0u8, 1] {
+            let mut j = vec![0xFF, 0xD8, 0xFF, 0xE1, 0, len, b'E', b'x', b'i', b'f'];
+            j.extend(seg(0xDB, &[0; 65]));
+            j.extend([0xFF, 0xDA, 0, 2, 1, 2, 3, 0xFF, 0xD9]);
+            assert_eq!(parse_segments(&j), None, "length {len}");
+            let mut com = vec![0xFF, 0xD8, 0xFF, 0xFE, 0, len];
+            com.extend([0xFF, 0xD9]);
+            assert_eq!(parse_segments(&com), None, "COM length {len}");
+        }
     }
 
     #[test]
