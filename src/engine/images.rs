@@ -124,7 +124,10 @@ impl Inner {
         for (stage, limit) in limits.into_iter().enumerate() {
             let queue = &self.cpu_queues[stage];
             let mut cursor = self.cpu_cursors[stage];
-            while cursor < queue.len() && (self.in_progress.contains(&queue[cursor]) || self.failed.contains(&queue[cursor])) {
+            while cursor < queue.len() && {
+                let file = &self.files[queue[cursor] as usize];
+                self.in_progress.contains(file) || self.failed.contains(file)
+            } {
                 cursor += 1;
             }
             self.cpu_cursors[stage] = cursor;
@@ -134,7 +137,7 @@ impl Inner {
             if self.cpu_active[stage] >= limit {
                 return CpuClaim::Wait;
             }
-            let file = self.cpu_queues[stage][cursor].clone();
+            let file = self.files[self.cpu_queues[stage][cursor] as usize].clone();
             self.cpu_cursors[stage] += 1;
             self.cpu_active[stage] += 1;
             self.in_progress.insert(file.clone());

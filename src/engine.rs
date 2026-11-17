@@ -162,14 +162,16 @@ struct Inner {
     files: Vec<PathBuf>,
     /// Size of each entry of `files` at scan time, same order.
     file_sizes: Vec<u64>,
-    pending_queue: Vec<PathBuf>,
+    /// Videos to do, as indices into `files` (a queued file costs 4 bytes, not a second copy
+    /// of its path: a library holds about a million files).
+    pending_queue: Vec<u32>,
     queue_cursor: usize,
     /// Single-frame GIFs found by the scan: always images, whatever their size.
     static_gifs: HashSet<PathBuf>,
     /// PNG/JPEG and small GIFs, processed by the CPU image workers.
     /// CPU files by stage (audio, documents, images: see `Kind::stage`), each with its cursor
     /// and how many run now. A stage starts when the one before has nothing left to start.
-    cpu_queues: [Vec<PathBuf>; 3],
+    cpu_queues: [Vec<u32>; 3],
     cpu_cursors: [usize; 3],
     cpu_active: [usize; 3],
     /// The stages announced in the log this batch.

@@ -47,6 +47,13 @@ pub(super) struct ScanResult {
 /// Recursively finds videos (skipping hidden folders like the old glob did), deletes leftover
 /// temp files and sorts the queue by size, largest first. File sizes come from the directory
 /// listing itself (on Windows `DirEntry::metadata` needs no extra system call).
+/// The scanned files not already in `loaded` (compared by reference: no copy of the
+/// library's paths is made under the engine's lock).
+fn only_new(loaded: &[PathBuf], files: Vec<PathBuf>, sizes: Vec<u64>) -> Vec<(PathBuf, u64)> {
+    let known: HashSet<&Path> = loaded.iter().map(PathBuf::as_path).collect();
+    files.into_iter().zip(sizes).filter(|(f, _)| !known.contains(f.as_path())).collect()
+}
+
 /// Whether ffmpeg can read `path` as media (a half-written encode, e.g. an MP4 without its
 /// index, can't).
 /// Runs through `tools::run` with a time limit: a file that makes ffmpeg hang can't hold up
@@ -287,31 +294,29 @@ impl Engine {
             // Appended to the running batch; more workers start if the queues need them.
             let (videos, cpu) = {
                 let mut inner = self.lock();
-                let loaded: HashSet<PathBuf> = inner.files.iter().cloned().collect();
+                let new = only_new(&inner.files, result.files, result.sizes);
                 let (mut videos, mut cpu) = (0, 0);
-                for (file, size) in result.files.into_iter().zip(result.sizes) {
-                    if loaded.contains(&file) {
-                        continue;
-                    }
+                for (file, size) in new {
                     if result.static_gifs.contains(&file) {
                         inner.static_gifs.insert(file.clone());
                     }
-                    match inner.place(&file, size) {
+                    let place = inner.place(&file, size);
+                    let stage = cpu_stage(&file);
+                    let i = inner.add_file(file, size);
+                    match place {
                         Place::Video => {
-                            inner.pending_queue.push(file.clone());
+                            inner.pending_queue.push(i);
                             inner.queue_bytes[0] += size;
                             inner.queue_revision += 1;
                             videos += 1;
                         }
                         Place::Cpu => {
-                            inner.run.stage_total[cpu_stage(&file)] += 1;
-                            inner.queue_cpu(file.clone(), size);
+                            inner.run.stage_total[stage] += 1;
+                            inner.queue_cpu(i, size);
                             cpu += 1;
                         }
                         _ => {}
                     }
-                    inner.files.push(file);
-                    inner.file_sizes.push(size);
                 }
                 inner.run.total += videos + cpu;
                 inner.run.images_total += cpu;
@@ -332,12 +337,8 @@ impl Engine {
         let (known, generated, small_gifs, videos, cpu, total) = {
             let mut inner = self.lock();
             if add {
-                let loaded: HashSet<PathBuf> = inner.files.iter().cloned().collect();
-                for (file, size) in result.files.into_iter().zip(result.sizes) {
-                    if !loaded.contains(&file) {
-                        inner.files.push(file);
-                        inner.file_sizes.push(size);
-                    }
+                for (file, size) in only_new(&inner.files, result.files, result.sizes) {
+                    inner.add_file(file, size);
                 }
                 inner.static_gifs.extend(result.static_gifs);
             } else {

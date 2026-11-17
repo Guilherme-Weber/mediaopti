@@ -139,7 +139,7 @@ impl Inner {
 
     /// Rebuilds the work queues from the scanned files, history and this run's failures.
     pub(super) fn rebuild_queue(&mut self) {
-        let (mut queue, mut cpu): (Vec<PathBuf>, [Vec<PathBuf>; 3]) = (Vec::new(), Default::default());
+        let (mut queue, mut cpu): (Vec<u32>, [Vec<u32>; 3]) = (Vec::new(), Default::default());
         let mut bytes = [0u64; 4];
         let (mut known, mut generated, mut small_gifs) = (0, 0, 0);
         for (i, file) in self.files.iter().enumerate() {
@@ -152,11 +152,11 @@ impl Inner {
                 Place::Cpu => {
                     let stage = cpu_stage(file);
                     bytes[stage + 1] += size;
-                    cpu[stage].push(file.clone());
+                    cpu[stage].push(i as u32);
                 }
                 Place::Video => {
                     bytes[0] += size;
-                    queue.push(file.clone());
+                    queue.push(i as u32);
                 }
             }
         }
@@ -185,24 +185,40 @@ impl Inner {
         self.cpu_queues.iter().zip(self.cpu_cursors).map(|(q, c)| q.len().saturating_sub(c)).sum()
     }
 
+    /// Where `file` is in `files` (a search: only for the rare Pause).
+    fn index_of(&self, file: &Path) -> Option<u32> {
+        self.files.iter().position(|f| f == file).map(|i| i as u32)
+    }
+
+    /// Adds a scanned file to `files`, returning its index for the queues.
+    pub(super) fn add_file(&mut self, file: PathBuf, size: u64) -> u32 {
+        self.files.push(file);
+        self.file_sizes.push(size);
+        (self.files.len() - 1) as u32
+    }
+
     /// A video whose job was ended by a Pause (to free memory): next in line again.
     pub(super) fn requeue_video(&mut self, file: &Path) {
         self.in_progress.remove(file);
-        self.pending_queue.insert(self.queue_cursor, file.to_path_buf());
+        if let Some(i) = self.index_of(file) {
+            self.pending_queue.insert(self.queue_cursor, i);
+        }
     }
 
     /// A CPU file whose job was ended by a Pause: next in line in its stage again.
     pub(super) fn requeue_cpu(&mut self, file: &Path) {
         let stage = cpu_stage(file);
         self.in_progress.remove(file);
-        self.cpu_queues[stage].insert(self.cpu_cursors[stage], file.to_path_buf());
+        if let Some(i) = self.index_of(file) {
+            self.cpu_queues[stage].insert(self.cpu_cursors[stage], i);
+        }
     }
 
-    /// Adds a CPU file to its stage's queue (and the byte counts).
-    pub(super) fn queue_cpu(&mut self, file: PathBuf, size: u64) {
-        let stage = cpu_stage(&file);
+    /// Adds a CPU file (index `i` in `files`) to its stage's queue (and the byte counts).
+    pub(super) fn queue_cpu(&mut self, i: u32, size: u64) {
+        let stage = cpu_stage(&self.files[i as usize]);
         self.queue_bytes[stage + 1] += size;
-        self.cpu_queues[stage].push(file);
+        self.cpu_queues[stage].push(i);
         self.queue_revision += 1;
     }
 
@@ -222,7 +238,7 @@ impl Inner {
 
     pub(super) fn claim_next(&mut self) -> Option<PathBuf> {
         while self.queue_cursor < self.pending_queue.len() {
-            let candidate = self.pending_queue[self.queue_cursor].clone();
+            let candidate = self.files[self.pending_queue[self.queue_cursor] as usize].clone();
             self.queue_cursor += 1;
             if !self.in_progress.contains(&candidate)
                 && !self.failed.contains(&candidate)
@@ -367,16 +383,81 @@ impl Engine {
     /// The first `limit` files waiting, in processing order: (name, type, size).
     pub fn queue_preview(&self, limit: usize) -> Vec<(String, &'static str, u64)> {
         let inner = self.lock();
-        let mut picked: Vec<(&PathBuf, &'static str)> = Vec::new();
-        let videos = inner.pending_queue.iter().skip(inner.queue_cursor).map(|p| (p, "Video"));
+        let videos = inner.pending_queue.iter().skip(inner.queue_cursor).map(|&i| (i, "Video"));
         let cpu = ["Audio", "Document", "Image"]
             .iter()
             .enumerate()
-            .flat_map(|(i, label)| inner.cpu_queues[i].iter().skip(inner.cpu_cursors[i]).map(move |p| (p, *label)));
-        picked.extend(videos.chain(cpu).take(limit));
-        let wanted: HashSet<&PathBuf> = picked.iter().map(|(p, _)| *p).collect();
-        let sizes: std::collections::HashMap<&PathBuf, u64> =
-            inner.files.iter().zip(&inner.file_sizes).filter(|(f, _)| wanted.contains(f)).map(|(f, s)| (f, *s)).collect();
-        picked.into_iter().map(|(p, kind)| (inner.display_name(p), kind, sizes.get(p).copied().unwrap_or(0))).collect()
+            .flat_map(|(s, label)| inner.cpu_queues[s].iter().skip(inner.cpu_cursors[s]).map(move |&i| (i, *label)));
+        videos
+            .chain(cpu)
+            .take(limit)
+            .map(|(i, kind)| {
+                let i = i as usize;
+                (inner.display_name(&inner.files[i]), kind, inner.file_sizes.get(i).copied().unwrap_or(0))
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+
+    struct Quiet;
+    impl Ui for Quiet {
+        fn log(&self, _: String) {}
+        fn state(&self, _: &StateDto) {}
+    }
+
+    /// This process's private memory in MB (PowerShell, good enough for a benchmark).
+    fn private_mb() -> f64 {
+        let out = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", &format!("(Get-Process -Id {}).PrivateMemorySize64", std::process::id())])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().parse::<f64>().unwrap_or(0.0) / 1_048_576.0
+    }
+
+    /// Queue work with a library-sized folder (1 million files, no real files needed): how long
+    /// the engine's lock is held by a queue rebuild, the queue preview and clearing the history,
+    /// and the memory the queued files take. Run:
+    /// `cargo test --release queue_scale -- --ignored --nocapture`
+    #[test]
+    #[ignore = "benchmark"]
+    fn queue_scale() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let data = std::env::temp_dir().join(format!("mo-queue-bench-{}", std::process::id()));
+        let engine = Engine::new(Box::new(Quiet), &data, PathBuf::from("ffmpeg.exe"), rt.handle().clone());
+        engine.apply_options(crate::args::RawOptions { images: Some(2), audio: Some(2), ..crate::args::RawOptions::default() });
+        const N: usize = 1_000_000;
+        let exts = ["png", "png", "png", "png", "png", "png", "png", "jpg", "jpg", "mp4", "flac", "pdf"];
+        let m0 = private_mb();
+        {
+            let mut inner = engine.lock();
+            inner.dir = Some(PathBuf::from(r"F:\USER\Pictures"));
+            for i in 0..N {
+                inner.files.push(PathBuf::from(format!(r"F:\USER\Pictures\Some Folder {}\Another Level\file number {i}.{}", i / 1000, exts[i % exts.len()])));
+                inner.file_sizes.push(100_000 + i as u64);
+            }
+        }
+        let m1 = private_mb();
+        let time = |what: &str, f: &mut dyn FnMut()| {
+            let t = std::time::Instant::now();
+            f();
+            println!("{what}: {:.0} ms", t.elapsed().as_secs_f64() * 1000.0);
+        };
+        time("rebuild_queue (lock held)", &mut || engine.lock().rebuild_queue());
+        let m2 = private_mb();
+        time("queue_preview(5000)", &mut || drop(engine.queue_preview(5000)));
+        time("history clear + rebuild (clear_history)", &mut || {
+            let mut inner = engine.lock();
+            inner.history.clear();
+            inner.rebuild_queue();
+        });
+        let inner = engine.lock();
+        println!("queued: {} videos, {} CPU files", inner.pending_queue.len(), inner.cpu_total());
+        println!("memory: files {:.0} MB ({:.0} B/file), queues {:.0} MB ({:.0} B/file)", m1 - m0, (m1 - m0) * 1_048_576.0 / N as f64, m2 - m1, (m2 - m1) * 1_048_576.0 / N as f64);
+        drop(inner);
+        let _ = std::fs::remove_dir_all(&data);
     }
 }
