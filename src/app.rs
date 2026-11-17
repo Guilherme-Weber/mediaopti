@@ -372,6 +372,7 @@ struct Controller {
     files_left: Rc<VecModel<FileRow>>,
     files_right: Rc<VecModel<FileRow>>,
     metric_model: Rc<VecModel<Metric>>,
+    count_model: Rc<VecModel<QueueCount>>,
     log_revision: i32,
     taskbar: Option<Taskbar>,
     taskbar_tried: bool,
@@ -449,13 +450,8 @@ impl Controller {
         let logs = std::mem::take(&mut *self.inbox.logs.lock().unwrap_or_else(PoisonError::into_inner));
 
         if !logs.is_empty() {
-            for line in logs {
-                self.log_model.push(line.into());
-            }
-            let excess = self.log_model.row_count().saturating_sub(MAX_LOG_LINES);
-            for _ in 0..excess {
-                self.log_model.remove(0);
-            }
+            append_log(&self.log_model, logs);
+
             self.log_revision += 1;
         }
         if let Some(state) = state {
@@ -484,7 +480,7 @@ impl Controller {
                 glyph: (*glyph).into(),
             })
             .collect();
-        w.set_queue_counts(ModelRc::new(VecModel::from(counts)));
+        sync_model(&self.count_model, counts);
         let running = matches!(s.status, Status::Running | Status::Paused | Status::Stopping);
         let key = (s.queue_revision, running);
         if running || self.queue_shown == Some(key) {
@@ -726,6 +722,23 @@ fn file_row(name: &str, step: &str, share: Option<f32>, extra: Option<String>, s
     FileRow { name: name.into(), meta: meta.into(), progress: share.unwrap_or(-1.0) }
 }
 
+/// Adds log lines, keeping the last `MAX_LOG_LINES`: past the limit, in one change (removing
+/// the oldest one by one shifted the whole list for each).
+fn append_log(model: &VecModel<SharedString>, logs: Vec<String>) {
+    if model.row_count() + logs.len() <= MAX_LOG_LINES {
+        for line in logs {
+            model.push(line.into());
+        }
+        return;
+    }
+    let keep = MAX_LOG_LINES.saturating_sub(logs.len());
+    let old = model.row_count();
+    let mut lines: Vec<SharedString> = (old.saturating_sub(keep)..old).filter_map(|i| model.row_data(i)).collect();
+    lines.extend(logs.into_iter().map(Into::into));
+    let from = lines.len().saturating_sub(MAX_LOG_LINES);
+    model.set_vec(lines.split_off(from));
+}
+
 fn sync_model<T: Clone + PartialEq + 'static>(model: &VecModel<T>, rows: Vec<T>) {
     if model.row_count() == rows.len() {
         for (i, row) in rows.into_iter().enumerate() {
@@ -831,6 +844,8 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
     window.set_files_left(files_left.clone().into());
     window.set_files_right(files_right.clone().into());
     window.set_metrics(metric_model.clone().into());
+    let count_model = Rc::new(VecModel::<QueueCount>::default());
+    window.set_queue_counts(count_model.clone().into());
     let queue_model = Rc::new(VecModel::<QueueItem>::default());
     window.set_queue_items(queue_model.clone().into());
 
@@ -972,6 +987,7 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
             files_left,
             files_right,
             metric_model,
+            count_model,
             log_revision: 0,
             taskbar: None,
             taskbar_tried: false,
@@ -1464,6 +1480,21 @@ fn idle_file_text(s: &StateDto) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The log keeps its last MAX_LOG_LINES lines, in order, however many arrive at once.
+    #[test]
+    fn the_log_keeps_its_last_lines() {
+        let model = VecModel::<SharedString>::default();
+        append_log(&model, (0..MAX_LOG_LINES - 2).map(|i| i.to_string()).collect());
+        assert_eq!(model.row_count(), MAX_LOG_LINES - 2);
+        append_log(&model, vec!["a".into(), "b".into(), "c".into()]);
+        assert_eq!(model.row_count(), MAX_LOG_LINES);
+        assert_eq!(model.row_data(0).unwrap(), "1");
+        assert_eq!(model.row_data(MAX_LOG_LINES - 1).unwrap(), "c");
+        append_log(&model, (0..MAX_LOG_LINES + 7).map(|i| format!("n{i}")).collect());
+        assert_eq!(model.row_count(), MAX_LOG_LINES);
+        assert_eq!(model.row_data(0).unwrap(), "n7");
+    }
 
     #[test]
     fn formats_megabytes_like_the_old_ui() {
