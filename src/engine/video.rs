@@ -522,6 +522,26 @@ impl Engine {
                 return Outcome::Failed;
             }
         }
+        self.place_new_version(worker_id, input, display, tmp, attempt.diag.duration_sec, &in_meta, (in_size, out_size), source_state, &mut completion)
+            .await
+    }
+
+    /// The last step of a video job whose new version passed its checks: its name (claimed,
+    /// with the same-content and taken-name cases), a last look at the original, the
+    /// replacement, and the history.
+    #[allow(clippy::too_many_arguments)]
+    async fn place_new_version(
+        self: &Arc<Self>,
+        worker_id: u32,
+        input: PathBuf,
+        display: String,
+        tmp: PathBuf,
+        duration_sec: f64,
+        in_meta: &std::fs::Metadata,
+        (in_size, out_size): (f64, f64),
+        source_state: Option<(u64, Option<std::time::SystemTime>)>,
+        completion: &mut Completion<'_>,
+    ) -> Outcome {
         let saved_mb = (in_size - out_size) / (1024.0 * 1024.0);
         let saved_pct = ((in_size - out_size) / in_size * 100.0).round() as i64;
 
@@ -555,7 +575,7 @@ impl Engine {
                 }
                 tries += 1;
                 if tries == 1 {
-                    match self.same_video(&input, &final_target, attempt.diag.duration_sec).await {
+                    match self.same_video(&input, &final_target, duration_sec).await {
                         Err(Stopped) => {
                             self.log_remove(&tmp);
                             completion.armed = false;
@@ -603,7 +623,7 @@ impl Engine {
             return Outcome::Skipped;
         }
 
-        let attrs = OriginalAttributes::from_metadata(&in_meta);
+        let attrs = OriginalAttributes::from_metadata(in_meta);
         let disposal = self.lock().disposal_for(&input);
         let (tmp_c, target_c, input_c) = (tmp.clone(), final_target.clone(), input.clone());
         let replaced = self
