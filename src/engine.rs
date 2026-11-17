@@ -268,6 +268,7 @@ impl Engine {
         system::put_app_in_kill_on_exit_job();
         let history = History::load(data_dir.join("processedFiles.txt"));
         let placeholders = system::init_claims_journal(&data_dir.join("claimed-names.txt"));
+        replace::init_pending_journal(&data_dir.join("pending-replacements.txt"));
         let image_tools = image::tools::Tools::discover(ffmpeg_path.clone(), data_dir);
         if placeholders > 0 {
             ui.log(format!("Removed {placeholders} empty name placeholder(s) left by an interrupted run"));

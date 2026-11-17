@@ -302,7 +302,7 @@ pub fn append_lines(path: &Path, lines: &str, durable: bool) -> std::io::Result<
 }
 
 /// Replaces a file's content so that a crash leaves either the old or the new one whole.
-fn write_atomically(path: &Path, data: &[u8]) -> std::io::Result<()> {
+pub fn write_atomically(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension("saving");
     {
         let mut f = std::fs::File::create(&tmp)?;

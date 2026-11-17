@@ -61,7 +61,9 @@ pub(super) fn media_readable(ffmpeg: &Path, path: &Path) -> bool {
     cmd.output().is_ok_and(|o| o.status.success() && o.stderr.is_empty())
 }
 
-pub(super) fn scan_folder(roots: &[PathBuf], exclude: Option<&Path>, temp: Option<&Path>, found: &std::sync::atomic::AtomicUsize, ffmpeg: &Path) -> ScanResult {
+/// `settle_temps`: leftover temp files are settled (`settle_orphan_temp`); off while a batch
+/// runs, whose workers' temps are not leftovers.
+pub(super) fn scan_folder(roots: &[PathBuf], exclude: Option<&Path>, temp: Option<&Path>, found: &std::sync::atomic::AtomicUsize, ffmpeg: &Path, settle_temps: bool) -> ScanResult {
     let mut messages = Vec::new();
     let mut cleaned_orphans = 0;
     // Work folders of runs that were killed or crashed.
@@ -101,14 +103,21 @@ pub(super) fn scan_folder(roots: &[PathBuf], exclude: Option<&Path>, temp: Optio
             continue; // dropped twice (a folder and a file inside it)
         }
         if is_orphan_temp(entry.path()) {
+            if !settle_temps {
+                continue;
+            }
             // A leftover with its original still there is a half-made version: removed. If
             // the original is gone, the app was stopped after setting it aside but before the
             // new version got its name: the leftover IS the file now, so it gets the name.
             match settle_orphan_temp(entry.path(), &|p| media_readable(ffmpeg, p)) {
-                Ok(None) => cleaned_orphans += 1,
-                Ok(Some(named)) => messages.push(format!(
+                Ok(Settled::Removed) => cleaned_orphans += 1,
+                Ok(Settled::Recovered(named)) => messages.push(format!(
                     "Recovered {} (the app had stopped while replacing it; its original is in the Recycle Bin or backup folder)",
                     named.display()
+                )),
+                Ok(Settled::LeftAlone) => messages.push(format!(
+                    "Left {} as it is: a temporary file from an interrupted run whose original could not be found (check it, then rename or delete it)",
+                    entry.path().display()
                 )),
                 Err(err) => messages.push(format!("Could not tidy up temporary file {}: {err}", entry.path().display())),
             }
@@ -250,7 +259,7 @@ impl Engine {
             })
         };
         let ffmpeg = self.ffmpeg_path.clone();
-        let scan = self.rt.spawn_blocking(move || scan_folder(&roots, exclude.as_deref(), temp.as_deref(), &found, &ffmpeg)).await;
+        let scan = self.rt.spawn_blocking(move || scan_folder(&roots, exclude.as_deref(), temp.as_deref(), &found, &ffmpeg, !working)).await;
         ticker.abort();
         let result = match scan {
             Ok(r) => r,
