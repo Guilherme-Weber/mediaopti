@@ -33,7 +33,8 @@ pub(super) enum Settled {
 /// same job could have come from (a video for a video temp; the same kind of file, picture,
 /// audio or document, for the others). A same-stem sibling of another kind (`IMG_1.JPG` beside
 /// a video's temp, `album.cue` beside a FLAC's) doesn't count. With no original, a temp that
-/// `complete` accepts (ffmpeg can read it) is given the stem's name; any other is left alone.
+/// `complete` accepts (ffmpeg can read it) is given the stem's name; an unreadable video,
+/// audio or picture temp is half-made and goes; a document's temp is left alone.
 pub(super) fn settle_orphan_temp(temp: &Path, complete: &dyn Fn(&Path) -> bool) -> std::io::Result<Settled> {
     let size = std::fs::metadata(temp)?.len();
     if let Some(p) = pending_for(temp).filter(|p| p.size == size) {
@@ -70,7 +71,15 @@ pub(super) fn settle_orphan_temp(temp: &Path, complete: &dyn Fn(&Path) -> bool) 
         return Ok(Settled::Removed);
     }
     if !complete(temp) {
-        return Ok(Settled::LeftAlone);
+        // A video, audio or picture temp ffmpeg can't read is half-made: an older version
+        // set an original aside only after its new version was verified (and readable). A
+        // document's temp can't be checked that way: never deleted on a guess.
+        let document = image::kind_of(temp).is_some_and(image::Kind::is_document);
+        if document {
+            return Ok(Settled::LeftAlone);
+        }
+        system::remove_file_if_exists(temp)?;
+        return Ok(Settled::Removed);
     }
     let ext = temp.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default();
     let target = free_target(&dir.join(format!("{stem}.{ext}")))?;
@@ -336,10 +345,14 @@ mod tests {
         assert_eq!(std::fs::read(dir.join("pic.png")).unwrap(), b"finished new version");
         assert_eq!(settle_orphan_temp(&dir.join("sky.mediaopti.i2.png"), &yes).unwrap(), Settled::Recovered(dir.join("sky.png")));
         assert_eq!(std::fs::read(dir.join("sky.png")).unwrap(), b"finished conversion");
-        // Unreadable, original gone, not in the journal: left alone (never deleted on a guess).
+        // Unreadable media, original gone, not in the journal: half-made, removed.
         w("cut.mediaopti.w2.mp4", b"truncated");
-        assert_eq!(settle_orphan_temp(&dir.join("cut.mediaopti.w2.mp4"), &|_: &Path| false).unwrap(), Settled::LeftAlone);
-        assert!(dir.join("cut.mediaopti.w2.mp4").exists() && !dir.join("cut.mp4").exists());
+        assert_eq!(settle_orphan_temp(&dir.join("cut.mediaopti.w2.mp4"), &|_: &Path| false).unwrap(), Settled::Removed);
+        assert!(!dir.join("cut.mediaopti.w2.mp4").exists() && !dir.join("cut.mp4").exists());
+        // A document's temp can't be checked: left alone, never deleted on a guess.
+        w("book.mediaopti.i4.pdf", b"maybe the only copy");
+        assert_eq!(settle_orphan_temp(&dir.join("book.mediaopti.i4.pdf"), &|_: &Path| false).unwrap(), Settled::LeftAlone);
+        assert!(dir.join("book.mediaopti.i4.pdf").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
