@@ -232,9 +232,8 @@ pub fn bytes_read(child: &std::process::Child) -> Option<u64> {
 pub fn free_space(path: &Path) -> Option<u64> {
     #[cfg(windows)]
     {
-        use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
-        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let wide = wide(path);
         let mut free = 0u64;
         // SAFETY: `wide` is NUL-terminated; the out pointer is valid for the call.
         let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, std::ptr::null_mut(), std::ptr::null_mut()) };
@@ -251,10 +250,9 @@ pub fn free_space(path: &Path) -> Option<u64> {
 pub fn set_hidden(path: &Path) {
     #[cfg(windows)]
     {
-        use std::os::windows::ffi::OsStrExt;
         let Ok(meta) = fs::metadata(path) else { return };
         let current = std::os::windows::fs::MetadataExt::file_attributes(&meta);
-        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let wide = wide(path);
         // SAFETY: `wide` is NUL-terminated and lives through the call.
         unsafe { windows_sys::Win32::Storage::FileSystem::SetFileAttributesW(wide.as_ptr(), current | 0x2) };
     }
@@ -616,11 +614,28 @@ pub fn flush_to_disk(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// `path` as a NUL-terminated UTF-16 string for the Windows API.
+/// `path` as a NUL-terminated UTF-16 string for the Windows API. A long absolute path gets
+/// the `\\?\` form, which has no length limit (the plain form stops at 260 characters unless
+/// the system allows long paths). Not for the Shell's functions, which refuse that form.
 #[cfg(windows)]
 fn wide(path: &Path) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
-    path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+    verbatim_if_long(path).as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+}
+
+/// `\\?\C:\...` (or `\\?\UNC\server\share\...`) for an absolute path of 248 characters or
+/// more (the limit of folder names in the plain form); any other path as it is.
+pub fn verbatim_if_long(path: &Path) -> std::path::PathBuf {
+    let text = path.as_os_str().to_string_lossy();
+    if text.len() < 248 || !path.is_absolute() || text.starts_with(r"\\?\") {
+        return path.to_path_buf();
+    }
+    // The \\?\ form is taken literally: separators must be backslashes.
+    let text = text.replace('/', r"\");
+    match text.strip_prefix(r"\\") {
+        Some(unc) => std::path::PathBuf::from(format!(r"\\?\UNC\{unc}")),
+        None => std::path::PathBuf::from(format!(r"\\?\{text}")),
+    }
 }
 
 /// Renames `from` to `to` on the same drive, failing with `AlreadyExists` if `to` exists
@@ -822,9 +837,8 @@ pub fn restore_attributes(path: &Path, attrs: &OriginalAttributes) -> std::io::R
     }
     #[cfg(windows)]
     if attrs.flags != 0 {
-        use std::os::windows::ffi::OsStrExt;
         let current = std::os::windows::fs::MetadataExt::file_attributes(&fs::metadata(path)?);
-        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let wide = wide(path);
         // SAFETY: `wide` is NUL-terminated and lives through the call.
         if unsafe { windows_sys::Win32::Storage::FileSystem::SetFileAttributesW(wide.as_ptr(), current | attrs.flags) } == 0 {
             return Err(std::io::Error::last_os_error());
@@ -973,6 +987,23 @@ mod tests {
         assert_eq!(std::os::windows::fs::MetadataExt::file_attributes(&meta) & KEPT_FLAGS, 0x2 | 0x2000, "hidden and not-indexed kept");
         remove_file_if_exists(&path).unwrap();
         assert!(!path.exists());
+    }
+
+    #[test]
+    #[ignore = "moves a temp file into the user's Recycle Bin"]
+    fn recycles_files_under_long_paths() {
+        let mut dir = std::env::temp_dir().join(format!("mo-recycle-long-{}", std::process::id()));
+        let top = dir.clone();
+        for i in 0..5 {
+            dir.push(format!("folder {i} with a long name to pass the old limit of Windows paths"));
+        }
+        fs::create_dir_all(&dir).unwrap();
+        let (orig, tmp) = (dir.join("clip.mp4"), dir.join("clip.mediaopti.w1.mp4"));
+        fs::write(&orig, b"original").unwrap();
+        fs::write(&tmp, b"new").unwrap();
+        replace_file_with_retry(&tmp, &orig, &orig, &Disposal::RecycleBin).unwrap();
+        assert_eq!(fs::read(&orig).unwrap(), b"new");
+        let _ = fs::remove_dir_all(&top);
     }
 
     #[test]

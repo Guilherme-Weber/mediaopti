@@ -678,9 +678,11 @@ pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, dispo
         return ImageResult::Kept { content: content_of(path), note: None };
     }
     let job = NEXT_JOB.fetch_add(1, Ordering::Relaxed);
-    // FLAC, MP3 and Ogg are read where they are (ffmpeg, flac and OptiVorbis open any path,
-    // and nothing writes to the original): a long album isn't copied to the temp folder first.
-    let in_place = matches!(kind, image::Kind::Flac | image::Kind::Mp3 | image::Kind::Ogg);
+    // FLAC, MP3 and Ogg are read where they are (nothing writes to the original): a long
+    // album isn't copied to the temp folder first. Not under a path longer than the classic
+    // 260 characters, which flac.exe can't open (it would silently skip its re-encode).
+    let in_place = matches!(kind, image::Kind::Flac | image::Kind::Mp3 | image::Kind::Ogg)
+        && path.as_os_str().len() < 248;
     let factor = match kind {
         image::Kind::Pdf => 16,
         _ if in_place => 2,

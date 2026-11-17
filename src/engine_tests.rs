@@ -1254,6 +1254,56 @@ fn wav_becomes_flac_only_when_safe() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Files in a folder whose path is longer than 260 characters are processed like any other:
+/// tools that can't open such paths (flac.exe) work on a short copy, and the originals go to
+/// a (just as long) backup folder.
+#[test]
+fn files_under_long_paths_are_processed() {
+    let Some(ff) = ffmpeg() else {
+        eprintln!("skipping: bundled ffmpeg not found");
+        return;
+    };
+    let tools = crate::image::tools::Tools::discover(ff.clone(), &std::env::temp_dir());
+    if !["oxipng", "flac"].iter().all(|t| tools.has(t)) {
+        eprintln!("skipping: oxipng or flac not found");
+        return;
+    }
+    let root = test_dir("longpath");
+    let mut media = root.join("media");
+    for i in 0..5 {
+        media.push(format!("folder {i} with a long name to pass the old limit of Windows paths"));
+    }
+    std::fs::create_dir_all(&media).unwrap();
+    assert!(media.as_os_str().len() > 300);
+    // ffmpeg itself handles long paths: it makes the files in place.
+    let art = root.join("art.png");
+    make(&ff, &["-f", "lavfi", "-i", "testsrc=s=300x300", "-frames:v", "1", "-compression_level", "0"], &art);
+    make(&ff, &["-f", "lavfi", "-i", "sine=duration=3", "-i", art.to_str().unwrap(), "-map", "0", "-map", "1", "-c:a", "flac",
+        "-c:v", "png", "-disposition:v", "attached_pic"], &media.join("song.flac"));
+    // No cover: only flac.exe's re-encode can make it smaller.
+    make(&ff, &["-f", "lavfi", "-i", "sine=duration=3", "-c:a", "flac", "-compression_level", "0"], &media.join("plain.flac"));
+    make(&ff, &["-f", "lavfi", "-i", "testsrc=s=200x150", "-frames:v", "1", "-compression_level", "0"], &media.join("picture.png"));
+    lossless_video(&ff, 2, "320x240", &media.join("clip.mp4"));
+
+    let rt = runtime();
+    let (engine, rec) = new_engine(&rt, &root, ff);
+    let raw = || RawOptions { images: Some(1), audio: Some(1), originals: Some(2), ..opts("libx264", 1.0) };
+    rt.block_on(async {
+        engine.apply_options(raw());
+        engine.load_dir(root.join("media")).await;
+        engine.clone().run_batch(raw()).await;
+    });
+    let logs = rec.logs.lock().unwrap().join("\n");
+    let s = engine.snapshot();
+    assert_eq!((s.completed_this_run, s.failed_this_run), (4, 0), "{logs}");
+    assert_eq!(s.compressed_this_run, 4, "all four were made smaller\n{logs}");
+    let backup = root.join("media (originals)").join(media.strip_prefix(root.join("media")).unwrap());
+    for name in ["song.flac", "plain.flac", "picture.png", "clip.mp4"] {
+        assert!(backup.join(name).exists(), "{name} in the backup folder\n{logs}");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A panic while processing one file (a bug, a malformed file nobody foresaw) fails that
 /// file only: the batch goes on and ends, its counters come back to zero, and the file is
 /// not remembered (tried again next run).
