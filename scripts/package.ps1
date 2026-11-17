@@ -33,7 +33,8 @@ try {
     $env:RUSTFLAGS, $env:CARGO_TARGET_DIR = $savedFlags, $savedTarget
 }
 $exePath = Join-Path $root 'target\package\release\mediaopti.exe'
-$exeText = [System.Text.Encoding]::Latin1.GetString([System.IO.File]::ReadAllBytes($exePath))
+# Latin-1 by code page (Windows PowerShell 5.1 has no Encoding.Latin1).
+$exeText = [System.Text.Encoding]::GetEncoding(28591).GetString([System.IO.File]::ReadAllBytes($exePath))
 foreach ($private in @($profileDir, $root)) {
     $found = [regex]::Matches($exeText, [regex]::Escape($private), 'IgnoreCase').Count
     if ($found -gt 0) { throw "the executable still names $private ($found times)" }
@@ -49,7 +50,10 @@ Remove-Item $stage, $zip -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force $stage | Out-Null
 Copy-Item $exePath $stage
 Copy-Item $ffmpeg $stage
-Copy-Item (Join-Path $root 'bin\ffmpeg-LICENSE.txt') $stage -ErrorAction SilentlyContinue
+# FFmpeg is GPL: its licence goes with it, always.
+$ffmpegLicense = Join-Path $root 'bin\ffmpeg-LICENSE.txt'
+if (-not (Test-Path $ffmpegLicense)) { throw "missing $ffmpegLicense (run scripts/fetch-ffmpeg.ps1)" }
+Copy-Item $ffmpegLicense $stage
 Copy-Item (Join-Path $root 'LICENSE') $stage
 
 if (-not $NoTools) {
@@ -57,6 +61,9 @@ if (-not $NoTools) {
     $bin = Join-Path $root 'bin'
     # cjpegli's version as scripts/build-jpegli.ps1 recorded it; without a build it is libjxl
     # 0.11.2's (fetch-tools.ps1).
+    # OptiVorbis' version is the one fetch-tools.ps1 downloads (one place to change it).
+    $optivorbisVersion = [regex]::Match((Get-Content (Join-Path $PSScriptRoot 'fetch-tools.ps1') -Raw), 'OptiVorbis/releases/download/v([\d.]+)/').Groups[1].Value
+    if (-not $optivorbisVersion) { throw 'the OptiVorbis version was not found in fetch-tools.ps1' }
     $jpegliVersion = 'libjxl 0.11.2'
     $binVersions = Join-Path $bin 'versions.json'
     if (Test-Path $binVersions) {
@@ -80,7 +87,7 @@ if (-not $NoTools) {
         @{ dir = '7zip'; app = '7zip'; licence = 'LGPL-2.1 with the unRAR restriction'; src = 'https://www.7-zip.org'; files = @('7z.exe', '7z.dll', 'License.txt') },
         @{ dir = 'qpdf'; app = 'qpdf'; licence = 'Apache-2.0'; src = 'https://github.com/qpdf/qpdf'; files = @('bin\*.dll', 'bin\qpdf.exe=qpdf.exe') },
         @{ dir = 'mupdf'; app = 'mupdf'; licence = 'AGPL-3.0'; src = 'https://mupdf.com'; files = @('mutool.exe', 'COPYING.txt') },
-        @{ dir = 'optivorbis'; app = $null; version = '0.3.2'; licence = 'AGPL-3.0'; src = 'https://github.com/OptiVorbis/OptiVorbis'; files = @('bin:optivorbis.exe=optivorbis.exe') }
+        @{ dir = 'optivorbis'; app = $null; version = $optivorbisVersion; licence = 'AGPL-3.0'; src = 'https://github.com/OptiVorbis/OptiVorbis'; files = @('bin:optivorbis.exe=optivorbis.exe') }
     )
     $notice = @('Third-party tools in tools\ (unmodified binaries; source code at the addresses below).',
                 'pingo and beeim (css-ig.net) are not included: they may not be redistributed.', '')
@@ -111,6 +118,8 @@ if (-not $NoTools) {
             }
         }
         $notice += "$($t.dir) $tv - $($t.licence) - $($t.src)"
+        # Copyleft tools: where the source of the very version shipped is.
+        if ($t.licence -match 'GPL') { $notice += "    source code of $($t.dir) $($tv): $($t.src) (release $tv)" }
     }
     $notice += 'FFmpeg (ffmpeg.exe) - see ffmpeg-LICENSE.txt - https://ffmpeg.org'
     $notice | Set-Content (Join-Path $stage 'THIRD-PARTY.txt') -Encoding utf8

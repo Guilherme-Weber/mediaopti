@@ -65,7 +65,9 @@ try {
     Step 'Clippy'
     Run { cargo clippy --all-targets -- -D warnings } 'clippy'
     Step 'Tests'
-    Run { cargo test } 'tests'
+    # Every test must really run here: one that would skip (a missing tool) fails instead.
+    $env:MEDIAOPTI_REQUIRE_TOOLS = '1'
+    try { Run { cargo test } 'tests' } finally { Remove-Item Env:MEDIAOPTI_REQUIRE_TOOLS }
     Step 'Package'
     Run { & (Join-Path $PSScriptRoot 'package.ps1') } 'package'
     $zip = Join-Path $root "dist\mediaopti-$Version-win64.zip"

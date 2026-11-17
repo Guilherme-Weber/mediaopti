@@ -1,0 +1,28 @@
+name: ci
+
+# Lint and the tests that need nothing installed. GitHub's runners have neither the bundled
+# ffmpeg (bin/, not in the repository) nor the image tools nor an NVIDIA GPU: those tests skip
+# themselves here. The full suite runs on the development machine (release.ps1 sets
+# MEDIAOPTI_REQUIRE_TOOLS so none may skip there).
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Tests
+        run: cargo test --locked
+      - name: No control characters in text files
+        shell: bash
+        run: |
+          bad=$(git ls-files '*.rs' '*.md' '*.slint' '*.ps1' '*.toml' '*.json' '*.yml' | xargs grep -lP '[\x00-\x08\x0b\x0c\x0e-\x1f]' || true)
+          if [ -n "$bad" ]; then echo "control characters in: $bad"; exit 1; fi

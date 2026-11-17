@@ -27,7 +27,7 @@ $fetch = Get-Content (Join-Path $PSScriptRoot 'fetch-tools.ps1') -Raw
 $optivorbis = [regex]::Match($fetch, 'OptiVorbis/releases/download/v([\d.]+)/').Groups[1].Value
 $latest = Get-LatestTag 'OptiVorbis/OptiVorbis'
 if ($latest -and $latest -ne $optivorbis) {
-    Write-Host "OptiVorbis: $optivorbis -> $latest (fetch-tools.ps1 and package.ps1)" -ForegroundColor Yellow
+    Write-Host "OptiVorbis: $optivorbis -> $latest (fetch-tools.ps1; package.ps1 reads it from there)" -ForegroundColor Yellow
     $outdated++
 }
 # cjpegli is built from google/jpegli (scripts/build-jpegli.ps1): new commits on its main branch?
