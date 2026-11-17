@@ -598,16 +598,79 @@ pub fn flush_to_disk(path: &Path) -> std::io::Result<()> {
     }
 }
 
-pub fn move_file(from: &Path, to: &Path) -> std::io::Result<std::path::PathBuf> {
-    if let Some(parent) = to.parent() {
+/// `path` as a NUL-terminated UTF-16 string for the Windows API.
+#[cfg(windows)]
+fn wide(path: &Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+}
+
+/// Renames `from` to `to` on the same drive, failing with `AlreadyExists` if `to` exists
+/// (never replacing it, unlike `fs::rename`).
+fn move_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+        // SAFETY: both strings are NUL-terminated and live for the call.
+        if unsafe { MoveFileExW(wide(from).as_ptr(), wide(to).as_ptr(), 0) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        if to.exists() {
+            return Err(std::io::ErrorKind::AlreadyExists.into());
+        }
+        fs::rename(from, to)
+    }
+}
+
+/// Copies `from` to `to`, failing with `AlreadyExists` if `to` exists.
+fn copy_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Storage::FileSystem::CopyFileExW;
+        const COPY_FILE_FAIL_IF_EXISTS: u32 = 0x1;
+        // SAFETY: both strings are NUL-terminated and live for the call; no progress
+        // routine, no cancel flag.
+        let ok = unsafe { CopyFileExW(wide(from).as_ptr(), wide(to).as_ptr(), None, std::ptr::null(), std::ptr::null_mut(), COPY_FILE_FAIL_IF_EXISTS) };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        fs::OpenOptions::new().write(true).create_new(true).open(to)?;
+        fs::copy(from, to).map(drop)
+    }
+}
+
+pub fn move_file(from: &Path, wanted: &Path) -> std::io::Result<std::path::PathBuf> {
+    if let Some(parent) = wanted.parent() {
         fs::create_dir_all(parent)?;
     }
-    let to = unused_name(to);
-    if fs::rename(from, &to).is_ok() {
+    // A free name can be taken by another job before the move: moves and copies never
+    // overwrite, and a name taken meanwhile means trying the next free one.
+    let mut tries = 0;
+    let (to, moved) = loop {
+        let to = unused_name(wanted);
+        match move_no_replace(from, &to) {
+            Ok(()) => break (to, true),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists && tries < 100 => tries += 1,
+            // Another drive (or anything else a rename can't do): copied below.
+            Err(_) => match copy_no_replace(from, &to) {
+                Ok(()) => break (to, false),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists && tries < 100 => tries += 1,
+                Err(err) => return Err(err),
+            },
+        }
+    };
+    if moved {
         return Ok(to);
     }
     let attrs = OriginalAttributes::from_metadata(&fs::metadata(from)?);
-    fs::copy(from, &to)?;
     // The copy is on the disk before the original is removed.
     if let Err(err) = flush_to_disk(&to) {
         let _ = remove_file_if_exists(&to);
@@ -925,6 +988,69 @@ mod tests {
         assert_eq!(fs::read_to_string(&backup).unwrap(), "original 1");
         assert_eq!(fs::read_to_string(backup.with_file_name("clip (2).mp4")).unwrap(), "original 2");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Originals moved at the same time to the same backup name (files of the same name from
+    /// different folders) each get their own name: one never overwrites another's backup.
+    #[test]
+    fn simultaneous_backups_never_overwrite_each_other() {
+        let dir = std::env::temp_dir().join(format!("mo-race-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let backup = dir.join("backup").join("IMG_0001.JPG");
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let (dir, backup) = (dir.clone(), backup.clone());
+                std::thread::spawn(move || {
+                    let src = dir.join(format!("src{t}"));
+                    fs::create_dir_all(&src).unwrap();
+                    for i in 0..25 {
+                        let orig = src.join("IMG_0001.JPG");
+                        fs::write(&orig, format!("{t}-{i}")).unwrap();
+                        move_file(&orig, &backup).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let kept: std::collections::BTreeSet<String> =
+            fs::read_dir(backup.parent().unwrap()).unwrap().map(|e| fs::read_to_string(e.unwrap().path()).unwrap()).collect();
+        assert_eq!(kept.len(), 200, "every original's backup is kept");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A backup on another drive is a copy (on the disk first, with the original's dates and
+    /// read-only flag), then the original goes; a taken name is never overwritten.
+    #[test]
+    fn backups_to_another_drive_are_copied() {
+        let other = Path::new(r"D:\");
+        let temp = std::env::temp_dir();
+        if !other.exists() || temp.starts_with(other) {
+            eprintln!("skipping: needs a D: drive other than the temp folder's");
+            return;
+        }
+        let src = temp.join(format!("mo-xdrive-{}", std::process::id()));
+        let dest = other.join(format!("mo-xdrive-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&src);
+        let _ = fs::remove_dir_all(&dest);
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        let orig = src.join("a.flac");
+        fs::write(&orig, b"original").unwrap();
+        let mut perms = fs::metadata(&orig).unwrap().permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&orig, perms).unwrap();
+        fs::write(dest.join("a.flac"), b"someone else's").unwrap();
+        let to = move_file(&orig, &dest.join("a.flac")).unwrap();
+        assert_eq!(to, dest.join("a (2).flac"));
+        assert_eq!(fs::read(&to).unwrap(), b"original");
+        assert!(fs::metadata(&to).unwrap().permissions().readonly());
+        assert_eq!(fs::read(dest.join("a.flac")).unwrap(), b"someone else's");
+        assert!(!orig.exists());
+        clear_readonly(&to);
+        let _ = fs::remove_dir_all(&src);
+        let _ = fs::remove_dir_all(&dest);
     }
 
     /// An original held open by another program (no delete sharing) can't be renamed over:
