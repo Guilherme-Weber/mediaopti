@@ -359,8 +359,14 @@ impl Optimized {
 }
 
 /// Content-history mode for images, compatible with imageopti's history.
-pub fn mode(lossy: bool) -> &'static str {
-    if lossy { "lossy-normal-t93" } else { "lossless-normal" }
+/// The history mode of a pass (imageopti's names; `-strip` when metadata was removed).
+pub fn mode(lossy: bool, strip: bool) -> &'static str {
+    match (lossy, strip) {
+        (true, false) => "lossy-normal-t93",
+        (true, true) => "lossy-normal-t93-strip",
+        (false, false) => "lossless-normal",
+        (false, true) => "lossless-normal-strip",
+    }
 }
 
 pub(crate) fn run(ctx: &Ctx, tool: &str, args: Vec<OsString>, cwd: &Path) -> Result<bool, RunError> {
@@ -978,7 +984,36 @@ mod tests {
             .success();
         assert!(ok);
 
+        // PNG eXIf: removed when the picture isn't turned, kept when it is.
+        let with_exif = |name: &str, orientation: u8| {
+            let p = dir.join(name);
+            make(&ff, &["-f", "lavfi", "-i", "mandelbrot=s=320x240", "-frames:v", "1", "-compression_level", "1"], &p);
+            let mut data = std::fs::read(&p).unwrap();
+            // TIFF header, one IFD entry: Orientation (0x0112), SHORT, 1 value.
+            let mut exif = b"II*\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0".to_vec();
+            exif.extend([orientation, 0, 0, 0, 0, 0, 0, 0]);
+            exif.extend_from_slice(marker);
+            let typed: Vec<u8> = [&b"eXIf"[..], &exif].concat();
+            let mut chunk = (exif.len() as u32).to_be_bytes().to_vec();
+            chunk.extend_from_slice(&typed);
+            chunk.extend_from_slice(&crc32fast::hash(&typed).to_be_bytes());
+            data.splice(33..33, chunk); // right after IHDR
+            std::fs::write(&p, &data).unwrap();
+            p
+        };
+        let upright = with_exif("upright.png", 1);
+        let turned = with_exif("turned.png", 6);
+        assert!(png::info(&turned).unwrap().rotated && !png::info(&upright).unwrap().rotated);
+
         let has_marker = |p: &Path| std::fs::read(p).unwrap().windows(marker.len()).any(|w| w == marker);
+        for (src, keep_when_stripping) in [(&upright, false), (&turned, true)] {
+            let c = Ctx { strip: true, ..ctx(t.clone(), false) };
+            let work = dir.join(format!("w-exif-{keep_when_stripping}"));
+            std::fs::create_dir_all(&work).unwrap();
+            let r = optimize(&c, Kind::Png, src, &work).unwrap();
+            let best = r.best.unwrap_or_else(|| panic!("no gain ({:?})", r.note));
+            assert_eq!(has_marker(&best), keep_when_stripping, "{}", src.display());
+        }
         for (src, kind) in [(&png, Kind::Png), (&jpg, Kind::Jpg), (&gif, Kind::Gif)] {
             assert!(has_marker(src), "{kind:?}: test file lacks the metadata");
             for strip in [false, true] {

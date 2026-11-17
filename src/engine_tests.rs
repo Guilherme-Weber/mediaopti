@@ -94,6 +94,7 @@ fn opts(encoder: &str, concurrency: f64) -> RawOptions {
         gpu_decoding: None,
         drop_data: None,
         strip: None,
+        redo_stripped: None,
         max_parts: None,
     }
 }
@@ -766,6 +767,50 @@ fn videos_keep_audio_tracks_subtitles_attachments_and_chapters() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A phone video's tags survive: recording date, place, make and model in the MP4, and the
+/// date in an MKV (a QuickTime date listed twice used to be dropped there).
+#[test]
+fn videos_keep_their_tags() {
+    let Some(ff) = ffmpeg() else {
+        eprintln!("skipping: bundled ffmpeg not found");
+        return;
+    };
+    let root = test_dir("keep-tags");
+    let media = root.join("media");
+    std::fs::create_dir_all(&media).unwrap();
+    let src = "testsrc2=size=640x360:rate=30:duration=2,noise=alls=30:allf=t";
+    let tags = ["-metadata", "creation_time=2024-05-01T10:20:30Z", "-metadata", "com.apple.quicktime.location.ISO6709=+12.3456-045.6789+010.000/",
+        "-metadata", "com.apple.quicktime.make=Apple", "-metadata", "com.apple.quicktime.model=iPhone 13", "-metadata", "title=Viagem"];
+    make(&ff, &[&["-f", "lavfi", "-i", src, "-f", "lavfi", "-i", "sine=d=2", "-c:v", "libx264", "-qp", "0", "-c:a", "aac", "-movflags", "use_metadata_tags"][..], &tags].concat(), &media.join("IMG_0001.MOV"));
+    // PCM makes the output MKV (with FLAC).
+    make(&ff, &[&["-f", "lavfi", "-i", src, "-f", "lavfi", "-i", "sine=d=2", "-c:v", "libx264", "-qp", "0", "-c:a", "pcm_s16le", "-movflags", "use_metadata_tags"][..], &tags].concat(), &media.join("IMG_0002.MOV"));
+
+    let probe = |p: &Path| {
+        let out = Command::new(&ff).args(["-hide_banner", "-i"]).arg(p).output().unwrap();
+        crate::args::Streams::parse(&String::from_utf8_lossy(&out.stderr))
+    };
+    let before = probe(&media.join("IMG_0001.MOV"));
+    assert_eq!(before.tags.len(), 5, "{:?}", before.tags);
+    let rt = runtime();
+    let (engine, rec) = new_engine(&rt, &root, ff.clone());
+    rt.block_on(async {
+        engine.apply_options(opts("av1_nvenc", 2.0));
+        engine.load_dir(media.clone()).await;
+        engine.clone().run_batch(opts("av1_nvenc", 2.0)).await;
+    });
+    let logs = rec.logs.lock().unwrap().join("\n");
+    println!("{logs}");
+    assert_eq!(engine.snapshot().failed_this_run, 0, "{logs}");
+    for out in ["IMG_0001.mp4", "IMG_0002.mkv"] {
+        let after = probe(&media.join(out));
+        for (k, v) in before.tags.iter().filter(|(k, _)| k != "creation_time") {
+            assert!(after.tags.iter().any(|(ak, av)| ak == k && av == v), "{out}: {k} lost: {:?}\n{logs}", after.tags);
+        }
+        assert!(after.creation_time().is_some_and(|t| t.starts_with("2024-05-01T10:20:30")), "{out}: {:?}", after.tags);
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Audio is never lost or downmixed: PCM in a MOV becomes FLAC in an MKV (checked to
 /// decode to the same samples), AC3 5.1 in an AVI is copied into the MP4 with its six
 /// channels, and an HDR10 video keeps its transfer and static metadata.
@@ -999,8 +1044,29 @@ fn images_and_videos_in_one_batch() {
     // Lossless history doesn't cover a lossy run: the optimized images are queued again.
     let (engine3, _) = new_engine(&rt, &root, ff.clone());
     engine3.apply_options(RawOptions { images: Some(2), ..opts("av1_nvenc", 1.0) });
-    rt.block_on(engine3.load_dir(media));
+    rt.block_on(engine3.load_dir(media.clone()));
     assert_eq!(engine3.snapshot().pending_files, 3);
+
+    // Removing metadata doesn't redo processed files, unless asked to.
+    let strip = |redo: u32| RawOptions { strip: Some(1), redo_stripped: Some(redo), ..raw() };
+    let (engine5, _) = new_engine(&rt, &root, ff.clone());
+    engine5.apply_options(strip(0));
+    rt.block_on(engine5.load_dir(media.clone()));
+    assert_eq!(engine5.snapshot().pending_files, 1, "only the hard link");
+    let (engine6, _) = new_engine(&rt, &root, ff.clone());
+    engine6.apply_options(strip(1));
+    rt.block_on(engine6.load_dir(media.clone()));
+    assert_eq!(engine6.snapshot().pending_files, 3, "processed without stripping: redone");
+    rt.block_on(engine6.run_batch(strip(1)));
+    let (engine8, _) = new_engine(&rt, &root, ff.clone());
+    engine8.apply_options(strip(1));
+    rt.block_on(engine8.load_dir(media.clone()));
+    assert_eq!(engine8.snapshot().pending_files, 1, "done once with stripping: not again");
+    // The redo option alone (metadata kept) changes nothing.
+    let (engine7, _) = new_engine(&rt, &root, ff.clone());
+    engine7.apply_options(RawOptions { redo_stripped: Some(1), ..raw() });
+    rt.block_on(engine7.load_dir(media));
+    assert_eq!(engine7.snapshot().pending_files, 1);
 
     // A moved image is recognised by content.
     let moved = root.join("moved");
@@ -1284,6 +1350,7 @@ fn real_folder_run() {
         gpu_decoding: None,
         drop_data: None,
         strip: None,
+        redo_stripped: None,
         max_parts: None,
     };
     let t = std::time::Instant::now();

@@ -371,6 +371,7 @@ impl Engine {
                 let text = String::from_utf8_lossy(&out.stderr).to_ascii_lowercase();
                 streams.mastering = text.contains("mastering display");
                 streams.light_level = text.contains("content light level");
+                streams.hdr10_plus = text.contains("hdr10+") || text.contains("2094-40");
             }
         }
         streams
@@ -471,6 +472,24 @@ pub(super) fn streams_lost(before: &args::Streams, after: &args::Streams) -> Opt
             lost.push(what.into());
         }
     }
+    let missing: Vec<&str> = before
+        .tags
+        .iter()
+        .filter(|(k, v)| {
+            let found = after.tags.iter().find(|(ak, _)| ak == k).map(|(_, av)| av.as_str());
+            if k == "creation_time" {
+                // MKV keeps it to the second, MP4 with fractions: compared to the second.
+                let day = |t: &str| t.split(';').next().unwrap_or_default().chars().take(19).collect::<String>();
+                found.is_none_or(|f| day(f) != day(v))
+            } else {
+                found != Some(v.as_str())
+            }
+        })
+        .map(|(k, _)| k.as_str())
+        .collect();
+    if !missing.is_empty() {
+        lost.push(format!("its tags ({})", missing.join(", ")));
+    }
     match (before.duration, after.duration) {
         (Some(b), Some(a)) if b - a > (b * 0.01).max(1.0) => lost.push(format!("its length ({b:.1} s -> {a:.1} s)")),
         (Some(_), None) => lost.push("its length (unreadable)".into()),
@@ -559,6 +578,17 @@ mod tests {
         let why = super::streams_lost(&before, &after).unwrap();
         assert!(why.contains("1 of 2 audio tracks") && why.contains("1 of 1 subtitles") && why.contains("3 of 3 chapters") && why.contains("600.0 s -> 500.0 s"), "{why}");
         assert!(super::streams_lost(&before, &Streams::default()).unwrap().contains("unreadable"));
+        let tagged = Streams {
+            tags: vec![("creation_time".into(), "2024-05-01T10:20:30.000000Z;2024-05-01T10:20:30Z".into()), ("com.apple.quicktime.make".into(), "Apple".into())],
+            ..before.clone()
+        };
+        let mkv = Streams {
+            tags: vec![("com.apple.quicktime.make".into(), "Apple".into()), ("creation_time".into(), "2024-05-01T10:20:30.000000Z".into())],
+            ..before.clone()
+        };
+        assert_eq!(super::streams_lost(&tagged, &mkv), None, "same tags, date to the second");
+        let why = super::streams_lost(&tagged, &before).unwrap();
+        assert!(why.contains("its tags (creation_time, com.apple.quicktime.make)"), "{why}");
     }
 
     #[test]

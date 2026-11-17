@@ -7,7 +7,7 @@ use std::path::Path;
 pub const SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 
 /// Chunks that change how the image looks: they must survive in every mode.
-const DISPLAY: &[&str] = &["iCCP", "sRGB", "gAMA", "cHRM", "cICP", "mDCV", "cLLI", "eXIf", "acTL"];
+const DISPLAY: &[&str] = &["iCCP", "sRGB", "gAMA", "cHRM", "cICP", "mDCV", "cLLI", "acTL"];
 /// Metadata chunks: they must survive unless metadata is stripped.
 const META: &[&str] = &["tEXt", "iTXt", "zTXt", "pHYs", "tIME", "eXIf"];
 /// Colour chunks, placed right after IHDR when restored.
@@ -18,6 +18,14 @@ pub struct PngInfo {
     pub bit_depth: u8,
     pub color_type: u8,
     pub chunks: HashSet<String>,
+    /// An eXIf chunk with an orientation other than "normal": it changes how the picture is
+    /// shown, so it survives even when metadata is stripped.
+    pub rotated: bool,
+}
+
+/// Whether eXIf data turns the picture.
+fn exif_rotates(data: &[u8]) -> bool {
+    super::jpeg::tiff_orientation(data).unwrap_or(1) != 1
 }
 
 impl PngInfo {
@@ -54,7 +62,7 @@ pub fn info(path: &Path) -> Option<PngInfo> {
     if &sig != SIGNATURE {
         return None;
     }
-    let mut info = PngInfo { bit_depth: 8, color_type: 6, chunks: HashSet::new() };
+    let mut info = PngInfo { bit_depth: 8, color_type: 6, chunks: HashSet::new(), rotated: false };
     loop {
         let mut hdr = [0u8; 8];
         if f.read_exact(&mut hdr).is_err() {
@@ -68,6 +76,11 @@ pub fn info(path: &Path) -> Option<PngInfo> {
             info.bit_depth = d[8];
             info.color_type = d[9];
             f.seek(SeekFrom::Current(len - 13 + 4)).ok()?;
+        } else if name == "eXIf" && (0..=1 << 20).contains(&len) {
+            let mut d = vec![0u8; len as usize];
+            f.read_exact(&mut d).ok()?;
+            info.rotated = exif_rotates(&d);
+            f.seek(SeekFrom::Current(4)).ok()?;
         } else {
             f.seek(SeekFrom::Current(len + 4)).ok()?;
         }
@@ -95,6 +108,9 @@ pub fn meta_ok(orig: &PngInfo, new: &PngInfo, strip: bool) -> bool {
         if (*c == "gAMA" || *c == "cHRM") && (has("sRGB") || has("iCCP")) {
             continue;
         }
+        return false;
+    }
+    if orig.rotated && !new.chunks.contains("eXIf") {
         return false;
     }
     strip || META.iter().all(|c| !orig.chunks.contains(*c) || new.chunks.contains(*c))
@@ -128,10 +144,11 @@ pub fn restore_chunks(orig: &Path, out: &Path, strip: bool) -> std::io::Result<(
         return Ok(());
     }
     let (oc, nc) = (chunks(&o), chunks(&n));
+    let rotated_exif = oc.iter().any(|(t, raw)| *t == "eXIf" && raw.len() >= 12 && exif_rotates(&raw[8..raw.len() - 4]));
     let have: HashSet<&str> = nc.iter().map(|(t, _)| *t).collect();
     let profile_present = have.contains("iCCP") || have.contains("sRGB");
     let wanted = |t: &str| {
-        let restorable = COLOUR.contains(&t) || t == "eXIf" || (!strip && META.contains(&t));
+        let restorable = COLOUR.contains(&t) || (t == "eXIf" && rotated_exif) || (!strip && META.contains(&t));
         restorable && !(profile_present && (t == "iCCP" || t == "sRGB"))
     };
     let missing: Vec<(&str, &[u8])> = oc.iter().copied().filter(|(t, _)| wanted(t) && !have.contains(t)).collect();

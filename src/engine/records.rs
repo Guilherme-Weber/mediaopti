@@ -102,7 +102,7 @@ impl Engine {
                 .map(|(f, s)| (f, inner.want(f, *s)))
                 .filter(|(f, want)| match want {
                     history::Want::Video => !inner.history.contains(f),
-                    _ => !inner.history.contains_image(f, inner.lossy_for(f)),
+                    _ => !inner.history.contains_image(f, inner.lossy_for(f), inner.redo_stripped()),
                 })
                 .map(|(f, want)| (f.clone(), want))
                 .unzip()
@@ -121,8 +121,8 @@ impl Engine {
                         history::Want::Video => {
                             inner.history.add(&file);
                         }
-                        history::Want::ImageLossy => inner.history.add_image(&file, image::mode(true)),
-                        history::Want::ImageLossless => inner.history.add_image(&file, image::mode(false)),
+                        history::Want::ImageLossy { strip } => inner.history.add_image(&file, image::mode(true, strip)),
+                        history::Want::ImageLossless { strip } => inner.history.add_image(&file, image::mode(false, strip)),
                     }
                     hits += 1;
                 }

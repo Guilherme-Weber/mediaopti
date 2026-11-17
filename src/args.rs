@@ -96,7 +96,22 @@ pub struct Streams {
     /// HDR10 static metadata on the first frame (filled by the engine for HDR files only).
     pub mastering: bool,
     pub light_level: bool,
+    /// HDR10+ dynamic metadata on the first frame (filled by the engine, HDR files only).
+    pub hdr10_plus: bool,
     pub dolby_vision: bool,
+    /// The container's own tags (recording date, place, camera, title...), keys in lower
+    /// case; the format's bookkeeping (`major_brand`, `encoder`...) is left out.
+    pub tags: Vec<(String, String)>,
+}
+
+/// Tags the muxer writes for itself: not the file's content.
+const OWN_TAGS: &[&str] = &["major_brand", "minor_version", "compatible_brands", "encoder"];
+
+impl Streams {
+    /// The recording date as one value: QuickTime files may list it twice (`a;b`).
+    pub fn creation_time(&self) -> Option<&str> {
+        self.tags.iter().find(|(k, _)| k == "creation_time").map(|(_, v)| v.split(';').next().unwrap_or_default().trim())
+    }
 }
 
 /// Audio codecs an MP4 holds as they are (copied, never re-encoded).
@@ -130,7 +145,29 @@ impl Streams {
     pub fn parse(listing: &str) -> Self {
         let mut s = Streams::default();
         let mut main_video = false;
-        for line in listing.lines().map(str::trim) {
+        // The input's own tags: between "Input #0" and "Duration:".
+        let mut in_tags = false;
+        for raw in listing.lines() {
+            let line = raw.trim();
+            if line.starts_with("Input #0") {
+                in_tags = true;
+                continue;
+            }
+            if in_tags && !line.starts_with("Duration: ") {
+                if let Some((k, v)) = line.split_once(':').filter(|_| line != "Metadata:") {
+                    let key = k.trim().to_ascii_lowercase();
+                    if key.is_empty() {
+                        if let Some(last) = s.tags.last_mut() {
+                            last.1.push('\n');
+                            last.1.push_str(v.trim());
+                        }
+                    } else if !OWN_TAGS.contains(&key.as_str()) {
+                        s.tags.push((key, v.trim().to_string()));
+                    }
+                }
+                continue;
+            }
+            in_tags = false;
             if line.contains("DOVI configuration record") {
                 s.dolby_vision = true;
             }
@@ -184,6 +221,9 @@ impl Streams {
     pub fn blocker(&self, drop_data: bool) -> Option<Blocked> {
         if self.dolby_vision {
             return Some(Blocked { why: "Dolby Vision (its dynamic metadata can't be re-encoded)".into(), permanent: true });
+        }
+        if self.hdr10_plus {
+            return Some(Blocked { why: "HDR10+ (its dynamic metadata can't be re-encoded)".into(), permanent: true });
         }
         if self.data.iter().any(|t| t == "qtvr") {
             // The picture is the panorama's tiles: re-encoded, it is no longer a panorama.
@@ -270,6 +310,8 @@ pub struct Options {
     /// Advanced: remove metadata from pictures (EXIF, comments, text chunks; colour profiles
     /// and rotation stay) and padding from FLAC/MP3 tags. Audio tags are never removed.
     pub strip: bool,
+    /// Advanced: with `strip`, files processed without it are done again.
+    pub redo_stripped: bool,
     /// What the file being encoded holds besides its picture (set per job).
     pub streams: Streams,
 }
@@ -298,6 +340,7 @@ impl Default for Options {
             max: crate::image::Max::chosen(),
             drop_data: false,
             strip: false,
+            redo_stripped: false,
             streams: Streams::default(),
         }
     }
@@ -344,6 +387,8 @@ pub struct RawOptions {
     pub drop_data: Option<u32>,
     /// Advanced: 1 = remove metadata.
     pub strip: Option<u32>,
+    /// Advanced: 1 = redo files processed without removing metadata.
+    pub redo_stripped: Option<u32>,
 }
 
 impl Options {
@@ -411,6 +456,7 @@ impl Options {
             max: raw.max_parts.map_or(d.max, |names| crate::image::Max::from_names(&names.iter().map(String::as_str).collect::<Vec<_>>())),
             drop_data: raw.drop_data.map_or(d.drop_data, |v| v != 0),
             strip: raw.strip.map_or(d.strip, |v| v != 0),
+            redo_stripped: raw.redo_stripped.map_or(d.redo_stripped, |v| v != 0),
             streams: Streams::default(),
         }
     }
@@ -511,7 +557,8 @@ pub fn build_ffmpeg_args(input: &Path, tmp: &Path, options: &Options, mode: Mode
 
     // Software CPU fallback for tiny GIFs/stickers or streams rejected by NVENC.
     if mode == Mode::CpuFallback {
-        args.extend(s(&["-i", &input, "-map", "0:V:0", "-map_metadata", "0"]));
+        args.extend(s(&["-i", &input, "-map", "0:V:0"]));
+        args.extend(tag_flags(options));
         args.extend(even_scale);
         args.extend(s(&["-c:v", "libx264", "-preset", "slow", "-crf", &x264_crf.to_string(), "-pix_fmt", "yuv420p"]));
         if gif {
@@ -524,7 +571,7 @@ pub fn build_ffmpeg_args(input: &Path, tmp: &Path, options: &Options, mode: Mode
             args.extend(copy_audio(options));
         }
         args.extend(keep.clone());
-        args.extend(s(&["-movflags", "+faststart", "-y", &tmp]));
+        args.extend(s(&["-movflags", "+faststart+use_metadata_tags", "-y", &tmp]));
         return streams_specific(args, options);
     }
 
@@ -552,7 +599,8 @@ pub fn build_ffmpeg_args(input: &Path, tmp: &Path, options: &Options, mode: Mode
         // for 4:2:0 input it hands the encoder the same frames as the CPU path (checked).
         let gpu = options.gpu_decode.filter(|_| ten_bit);
         let mut a = if gpu.is_some() { s(&["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]) } else { Vec::new() };
-        a.extend(s(&["-i", &input, "-map", "0:V:0", "-map_metadata", "0"]));
+        a.extend(s(&["-i", &input, "-map", "0:V:0"]));
+        a.extend(tag_flags(options));
         if let Some((w, h)) = gpu {
             a.extend(s(&["-vf", &format!("scale_cuda=w={w}:h={h}:format=p010le")]));
         } else {
@@ -569,7 +617,7 @@ pub fn build_ffmpeg_args(input: &Path, tmp: &Path, options: &Options, mode: Mode
         }
         a.extend(audio_flags.clone());
         a.extend(keep.clone());
-        a.extend(s(&["-movflags", "+faststart", "-y", &tmp]));
+        a.extend(s(&["-movflags", "+faststart+use_metadata_tags", "-y", &tmp]));
         a
     };
 
@@ -590,10 +638,10 @@ pub fn build_ffmpeg_args(input: &Path, tmp: &Path, options: &Options, mode: Mode
             args.extend(s(&["-i", &input, "-map", "0:V:0"]));
             args.extend(even_scale);
             args.extend(s(&["-vcodec", "libx264", "-preset", preset, "-crf", &x264_crf.to_string()]));
-            args.extend(s(&["-map_metadata", "0"]));
+            args.extend(tag_flags(options));
             args.extend(x264_audio);
             args.extend(keep);
-            args.extend(s(&["-y", &tmp]));
+            args.extend(s(&["-movflags", "+use_metadata_tags", "-y", &tmp]));
         }
     }
 
@@ -606,6 +654,20 @@ pub fn build_ffmpeg_args(input: &Path, tmp: &Path, options: &Options, mode: Mode
         }
     }
     streams_specific(args, options)
+}
+
+/// The input's tags carried over (with `use_metadata_tags`, MP4/MOV keep every key, e.g.
+/// the iPhone's place, make and model), minus the old format's bookkeeping, and the
+/// recording date given as one value (else MKV drops a doubled QuickTime date).
+fn tag_flags(options: &Options) -> Vec<String> {
+    let mut a = s(&["-map_metadata", "0"]);
+    for own in &OWN_TAGS[..3] {
+        a.extend(["-metadata".into(), format!("{own}=")]);
+    }
+    if let Some(t) = options.streams.creation_time() {
+        a.extend(["-metadata".into(), format!("creation_time={t}")]);
+    }
+    a
 }
 
 /// Every audio track copied as it is; integer PCM becomes FLAC (lossless, about half the
@@ -678,6 +740,7 @@ mod tests {
             gpu_decoding: None,
             drop_data: None,
             strip: None,
+            redo_stripped: None,
             max_parts: None,
         });
         assert_eq!(o.audio, ImageMode::Lossy, "audio: cover art visually lossless by default");
@@ -720,7 +783,7 @@ mod tests {
         let joined = a.join(" ");
         assert!(joined.contains("-c:v av1_nvenc -preset p7 -tune hq -rc vbr -cq 36"));
         assert!(joined.contains("-aq-strength 5 -bf 4 -b_ref_mode middle -pix_fmt p010le"));
-        assert!(joined.ends_with("-map 0:a? -c:a copy -map 0:s? -c:s copy -movflags +faststart -y out.mp4"));
+        assert!(joined.ends_with("-map 0:a? -c:a copy -map 0:s? -c:s copy -movflags +faststart+use_metadata_tags -y out.mp4"));
     }
 
     #[test]
@@ -813,6 +876,32 @@ mod tests {
         assert!(!s.fits_mp4());
         let mp4 = Streams { subtitles: vec!["mov_text".into()], audio: 3, ..Streams::default() };
         assert!(mp4.fits_mp4());
+    }
+
+    #[test]
+    fn container_tags_are_read_and_carried_over() {
+        let listing = "Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'IMG_0001.MOV':\n  Metadata:\n\
+            \x20   major_brand     : qt  \n    minor_version   : 0\n    compatible_brands: qt  \n\
+            \x20   creation_time   : 2024-05-01T10:20:30.000000Z;2024-05-01T10:20:30Z\n\
+            \x20   com.apple.quicktime.location.ISO6709: +12.3456-045.6789+010.000/\n\
+            \x20   com.apple.quicktime.make: Apple\n    comment         : line one\n                    : line two\n\
+            \x20   encoder         : Lavf61\n\
+            \x20 Duration: 00:00:02.00, start: 0.000000, bitrate: 1 kb/s\n\
+            \x20 Stream #0:0[0x1](und): Video: h264 (High) (avc1), yuv420p, 640x360, 30 fps\n\
+            \x20   Metadata:\n      handler_name    : Core Media Video\n";
+        let s = Streams::parse(listing);
+        let keys: Vec<&str> = s.tags.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["creation_time", "com.apple.quicktime.location.iso6709", "com.apple.quicktime.make", "comment"], "stream tags and bookkeeping left out");
+        assert_eq!(s.tags[3].1, "line one\nline two");
+        assert_eq!(s.creation_time(), Some("2024-05-01T10:20:30.000000Z"));
+        let o = Options { streams: s, ..Options::default() };
+        let a = build_ffmpeg_args(Path::new("IMG_0001.MOV"), Path::new("out.mp4"), &o, Mode::Primary).join(" ");
+        assert!(a.contains("-map_metadata 0 -metadata major_brand= -metadata minor_version= -metadata compatible_brands= -metadata creation_time=2024-05-01T10:20:30.000000Z"), "{a}");
+        assert!(a.contains("-movflags +faststart+use_metadata_tags"), "{a}");
+        let x = build_ffmpeg_args(Path::new("IMG_0001.MOV"), Path::new("out.mp4"), &Options { encoder: "libx264".into(), ..o }, Mode::Primary).join(" ");
+        assert!(x.contains("-map_metadata 0") && x.contains("+use_metadata_tags"), "{x}");
+        let hdr10_plus = Streams { hdr10_plus: true, ..Streams::default() };
+        assert!(hdr10_plus.blocker(true).is_some_and(|b| b.why.contains("HDR10+") && b.permanent));
     }
 
     #[test]

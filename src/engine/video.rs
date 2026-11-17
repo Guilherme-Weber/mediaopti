@@ -40,8 +40,9 @@ impl Engine {
     fn remember_without_gif_pass(&self, input: &Path) {
         if args::is_gif(input) {
             let mut inner = self.lock();
-            inner.history.add_image(input, crate::image::mode(true));
-            inner.history.add_image(input, crate::image::mode(false));
+            for (lossy, strip) in [(true, false), (false, false), (true, true), (false, true)] {
+                inner.history.add_image(input, crate::image::mode(lossy, strip));
+            }
         }
     }
 

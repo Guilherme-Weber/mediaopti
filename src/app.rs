@@ -122,6 +122,8 @@ struct Prefs {
     drop_data: bool,
     /// Advanced: remove metadata (pictures) and tag padding (audio).
     strip: bool,
+    /// Advanced: with `strip`, redo files processed without it.
+    redo_stripped: bool,
 }
 
 impl Default for Prefs {
@@ -152,6 +154,7 @@ impl Default for Prefs {
             max_parts: crate::image::Max::chosen().names().into_iter().map(String::from).collect(),
             drop_data: false,
             strip: false,
+            redo_stripped: false,
         }
     }
 }
@@ -215,6 +218,7 @@ impl Prefs {
             max_parts: w.get_adv_parts().iter().filter(|p| p.on).map(|p| p.name.to_string()).collect(),
             drop_data: w.get_drop_data(),
             strip: w.get_strip(),
+            redo_stripped: w.get_redo_stripped(),
         }
     }
 
@@ -246,6 +250,7 @@ impl Prefs {
         w.set_gpu_decoding(self.gpu_decoding);
         w.set_drop_data(self.drop_data);
         w.set_strip(self.strip);
+        w.set_redo_stripped(self.redo_stripped);
         let parts: Vec<AdvPart> = crate::image::Max::PARTS
             .iter()
             .map(|(name, label, detail)| AdvPart {
@@ -261,7 +266,7 @@ impl Prefs {
 
     fn advanced_are_defaults(&self) -> bool {
         let d = Prefs::default();
-        self.gpu_decoding == d.gpu_decoding && self.drop_data == d.drop_data && self.strip == d.strip && self.max_parts_sorted() == d.max_parts_sorted()
+        self.gpu_decoding == d.gpu_decoding && self.drop_data == d.drop_data && self.strip == d.strip && self.redo_stripped == d.redo_stripped && self.max_parts_sorted() == d.max_parts_sorted()
     }
 
     fn max_parts_sorted(&self) -> Vec<&str> {
@@ -293,6 +298,7 @@ impl Prefs {
             max_parts: Some(self.max_parts.clone()),
             drop_data: Some(u32::from(self.drop_data)),
             strip: Some(u32::from(self.strip)),
+            redo_stripped: Some(u32::from(self.redo_stripped)),
         }
     }
 }
@@ -890,7 +896,7 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
         window.on_restore_advanced(move || {
             let Some(w) = weak.upgrade() else { return };
             let d = Prefs::default();
-            let prefs = Prefs { gpu_decoding: d.gpu_decoding, max_parts: d.max_parts, drop_data: d.drop_data, strip: d.strip, ..Prefs::from_window(&w) };
+            let prefs = Prefs { gpu_decoding: d.gpu_decoding, max_parts: d.max_parts, drop_data: d.drop_data, strip: d.strip, redo_stripped: d.redo_stripped, ..Prefs::from_window(&w) };
             prefs.apply_to_window(&w);
             prefs.save(&prefs_path);
             engine.apply_options_in_background(prefs.to_raw());
@@ -1034,7 +1040,7 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
             // The layout of the window isn't a setting, and Advanced options have their own
             // Restore: both stay as they are.
             let current = Prefs::from_window(&w);
-            let prefs = Prefs { nav_compact: current.nav_compact, gpu_decoding: current.gpu_decoding, max_parts: current.max_parts, drop_data: current.drop_data, strip: current.strip, ..Prefs::default() };
+            let prefs = Prefs { nav_compact: current.nav_compact, gpu_decoding: current.gpu_decoding, max_parts: current.max_parts, drop_data: current.drop_data, strip: current.strip, redo_stripped: current.redo_stripped, ..Prefs::default() };
             prefs.apply_to_window(&w);
             prefs.save(&prefs_path);
             engine.apply_options_in_background(prefs.to_raw());

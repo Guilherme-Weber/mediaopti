@@ -30,14 +30,17 @@ pub const VIDEO_MODE: &str = "video";
 const F_VIDEO: u8 = 1;
 const F_LOSSLESS: u8 = 2;
 const F_LOSSY: u8 = 4;
+/// The pass removed metadata (imageopti's `-strip` modes).
+const F_STRIP: u8 = 8;
 
 fn mode_flag(mode: &str) -> u8 {
+    let strip = if mode.ends_with("-strip") { F_STRIP } else { 0 };
     if mode == VIDEO_MODE {
         F_VIDEO
     } else if mode.starts_with("lossy") {
-        F_LOSSY
+        F_LOSSY | strip
     } else {
-        F_LOSSLESS
+        F_LOSSLESS | strip
     }
 }
 
@@ -45,8 +48,9 @@ fn mode_flag(mode: &str) -> u8 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Want {
     Video,
-    ImageLossless,
-    ImageLossy,
+    /// `strip`: only a pass that removed metadata counts (the "redo" option).
+    ImageLossless { strip: bool },
+    ImageLossy { strip: bool },
 }
 
 impl Want {
@@ -55,8 +59,8 @@ impl Want {
     fn covered_by(self, flags: u8) -> bool {
         match self {
             Want::Video => flags != 0,
-            Want::ImageLossless => flags & (F_LOSSLESS | F_LOSSY) != 0,
-            Want::ImageLossy => flags & F_LOSSY != 0,
+            Want::ImageLossless { strip } => flags & (F_LOSSLESS | F_LOSSY) != 0 && (!strip || flags & F_STRIP != 0),
+            Want::ImageLossy { strip } => flags & F_LOSSY != 0 && (!strip || flags & F_STRIP != 0),
         }
     }
 }
@@ -154,10 +158,13 @@ impl History {
     }
 
     /// Location check for an image to be processed lossily or not (a lossy entry also
-    /// covers a lossless request).
-    pub fn contains_image(&self, file: &Path, lossy: bool) -> bool {
-        self.hashes.contains(&hash_image_path(file, crate::image::mode(true)))
-            || (!lossy && self.hashes.contains(&hash_image_path(file, crate::image::mode(false))))
+    /// covers a lossless request). With `strip`, only passes that removed metadata count.
+    pub fn contains_image(&self, file: &Path, lossy: bool, strip: bool) -> bool {
+        let lossiness: &[bool] = if lossy { &[true] } else { &[true, false] };
+        let stripped: &[bool] = if strip { &[true] } else { &[true, false] };
+        lossiness
+            .iter()
+            .any(|&l| stripped.iter().any(|&s| self.hashes.contains(&hash_image_path(file, crate::image::mode(l, s)))))
     }
 
     /// Whether some processed file had exactly this size (only those are worth hashing).
@@ -190,7 +197,7 @@ impl History {
     pub fn add_content(&mut self, hash: ContentHash, size: u64, mode: &'static str) {
         let flag = mode_flag(mode);
         let flags = self.content.entry(hash).or_insert(0);
-        if *flags & flag == 0 {
+        if *flags & flag != flag {
             *flags |= flag;
             self.sizes.insert(size);
             self.unsaved_content.push((hash, size, mode));
@@ -433,29 +440,35 @@ mod tests {
         .unwrap();
         let mut h = History::load(file.clone());
         let img = parse_hex::<16>("e67a4fc97c7ac57455fe91c3a7a91279").unwrap();
-        assert!(h.contains_content(&img, Want::ImageLossless));
-        assert!(!h.contains_content(&img, Want::ImageLossy), "lossless doesn't cover lossy");
+        assert!(h.contains_content(&img, Want::ImageLossless { strip: false }));
+        assert!(!h.contains_content(&img, Want::ImageLossy { strip: false }), "lossless doesn't cover lossy");
+        assert!(!h.contains_content(&img, Want::ImageLossless { strip: true }), "not stripped");
         assert!(h.has_size(336_517));
 
         let vid = [7u8; 16];
         h.add_content(vid, 1234, VIDEO_MODE);
         h.add_content(vid, 1234, VIDEO_MODE); // duplicate: written once
-        h.add_content(img, 336_517, crate::image::mode(true));
+        h.add_content(img, 336_517, crate::image::mode(true, false));
+        h.add_content(img, 336_517, crate::image::mode(true, true)); // flag added to known content
         h.save().unwrap();
         let text = std::fs::read_to_string(dir.join("processed-content.tsv")).unwrap();
         assert_eq!(text.matches("\tvideo\n").count(), 1);
 
         let mut r = History::load(file);
         assert!(r.contains_content(&vid, Want::Video));
-        assert!(r.contains_content(&img, Want::ImageLossy), "lossy pass survives reload");
+        assert!(r.contains_content(&img, Want::ImageLossy { strip: false }), "lossy pass survives reload");
+        assert!(r.contains_content(&img, Want::ImageLossy { strip: true }), "stripped pass survives reload");
         assert!(r.has_size(1234) && !r.has_size(1235));
 
         // Image location keys are per mode and don't collide with video keys.
         let f = Path::new(r"C:\p\a.png");
-        r.add_image(f, crate::image::mode(false));
-        assert!(r.contains_image(f, false) && !r.contains_image(f, true) && !r.contains(f));
-        r.add_image(f, crate::image::mode(true));
-        assert!(r.contains_image(f, true));
+        r.add_image(f, crate::image::mode(false, false));
+        assert!(r.contains_image(f, false, false) && !r.contains_image(f, true, false) && !r.contains(f));
+        assert!(!r.contains_image(f, false, true), "the redo option asks for a stripped pass");
+        r.add_image(f, crate::image::mode(true, false));
+        assert!(r.contains_image(f, true, false));
+        r.add_image(f, crate::image::mode(true, true));
+        assert!(r.contains_image(f, false, true) && r.contains_image(f, true, true));
         let _ = std::fs::remove_dir_all(dir);
     }
 

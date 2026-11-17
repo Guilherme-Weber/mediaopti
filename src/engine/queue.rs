@@ -56,14 +56,19 @@ impl Inner {
         (if audio { self.options.audio } else { self.options.images }) == ImageMode::Lossy
     }
 
+    /// Files already processed without removing metadata are done again.
+    pub(super) fn redo_stripped(&self) -> bool {
+        self.options.strip && self.options.redo_stripped
+    }
+
     /// Content-history request for a file under the current settings.
     pub(super) fn want(&self, file: &Path, size: u64) -> history::Want {
         if !self.is_image_job(file, size) {
             history::Want::Video
         } else if self.lossy_for(file) {
-            history::Want::ImageLossy
+            history::Want::ImageLossy { strip: self.redo_stripped() }
         } else {
-            history::Want::ImageLossless
+            history::Want::ImageLossless { strip: self.redo_stripped() }
         }
     }
 
@@ -103,7 +108,7 @@ impl Inner {
             if !self.cpu_job_enabled(file) {
                 // Not remembered: they may be optimized once switched on.
                 Place::Off { gif: args::is_gif(file) }
-            } else if self.history.contains_image(file, self.lossy_for(file)) {
+            } else if self.history.contains_image(file, self.lossy_for(file), self.redo_stripped()) {
                 Place::Known
             } else if self.failed.contains(file) {
                 Place::Failed
@@ -118,7 +123,7 @@ impl Inner {
             // being encoded again.
             if args::is_gif(file)
                 && self.cpu_job_enabled(file)
-                && !self.history.contains_image(file, self.lossy_for(file))
+                && !self.history.contains_image(file, self.lossy_for(file), self.redo_stripped())
                 && !self.failed.contains(file)
             {
                 Place::Cpu

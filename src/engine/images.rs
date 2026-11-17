@@ -274,7 +274,7 @@ impl Engine {
             let engine = Arc::clone(&self);
             opts.busy = Some(Arc::new(move |p: &Path| engine.lock().in_progress.contains(p)));
             let engine = Arc::clone(&self);
-            let mode = image::mode(lossy);
+            let mode = image::mode(lossy, self.lock().options.strip);
             opts.note = Some(Arc::new(move |p: &Path| engine.note_content_now(p, mode)));
             if let Some(line) = announce {
                 self.log(line);
@@ -320,7 +320,7 @@ impl Engine {
     }
 
     fn finish_image(self: &Arc<Self>, path: &Path, lossy: bool, result: ImageResult) {
-        let mode = image::mode(lossy);
+        let mode = image::mode(lossy, self.lock().options.strip);
         let mut remembered = false;
         let mut log = None;
         let tag = match image::kind_of(path).map(image::Kind::stage) {

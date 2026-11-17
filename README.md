@@ -8,7 +8,7 @@ and replaced originals go to the Recycle Bin (or a backup folder) by default.
 
 | Type | Formats | Method |
 |---|---|---|
-| Videos | mp4, mkv, mov, avi, wmv, webm, flv, m4v, mts, m2ts, ts, 3gp, mpg, mpeg; GIFs over 1 MB | NVENC AV1/HEVC/H.264 or x264. If the preset isn't smaller, stronger settings are retried while VMAF stays ≥ 93. Audio tracks, subtitles, attachments, cover pictures, chapters and HDR10 metadata are kept (MKV when MP4 can't hold them); PCM audio becomes FLAC. |
+| Videos | mp4, mkv, mov, avi, wmv, webm, flv, m4v, mts, m2ts, ts, 3gp, mpg, mpeg; GIFs over 1 MB | NVENC AV1/HEVC/H.264 or x264. If the preset isn't smaller, stronger settings are retried while VMAF stays ≥ 93. Audio tracks, subtitles, attachments, cover pictures, chapters, tags (recording date, place, camera) and HDR10 metadata are kept (MKV when MP4 can't hold them); PCM audio becomes FLAC. |
 | Images | png, jpg, gif, bmp, tga | beeim/pingo, oxipng, ECT, jpegtran, gifsicle. Lossless, or visually lossless (SSIMULACRA2 ≥ 93). |
 | Audio | flac, mp3, ogg, wav, m4a (ALAC), aiff, ape, wv, tta | Cover art optimized; FLAC and Ogg repacked; the decoded audio stays identical. |
 | Documents | pdf, docx/xlsx/pptx, odt/ods/odp/odg, epub, cbz, cbr | Pictures inside optimized. Text and drawings are never changed, and PDF pages are rendered and compared. |
@@ -55,7 +55,7 @@ nothing). Settings and history are kept. It is available only while no batch is 
 GPU decoding on or off, removing data tracks no container can carry over (GoPro telemetry,
 iPhone metadata; otherwise such videos are left as they are), removing metadata (EXIF,
 comments and text from pictures, padding from FLAC and MP3 tags; colour profiles, rotation and
-audio tags are always kept), and each extra optimizer step of the maximum effort (only the
+audio tags are always kept; optionally also for files already processed without it), and each extra optimizer step of the maximum effort (only the
 measured default is on). Every result is still verified before a file is replaced.
 
 For very large libraries, choose *Move to a backup folder*: the Recycle Bin handles only about 25

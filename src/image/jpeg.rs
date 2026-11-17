@@ -68,11 +68,13 @@ fn is_adobe(m: u8, d: &[u8]) -> bool {
 }
 
 pub fn exif_orientation(segs: &Segments) -> Option<u16> {
-    for (m, d) in segs {
-        if *m != 0xE1 || !d.starts_with(b"Exif\0\0") {
-            continue;
-        }
-        let t = &d[6..];
+    segs.iter().find(|(m, d)| *m == 0xE1 && d.starts_with(b"Exif\0\0")).and_then(|(_, d)| tiff_orientation(&d[6..]))
+}
+
+/// The orientation tag of EXIF data (a TIFF header and its first IFD), as in JPEG's APP1
+/// after "Exif\0\0" and in PNG's eXIf chunk.
+pub fn tiff_orientation(t: &[u8]) -> Option<u16> {
+    {
         let le = t.starts_with(b"II");
         let u16_at = |i: usize| -> Option<u16> {
             let b = t.get(i..i + 2)?;
