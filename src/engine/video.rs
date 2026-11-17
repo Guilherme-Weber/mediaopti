@@ -663,8 +663,8 @@ impl Engine {
                 if replaced {
                     let attrs = std::fs::metadata(&input_c).map(|m| OriginalAttributes::from_metadata(&m));
                     replace_original(&tmp_c, &existing_c, &existing_c, &disposal.for_sibling(&existing_c), &|p| engine.note_content_now(p, history::VIDEO_MODE))?;
-                    if let Ok(a) = attrs {
-                        let _ = system::restore_attributes(&existing_c, &a);
+                    if let Err(err) = attrs.and_then(|a| system::restore_attributes(&existing_c, &a)) {
+                        engine.log(format!("Could not restore the dates and attributes of {}: {err}", existing_c.display()));
                     }
                 } else {
                     let _ = system::remove_file_if_exists(&tmp_c);

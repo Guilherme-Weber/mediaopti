@@ -105,6 +105,7 @@ impl Inner {
             fix_ext: self.options.fix_ext,
             busy: None,
             note: None,
+            warn: None,
         }
     }
 
@@ -279,6 +280,8 @@ impl Engine {
             let engine = Arc::clone(&self);
             let mode = image::mode(lossy, self.lock().options.strip);
             opts.note = Some(Arc::new(move |p: &Path| engine.note_content_now(p, mode)));
+            let engine = Arc::clone(&self);
+            opts.warn = Some(Arc::new(move |line: String| engine.log(line)));
             if let Some(line) = announce {
                 self.log(line);
             }
@@ -587,6 +590,17 @@ pub(super) struct JobOpts {
     pub busy: Option<BusyCheck>,
     /// Records a new version's content in the history before it replaces an original.
     pub note: Option<NoteContent>,
+    /// Logs a problem that doesn't change the result (dates that could not be restored).
+    pub warn: Option<Arc<dyn Fn(String) + Send + Sync>>,
+}
+
+/// Restores a replaced file's dates and flags, logging (through `opts.warn`) when it can't.
+fn restore_or_warn(target: &Path, attrs: &system::OriginalAttributes, opts: &JobOpts) {
+    if let Err(err) = system::restore_attributes(target, attrs) {
+        if let Some(warn) = &opts.warn {
+            warn(format!("Could not restore the dates and attributes of {}: {err}", target.display()));
+        }
+    }
 }
 
 pub(super) type NoteContent = Arc<dyn Fn(&Path) -> std::io::Result<()> + Send + Sync>;
@@ -771,7 +785,7 @@ pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, dispo
         unclaim();
         return ImageResult::Failed(err);
     }
-    let _ = system::restore_attributes(&target, &attrs);
+    restore_or_warn(&target, &attrs, opts);
     let lossy = result.steps.iter().any(|s| s.contains('='));
     let renamed = (target != path).then(|| target.clone());
     ImageResult::Smaller { before, after, lossy, content: content_of(&target), renamed }
@@ -801,7 +815,7 @@ fn keep_smaller_copy(path: &Path, existing: &Path, smaller: Option<&(PathBuf, u6
                 return ImageResult::Failed(err);
             }
             if let Ok(a) = attrs {
-                let _ = system::restore_attributes(existing, &a);
+                restore_or_warn(existing, &a, opts);
             }
             match system::dispose(path, disposal) {
                 Ok(()) => ImageResult::Duplicate { before: before + theirs - after, kept: existing.to_path_buf(), content: content_of(existing), replaced: true },
