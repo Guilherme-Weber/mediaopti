@@ -187,7 +187,10 @@ struct Update {
 /// A JPEG written as a sequential (baseline) file: progressive JPEGs are refused in PDFs, for
 /// maximum reader compatibility.
 fn sequential(path: &Path) -> bool {
-    jpeg::segments(path).is_some_and(|s| !s.iter().any(|(m, _)| matches!(m, 0xC2 | 0xC6 | 0xCA | 0xCE)))
+    std::fs::read(path)
+        .ok()
+        .and_then(|d| jpeg::frame_marker(&d))
+        .is_some_and(|m| !matches!(m, 0xC2 | 0xC6 | 0xCA | 0xCE))
 }
 
 /// JPEG re-encoders for the quality search, from a decoded `pnm`; ICC profiles in `keep` are
@@ -385,6 +388,27 @@ mod tests {
     use super::*;
     use crate::image::tools::Tools;
     use std::time::Duration;
+
+    /// Re-encoded JPEGs go into PDFs only when sequential: the check must read the frame
+    /// marker (it looked for it among the APPn/COM segments, where it never is).
+    #[test]
+    fn progressive_jpegs_are_not_sequential() {
+        let dir = std::env::temp_dir().join(format!("mo-seq-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let jpeg = |sof: u8| {
+            let mut j = vec![0xFF, 0xD8, 0xFF, 0xE0, 0, 4, b'h', b'i'];
+            j.extend([0xFF, 0xDB, 0, 3, 0]);
+            j.extend([0xFF, sof, 0, 11, 8, 0, 16, 0, 16, 1, 1, 0x11, 0]);
+            j.extend([0xFF, 0xDA, 0, 2, 1, 2, 0xFF, 0xD9]);
+            j
+        };
+        let (base, prog) = (dir.join("base.jpg"), dir.join("prog.jpg"));
+        std::fs::write(&base, jpeg(0xC0)).unwrap();
+        std::fs::write(&prog, jpeg(0xC2)).unwrap();
+        assert!(sequential(&base));
+        assert!(!sequential(&prog), "progressive");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn ctx(lossy: bool) -> Option<Ctx> {
         let ffmpeg = Path::new(env!("CARGO_MANIFEST_DIR")).join("bin").join("ffmpeg.exe");

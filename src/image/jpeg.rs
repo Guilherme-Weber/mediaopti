@@ -142,6 +142,41 @@ pub fn without_adobe(segs: &Segments) -> Segments {
     segs.iter().filter(|(m, d)| !is_adobe(*m, d)).cloned().collect()
 }
 
+/// The frame (SOF) marker of a JPEG: 0xC0 baseline, 0xC1 extended, 0xC2 progressive...
+/// `None` if none comes before the first scan (damaged or not a JPEG).
+pub fn frame_marker(data: &[u8]) -> Option<u8> {
+    if !data.starts_with(&[0xFF, 0xD8]) {
+        return None;
+    }
+    let mut i = 2;
+    while i + 4 <= data.len() {
+        if data[i] != 0xFF {
+            return None;
+        }
+        let m = data[i + 1];
+        match m {
+            0xFF => {
+                i += 1;
+                continue;
+            }
+            0xD8 | 0x01 | 0xD0..=0xD7 => {
+                i += 2;
+                continue;
+            }
+            0xDA | 0xD9 => return None,
+            // C4 (Huffman tables), C8 (reserved) and CC (arithmetic conditioning) aren't frames.
+            0xC0..=0xCF if !matches!(m, 0xC4 | 0xC8 | 0xCC) => return Some(m),
+            _ => {}
+        }
+        let len = usize::from(u16::from_be_bytes([data[i + 2], data[i + 3]]));
+        if len < 2 {
+            return None;
+        }
+        i += 2 + len;
+    }
+    None
+}
+
 /// Replaces the APPn/COM segments of a JPEG with `segs`.
 pub fn with_segments(jpg: &[u8], segs: &Segments) -> Vec<u8> {
     let mut i = 2;
