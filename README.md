@@ -53,8 +53,10 @@ nothing). Settings and history are kept. It is available only while no batch is 
 
 **About > Advanced options** holds settings meant for testing and troubleshooting, with a warning:
 GPU decoding on or off, removing data tracks no container can carry over (GoPro telemetry,
-iPhone metadata; otherwise such videos are left as they are), and each extra optimizer step of
-the maximum effort (only the measured default is on). Every result is still verified before a file is replaced.
+iPhone metadata; otherwise such videos are left as they are), removing metadata (EXIF,
+comments and text from pictures, padding from FLAC and MP3 tags; colour profiles, rotation and
+audio tags are always kept), and each extra optimizer step of the maximum effort (only the
+measured default is on). Every result is still verified before a file is replaced.
 
 For very large libraries, choose *Move to a backup folder*: the Recycle Bin handles only about 25
 files per second and drops its oldest items when full.

@@ -159,7 +159,7 @@ impl Engine {
             lossy: options.images == crate::args::ImageMode::Lossy,
             target: 93.0,
             lossy_min_gain: 0.03,
-            strip: false,
+            strip: options.strip,
             strict_alpha: false,
             lossy_docs: options.lossy_docs,
             parallel: slots > 1,

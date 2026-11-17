@@ -120,6 +120,8 @@ struct Prefs {
     max_parts: Vec<String>,
     /// Advanced: leave out data tracks no container can carry over.
     drop_data: bool,
+    /// Advanced: remove metadata (pictures) and tag padding (audio).
+    strip: bool,
 }
 
 impl Default for Prefs {
@@ -149,6 +151,7 @@ impl Default for Prefs {
             gpu_decoding: true,
             max_parts: crate::image::Max::chosen().names().into_iter().map(String::from).collect(),
             drop_data: false,
+            strip: false,
         }
     }
 }
@@ -211,6 +214,7 @@ impl Prefs {
             gpu_decoding: w.get_gpu_decoding(),
             max_parts: w.get_adv_parts().iter().filter(|p| p.on).map(|p| p.name.to_string()).collect(),
             drop_data: w.get_drop_data(),
+            strip: w.get_strip(),
         }
     }
 
@@ -241,6 +245,7 @@ impl Prefs {
         w.set_nav_compact(self.nav_compact);
         w.set_gpu_decoding(self.gpu_decoding);
         w.set_drop_data(self.drop_data);
+        w.set_strip(self.strip);
         let parts: Vec<AdvPart> = crate::image::Max::PARTS
             .iter()
             .map(|(name, label, detail)| AdvPart {
@@ -256,7 +261,7 @@ impl Prefs {
 
     fn advanced_are_defaults(&self) -> bool {
         let d = Prefs::default();
-        self.gpu_decoding == d.gpu_decoding && self.drop_data == d.drop_data && self.max_parts_sorted() == d.max_parts_sorted()
+        self.gpu_decoding == d.gpu_decoding && self.drop_data == d.drop_data && self.strip == d.strip && self.max_parts_sorted() == d.max_parts_sorted()
     }
 
     fn max_parts_sorted(&self) -> Vec<&str> {
@@ -287,6 +292,7 @@ impl Prefs {
             gpu_decoding: Some(u32::from(self.gpu_decoding)),
             max_parts: Some(self.max_parts.clone()),
             drop_data: Some(u32::from(self.drop_data)),
+            strip: Some(u32::from(self.strip)),
         }
     }
 }
@@ -884,7 +890,7 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
         window.on_restore_advanced(move || {
             let Some(w) = weak.upgrade() else { return };
             let d = Prefs::default();
-            let prefs = Prefs { gpu_decoding: d.gpu_decoding, max_parts: d.max_parts, drop_data: d.drop_data, ..Prefs::from_window(&w) };
+            let prefs = Prefs { gpu_decoding: d.gpu_decoding, max_parts: d.max_parts, drop_data: d.drop_data, strip: d.strip, ..Prefs::from_window(&w) };
             prefs.apply_to_window(&w);
             prefs.save(&prefs_path);
             engine.apply_options_in_background(prefs.to_raw());
@@ -1028,7 +1034,7 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
             // The layout of the window isn't a setting, and Advanced options have their own
             // Restore: both stay as they are.
             let current = Prefs::from_window(&w);
-            let prefs = Prefs { nav_compact: current.nav_compact, gpu_decoding: current.gpu_decoding, max_parts: current.max_parts, drop_data: current.drop_data, ..Prefs::default() };
+            let prefs = Prefs { nav_compact: current.nav_compact, gpu_decoding: current.gpu_decoding, max_parts: current.max_parts, drop_data: current.drop_data, strip: current.strip, ..Prefs::default() };
             prefs.apply_to_window(&w);
             prefs.save(&prefs_path);
             engine.apply_options_in_background(prefs.to_raw());
@@ -1425,12 +1431,12 @@ mod tests {
         assert_eq!(old.max_parts, ["png_ect"]);
         let o = crate::args::Options::normalize(old.to_raw());
         assert!(o.gpu_decoding);
-        assert!(!old.drop_data && !o.drop_data);
+        assert!(!old.drop_data && !o.drop_data && !old.strip && !o.strip);
         assert_eq!(o.max, crate::image::Max::chosen());
         // Chosen parts reach the engine; unknown names are ignored.
-        let p = Prefs { gpu_decoding: false, drop_data: true, max_parts: vec!["flac_e".into(), "bogus".into()], ..Prefs::default() };
+        let p = Prefs { gpu_decoding: false, drop_data: true, strip: true, max_parts: vec!["flac_e".into(), "bogus".into()], ..Prefs::default() };
         let o = crate::args::Options::normalize(p.to_raw());
-        assert!(!o.gpu_decoding && o.drop_data);
+        assert!(!o.gpu_decoding && o.drop_data && o.strip);
         assert_eq!(o.max, crate::image::Max { flac_e: true, ..crate::image::Max::default() });
         // Every part has a name that round-trips.
         for (name, _, _) in crate::image::Max::PARTS {

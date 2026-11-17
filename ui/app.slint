@@ -487,6 +487,7 @@ export component AppWindow inherits Window {
     // ---- advanced page (reached from About)
     in-out property <bool> gpu-decoding: true;
     in-out property <bool> drop-data: false;
+    in-out property <bool> strip: false;
     in-out property <[AdvPart]> adv-parts;
     in property <bool> adv-default: true;
 
@@ -1405,6 +1406,27 @@ export component AppWindow inherits Window {
                                 text: root.drop-data ? "On" : "Off";
                                 enabled: !root.locked;
                                 checked <=> root.drop-data;
+                                toggled => { root.advanced-changed(); }
+                            }
+                        }
+                    }
+
+                    Card {
+                        SectionTitle { glyph: "\u{E8EC}"; text: "Remove metadata"; }
+                        HorizontalLayout {
+                            spacing: 12px;
+                            Text {
+                                text: "Removes EXIF (camera, date, GPS), comments and text from PNG, JPEG and GIF (also inside comics, Office and EPUB files) and the empty padding in FLAC and MP3 tags. Colour profiles and rotation are always kept, and so are audio tags. Files already in the processed history are not redone when this changes.";
+                                font-size: 13px;
+                                color: Theme.text-secondary;
+                                wrap: word-wrap;
+                                horizontal-stretch: 1;
+                                vertical-alignment: center;
+                            }
+                            Switch {
+                                text: root.strip ? "On" : "Off";
+                                enabled: !root.locked;
+                                checked <=> root.strip;
                                 toggled => { root.advanced-changed(); }
                             }
                         }

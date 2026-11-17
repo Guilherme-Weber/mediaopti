@@ -93,6 +93,7 @@ fn opts(encoder: &str, concurrency: f64) -> RawOptions {
         docs: None,
         gpu_decoding: None,
         drop_data: None,
+        strip: None,
         max_parts: None,
     }
 }
@@ -1282,6 +1283,7 @@ fn real_folder_run() {
         docs: None,
         gpu_decoding: None,
         drop_data: None,
+        strip: None,
         max_parts: None,
     };
     let t = std::time::Instant::now();

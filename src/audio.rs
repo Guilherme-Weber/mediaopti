@@ -34,6 +34,7 @@ const MAX_META: u64 = 64 * 1024 * 1024;
 const MIN_ART: usize = 1024;
 
 const PICTURE: u8 = 6;
+const PADDING: u8 = 1;
 const VORBIS_COMMENT: u8 = 4;
 
 pub fn optimize(ctx: &Ctx, kind: Kind, src: &Path, work: &Path) -> Result<Optimized, RunError> {
@@ -689,6 +690,9 @@ fn flac(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, AudioError> {
     // 1) cover art; the audio frames are copied byte for byte.
     let (mut new_blocks, mut n_art, mut art_steps) = (Vec::new(), 0, BTreeSet::new());
     for (i, (typ, body)) in orig.blocks.iter().enumerate() {
+        if *typ == PADDING && ctx.strip {
+            continue;
+        }
         let mut body = body.clone();
         if *typ == PICTURE {
             if let Some(p) = picture_parse(&body) {
@@ -701,13 +705,14 @@ fn flac(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, AudioError> {
         }
         new_blocks.push((*typ, body));
     }
-    if n_art > 0 {
+    let unpadded = new_blocks.len() < orig.blocks.len();
+    if n_art > 0 || unpadded {
         let out = work.join("art.flac");
         write_with_tail(&out, &flac_header(&new_blocks), src, orig.audio_at)?;
         let size = std::fs::metadata(&out)?.len();
-        if worth_keeping(best_size, size) && flac_art_same_layout(&orig, src, &out)? && same_audio(ctx, src, &mut orig_audio, &out)? {
+        if worth_keeping(best_size, size) && flac_art_same_layout(&orig, src, &out, ctx.strip)? && same_audio(ctx, src, &mut orig_audio, &out)? {
             (best, best_size) = (out, size);
-            steps.push(art_label(n_art, &art_steps));
+            steps.push(if n_art > 0 { art_label(n_art, &art_steps) } else { "no-padding".into() });
         }
     }
 
@@ -717,6 +722,9 @@ fn flac(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, AudioError> {
         if let Some(flac) = ctx.tools.get("flac") {
             let out = work.join("enc.flac");
             let mut args = flac_level(ctx);
+            if ctx.strip {
+                args.push("--no-padding".into());
+            }
             args.extend(crate::os_args!["--verify", "--silent", "-f", "-o", &out, &best]);
             ctx.phase("re-encoding", &[&best]);
             let ran =tools::run(flac, args, Some(work), Capture::None, audio_timeout(ctx, src), &ctx.gate)?;
@@ -745,12 +753,13 @@ fn tag_at_end(path: &Path) -> io::Result<bool> {
     Ok(id3v1 || tail.windows(8).any(|w| w == b"APETAGEX"))
 }
 
-/// The new file has the same blocks except for picture data, and the same audio bytes (the
-/// decode check follows separately).
-fn flac_art_same_layout(orig: &Flac, src: &Path, out: &Path) -> Result<bool, AudioError> {
+/// The new file has the same blocks except for picture data (and padding, when `strip`), and
+/// the same audio bytes (the decode check follows separately).
+fn flac_art_same_layout(orig: &Flac, src: &Path, out: &Path, strip: bool) -> Result<bool, AudioError> {
     let Some(new) = flac_read(out)? else { return Ok(false) };
-    let same_blocks = new.blocks.len() == orig.blocks.len()
-        && new.blocks.iter().zip(&orig.blocks).all(|(n, o)| {
+    let kept: Vec<&(u8, Vec<u8>)> = orig.blocks.iter().filter(|b| !(strip && b.0 == PADDING)).collect();
+    let same_blocks = new.blocks.len() == kept.len()
+        && new.blocks.iter().zip(kept).all(|(n, o)| {
             n.0 == o.0
                 && if n.0 == PICTURE {
                     match (picture_parse(&n.1), picture_parse(&o.1)) {
@@ -859,7 +868,7 @@ fn mp3(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, AudioError> {
         new_tag.extend_from_slice(fflags);
         new_tag.extend_from_slice(body);
     }
-    new_tag.resize(new_tag.len() + padding, 0);
+    new_tag.resize(new_tag.len() + if ctx.strip { 0 } else { padding }, 0);
     let mut header = head[..6].to_vec();
     header.extend_from_slice(&to_syncsafe(new_tag.len() as u32));
     header.extend_from_slice(&new_tag);
@@ -1079,6 +1088,48 @@ mod tests {
                 assert!(r.steps.iter().any(|s| s == "flac-8p"), "{:?}", r.steps);
             }
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A modern FLAC with padding: left alone by default; with `strip`, the padding goes and
+    /// the tags and samples stay.
+    #[test]
+    fn flac_padding_goes_only_when_stripping() {
+        let Some(c) = ctx() else {
+            eprintln!("skipping: audio tools not found");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("mo-padding-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("tone.wav");
+        ff(&c, &["-f", "lavfi", "-i", "sine=f=440:d=2", "-ac", "1", "-c:a", "pcm_s16le", wav.to_str().unwrap()]);
+        let flac = dir.join("tone.flac");
+        let ok = std::process::Command::new(c.tools.get("flac").unwrap())
+            .args(["-8", "--padding=65536", "-T", "TITLE=Kept", "--silent", "-f", "-o"])
+            .arg(&flac)
+            .arg(&wav)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        assert!(flac_read(&flac).unwrap().unwrap().blocks.iter().any(|b| b.0 == PADDING));
+
+        let work = dir.join("keep");
+        std::fs::create_dir_all(&work).unwrap();
+        let r = optimize(&c, Kind::Flac, &flac, &work).unwrap();
+        assert!(r.best.is_none(), "nothing to do without strip: {:?}", r.steps);
+
+        let c = Ctx { strip: true, ..c };
+        let work = dir.join("strip");
+        std::fs::create_dir_all(&work).unwrap();
+        let r = optimize(&c, Kind::Flac, &flac, &work).unwrap();
+        let best = r.best.unwrap_or_else(|| panic!("padding not removed: {:?}", r.note));
+        assert_eq!(r.steps, ["no-padding"]);
+        let out = flac_read(&best).unwrap().unwrap();
+        assert!(out.blocks.iter().all(|b| b.0 != PADDING));
+        assert_eq!(audio_hash(&c, &best).unwrap(), audio_hash(&c, &flac).unwrap());
+        assert_eq!(tags(&c, &best).unwrap(), tags(&c, &flac).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

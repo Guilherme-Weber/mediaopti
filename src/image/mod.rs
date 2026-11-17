@@ -493,7 +493,13 @@ pub fn optimize(ctx: &Ctx, kind: Kind, src: &Path, work: &Path) -> Result<Optimi
         Kind::Gif => {
             let mut c = Chain::new(ctx, work, src);
             let mut check = |p: &Path| ver.ok(p);
-            c.write_to("gifsicle", "gifsicle", |i, o| crate::os_args!["-O3", "--no-warnings", "-o", o, i], &mut check, None)?;
+            let strip: &[&str] = if ctx.strip { &["--no-comments", "--no-names"] } else { &[] };
+            c.write_to("gifsicle", "gifsicle", |i, o| {
+                let mut a = crate::os_args!["-O3", "--no-warnings"];
+                a.extend(strip.iter().map(Into::into));
+                a.extend(crate::os_args!["-o", o, i]);
+                a
+            }, &mut check, None)?;
             c
         }
         _ => unreachable!("handled above"),
@@ -917,6 +923,73 @@ mod tests {
             let score = ssim_score(&c, src, &best).unwrap().unwrap();
             println!("{kind:?} lossy {before} -> {} {:?} ssim {score:.1}", size(&best).unwrap(), r.steps);
             assert!(score >= 93.0, "{kind:?}: quality {score}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Metadata survives by default and is removed only with `strip`: a PNG text chunk, a
+    /// JPEG's EXIF and a GIF comment. Pixels stay identical either way.
+    #[test]
+    fn metadata_is_removed_only_when_asked() {
+        let Some(t) = tools().filter(|t| t.has("gifsicle")) else {
+            eprintln!("skipping: image tools not found");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("mo-strip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ff = t.ffmpeg.clone();
+        let marker = b"mediaopti-marker";
+
+        let png = dir.join("text.png");
+        make(&ff, &["-f", "lavfi", "-i", "mandelbrot=s=320x240", "-frames:v", "1", "-compression_level", "1"], &png);
+        let mut data = std::fs::read(&png).unwrap();
+        let mut body = b"Comment\0".to_vec();
+        body.extend_from_slice(marker);
+        let mut chunk = (body.len() as u32).to_be_bytes().to_vec();
+        let typed: Vec<u8> = [&b"tEXt"[..], &body].concat();
+        chunk.extend_from_slice(&typed);
+        chunk.extend_from_slice(&crc32fast::hash(&typed).to_be_bytes());
+        let iend = data.len() - 12;
+        data.splice(iend..iend, chunk);
+        std::fs::write(&png, &data).unwrap();
+
+        let jpg = dir.join("exif.jpg");
+        make(&ff, &["-f", "lavfi", "-i", "testsrc2=s=400x300", "-frames:v", "1", "-q:v", "1"], &jpg);
+        let mut data = std::fs::read(&jpg).unwrap();
+        let mut exif = b"Exif\0\0II*\0\x08\0\0\0\0\0".to_vec();
+        exif.extend_from_slice(marker);
+        let mut app1 = vec![0xFF, 0xE1];
+        app1.extend_from_slice(&((exif.len() + 2) as u16).to_be_bytes());
+        app1.extend_from_slice(&exif);
+        data.splice(2..2, app1);
+        std::fs::write(&jpg, &data).unwrap();
+
+        let plain_gif = dir.join("plain.gif");
+        make(&ff, &["-f", "lavfi", "-i", "testsrc=s=200x150:d=0.5:r=10"], &plain_gif);
+        let gif = dir.join("comment.gif");
+        let ok = std::process::Command::new(t.get("gifsicle").unwrap())
+            .args(["--comment", std::str::from_utf8(marker).unwrap()])
+            .arg(&plain_gif)
+            .arg("-o")
+            .arg(&gif)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+
+        let has_marker = |p: &Path| std::fs::read(p).unwrap().windows(marker.len()).any(|w| w == marker);
+        for (src, kind) in [(&png, Kind::Png), (&jpg, Kind::Jpg), (&gif, Kind::Gif)] {
+            assert!(has_marker(src), "{kind:?}: test file lacks the metadata");
+            for strip in [false, true] {
+                let c = Ctx { strip, ..ctx(t.clone(), false) };
+                let work = dir.join(format!("w-{kind:?}-{strip}"));
+                std::fs::create_dir_all(&work).unwrap();
+                let r = optimize(&c, kind, src, &work).unwrap();
+                let best = r.best.unwrap_or_else(|| panic!("{kind:?} strip={strip}: no gain ({:?})", r.note));
+                assert_eq!(has_marker(&best), !strip, "{kind:?} strip={strip}");
+                assert!(Verifier::new(&c, kind, src).ok(&best).unwrap(), "{kind:?}: pixels changed");
+            }
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

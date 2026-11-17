@@ -267,6 +267,9 @@ pub struct Options {
     /// Advanced: data tracks no container can carry over (GoPro telemetry, iPhone metadata)
     /// are left out of the new version instead of keeping the video as it is.
     pub drop_data: bool,
+    /// Advanced: remove metadata from pictures (EXIF, comments, text chunks; colour profiles
+    /// and rotation stay) and padding from FLAC/MP3 tags. Audio tags are never removed.
+    pub strip: bool,
     /// What the file being encoded holds besides its picture (set per job).
     pub streams: Streams,
 }
@@ -294,6 +297,7 @@ impl Default for Options {
             gpu_decoding: true,
             max: crate::image::Max::chosen(),
             drop_data: false,
+            strip: false,
             streams: Streams::default(),
         }
     }
@@ -338,6 +342,8 @@ pub struct RawOptions {
     pub max_parts: Option<Vec<String>>,
     /// Advanced: 1 = leave out data tracks that can't be carried over.
     pub drop_data: Option<u32>,
+    /// Advanced: 1 = remove metadata.
+    pub strip: Option<u32>,
 }
 
 impl Options {
@@ -404,6 +410,7 @@ impl Options {
             gpu_decoding: raw.gpu_decoding.map_or(d.gpu_decoding, |g| g != 0),
             max: raw.max_parts.map_or(d.max, |names| crate::image::Max::from_names(&names.iter().map(String::as_str).collect::<Vec<_>>())),
             drop_data: raw.drop_data.map_or(d.drop_data, |v| v != 0),
+            strip: raw.strip.map_or(d.strip, |v| v != 0),
             streams: Streams::default(),
         }
     }
@@ -670,6 +677,7 @@ mod tests {
             docs: None,
             gpu_decoding: None,
             drop_data: None,
+            strip: None,
             max_parts: None,
         });
         assert_eq!(o.audio, ImageMode::Lossy, "audio: cover art visually lossless by default");
