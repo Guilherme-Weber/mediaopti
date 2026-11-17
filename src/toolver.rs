@@ -8,8 +8,7 @@
 use crate::image::tools::{Tools, DOWNLOADED, NAMES};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// How often css-ig.net is asked for new pingo and beeim versions.
 const CHECK_EVERY: Duration = Duration::from_secs(7 * 24 * 3600);
@@ -66,35 +65,16 @@ pub fn is_newer(candidate: &str, installed: &str) -> bool {
 }
 
 /// Runs `program args` and returns what it printed (both streams), killed after `limit`.
+/// Through `tools::run`, which reads both streams at once (one read after the other stalled
+/// a tool writing a long usage text to stderr until the time limit).
 fn output_of(program: &Path, args: &[&str], limit: Duration) -> Option<String> {
-    let mut cmd = Command::new(program);
-    cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // no console window
-    }
-    let mut child = cmd.spawn().ok()?;
-    let (mut out, mut err) = (child.stdout.take()?, child.stderr.take()?);
-    let reader = std::thread::spawn(move || {
-        use std::io::Read;
-        let mut a = Vec::new();
-        let _ = out.read_to_end(&mut a);
-        let mut b = Vec::new();
-        let _ = err.read_to_end(&mut b);
-        a.extend(b);
-        a
-    });
-    let start = Instant::now();
-    while child.try_wait().ok()?.is_none() {
-        if start.elapsed() > limit {
-            let _ = child.kill();
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    let _ = child.wait();
-    reader.join().ok().map(|b| String::from_utf8_lossy(&b).into_owned())
+    let args = args.iter().map(std::ffi::OsString::from).collect();
+    let gate = crate::image::tools::Gate::default();
+    // Many tools print their banner with a non-zero exit code: what they printed counts.
+    let ran = crate::image::tools::run(program, args, None, crate::image::tools::Capture::BytesUpTo(1 << 20), limit, &gate).ok()?;
+    let mut text = String::from_utf8_lossy(&ran.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&ran.stderr));
+    Some(text)
 }
 
 /// The version `program` reports about itself.
@@ -225,6 +205,17 @@ pub fn install_newer(data_dir: &Path) -> Result<Vec<&'static str>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tool that writes a lot to stderr before its version (a long usage text) must not
+    /// stall the version check until its time limit.
+    #[test]
+    fn a_long_stderr_does_not_stall_the_version_check() {
+        let t = std::time::Instant::now();
+        let script = "[Console]::Error.Write('x' * 200000); [Console]::Out.Write('tool v1.2.3')";
+        let out = output_of(Path::new("powershell"), &["-NoProfile", "-Command", script], Duration::from_secs(30)).unwrap();
+        assert!(out.contains("tool v1.2.3"), "{}", &out[..out.len().min(200)]);
+        assert!(t.elapsed() < Duration::from_secs(15), "took {:?}", t.elapsed());
+    }
 
     #[test]
     fn versions_are_read_and_ordered() {
