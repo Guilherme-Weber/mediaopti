@@ -1078,7 +1078,7 @@ mod tests {
         let other = Path::new(r"D:\");
         let temp = std::env::temp_dir();
         if !other.exists() || temp.starts_with(other) {
-            eprintln!("skipping: needs a D: drive other than the temp folder's");
+            skip_test!("needs a D: drive other than the temp folder's");
             return;
         }
         let src = temp.join(format!("mo-xdrive-{}", std::process::id()));

@@ -92,7 +92,7 @@ fn opts(encoder: &str, concurrency: f64) -> RawOptions {
 #[test]
 fn full_batch_handles_every_file_kind() {
     let Some(ff) = ffmpeg() else {
-        eprintln!("skipping: bundled ffmpeg not found");
+        skip_test!("bundled ffmpeg not found");
         return;
     };
     let root = test_dir("full");
@@ -237,7 +237,7 @@ fn nvenc_encodes_quit_cleanly() {
 #[test]
 fn stop_kills_ffmpeg_and_keeps_originals() {
     let Some(ff) = ffmpeg() else {
-        eprintln!("skipping: bundled ffmpeg not found");
+        skip_test!("bundled ffmpeg not found");
         return;
     };
     let root = test_dir("stop");
@@ -289,7 +289,7 @@ async fn wait_for_progress(engine: &Arc<Engine>) -> i64 {
 #[test]
 fn pause_ends_ffmpeg_and_resume_finishes() {
     let Some(ff) = ffmpeg() else {
-        eprintln!("skipping: bundled ffmpeg not found");
+        skip_test!("bundled ffmpeg not found");
         return;
     };
     let pause_secs: u64 = std::env::var("BATCHVIPROC_PAUSE_SECS")
@@ -348,7 +348,7 @@ fn pause_ends_ffmpeg_and_resume_finishes() {
 #[test]
 fn pause_releases_memory_and_resume_redoes_the_files() {
     let Some(ff) = ffmpeg() else {
-        eprintln!("skipping: bundled ffmpeg not found");
+        skip_test!("bundled ffmpeg not found");
         return;
     };
     let root = test_dir("pause-release");
@@ -446,7 +446,7 @@ fn pause_for_a_game() {
 #[test]
 fn stop_while_paused_keeps_originals() {
     let Some(ff) = ffmpeg() else {
-        eprintln!("skipping: bundled ffmpeg not found");
+        skip_test!("bundled ffmpeg not found");
         return;
     };
     let root = test_dir("pause-stop");
@@ -490,7 +490,7 @@ fn audio_codec(ffmpeg: &Path, file: &Path) -> Option<String> {
 #[test]
 fn historical_problem_files_are_handled() {
     let Some(ff) = ffmpeg() else {
-        eprintln!("skipping: bundled ffmpeg not found");
+        skip_test!("bundled ffmpeg not found");
         return;
     };
     let root = test_dir("history");
@@ -570,7 +570,7 @@ fn historical_problem_files_are_handled() {
 #[test]
 fn hard_links_are_left_alone_and_small_gifs_stay_gifs() {
     let Some(ff) = ffmpeg() else {
-        eprintln!("skipping: bundled ffmpeg not found");
+        skip_test!("bundled ffmpeg not found");
         return;
     };
     let root = test_dir("links");
@@ -610,7 +610,7 @@ fn hard_links_are_left_alone_and_small_gifs_stay_gifs() {
 #[test]
 fn gifs_the_video_path_fails_on_are_left_alone() {
     let Some(ff) = ffmpeg() else {
-        eprintln!("skipping: bundled ffmpeg not found");
+        skip_test!("bundled ffmpeg not found");
         return;
     };
     let root = test_dir("gif-fallback");
@@ -666,7 +666,7 @@ fn gifs_the_video_path_fails_on_are_left_alone() {
 #[test]
 fn a_gif_remembered_as_video_gets_the_gif_optimizer_later() {
     let Some(ff) = ffmpeg() else {
-        eprintln!("skipping: bundled ffmpeg not found");
+        skip_test!("bundled ffmpeg not found");
         return;
     };
     let root = test_dir("gif-later");
@@ -710,7 +710,7 @@ fn a_gif_remembered_as_video_gets_the_gif_optimizer_later() {
 #[test]
 fn videos_keep_audio_tracks_subtitles_attachments_and_chapters() {
     let Some(ff) = ffmpeg() else {
-        eprintln!("skipping: bundled ffmpeg not found");
+        skip_test!("bundled ffmpeg not found");
         return;
     };
     let root = test_dir("keep-streams");
@@ -762,7 +762,7 @@ fn videos_keep_audio_tracks_subtitles_attachments_and_chapters() {
 #[test]
 fn videos_keep_their_tags() {
     let Some(ff) = ffmpeg() else {
-        eprintln!("skipping: bundled ffmpeg not found");
+        skip_test!("bundled ffmpeg not found");
         return;
     };
     let root = test_dir("keep-tags");
@@ -807,7 +807,7 @@ fn videos_keep_their_tags() {
 #[test]
 fn audio_is_kept_or_made_flac_and_hdr10_is_kept() {
     let Some(ff) = ffmpeg() else {
-        eprintln!("skipping: bundled ffmpeg not found");
+        skip_test!("bundled ffmpeg not found");
         return;
     };
     let root = test_dir("audio-hdr");
@@ -861,7 +861,7 @@ fn compressed_h264(ffmpeg: &Path, noise: u32, crf: u32, out: &Path) {
 #[test]
 fn pause_during_quality_retry_resumes_from_the_last_step() {
     let Some(ff) = ffmpeg() else {
-        eprintln!("skipping: bundled ffmpeg not found");
+        skip_test!("bundled ffmpeg not found");
         return;
     };
     let root = test_dir("vmaf-resume");
@@ -918,7 +918,7 @@ fn pause_during_quality_retry_resumes_from_the_last_step() {
 #[test]
 fn quality_retry_accepts_only_above_the_vmaf_floor() {
     let Some(ff) = ffmpeg() else {
-        eprintln!("skipping: bundled ffmpeg not found");
+        skip_test!("bundled ffmpeg not found");
         return;
     };
     let root = test_dir("vmaf");
@@ -966,12 +966,12 @@ fn quality_retry_accepts_only_above_the_vmaf_floor() {
 #[test]
 fn images_and_videos_in_one_batch() {
     let Some(ff) = ffmpeg() else {
-        eprintln!("skipping: bundled ffmpeg not found");
+        skip_test!("bundled ffmpeg not found");
         return;
     };
     let tools = crate::image::tools::Tools::discover(ff.clone(), &std::env::temp_dir());
     if !["oxipng", "jpegtran", "djpeg"].iter().all(|t| tools.has(t)) {
-        eprintln!("skipping: image tools not found");
+        skip_test!("image tools not found");
         return;
     }
     let root = test_dir("images");
@@ -1129,12 +1129,12 @@ fn bench_folder() {
 #[test]
 fn originals_go_to_a_mirrored_backup_folder() {
     let Some(ff) = ffmpeg() else {
-        eprintln!("skipping: bundled ffmpeg not found");
+        skip_test!("bundled ffmpeg not found");
         return;
     };
     let tools = crate::image::tools::Tools::discover(ff.clone(), &std::env::temp_dir());
     if !tools.has("oxipng") {
-        eprintln!("skipping: image tools not found");
+        skip_test!("image tools not found");
         return;
     }
     let root = test_dir("backup");
@@ -1187,11 +1187,11 @@ fn originals_go_to_a_mirrored_backup_folder() {
 #[test]
 fn wav_becomes_flac_only_when_safe() {
     let Some(ff) = ffmpeg() else {
-        eprintln!("skipping: bundled ffmpeg not found");
+        skip_test!("bundled ffmpeg not found");
         return;
     };
     if !crate::image::tools::Tools::discover(ff.clone(), &std::env::temp_dir()).has("flac") {
-        eprintln!("skipping: flac not found");
+        skip_test!("flac not found");
         return;
     }
     let root = test_dir("wav");
@@ -1260,12 +1260,12 @@ fn wav_becomes_flac_only_when_safe() {
 #[test]
 fn empty_cut_off_and_skipped_files_are_told_apart() {
     let Some(ff) = ffmpeg() else {
-        eprintln!("skipping: bundled ffmpeg not found");
+        skip_test!("bundled ffmpeg not found");
         return;
     };
     let tools = crate::image::tools::Tools::discover(ff.clone(), &std::env::temp_dir());
     if !["jpegtran", "djpeg", "oxipng"].iter().all(|t| tools.has(t)) {
-        eprintln!("skipping: image tools not found");
+        skip_test!("image tools not found");
         return;
     }
     let root = test_dir("tellapart");
@@ -1303,12 +1303,12 @@ fn empty_cut_off_and_skipped_files_are_told_apart() {
 #[test]
 fn files_under_long_paths_are_processed() {
     let Some(ff) = ffmpeg() else {
-        eprintln!("skipping: bundled ffmpeg not found");
+        skip_test!("bundled ffmpeg not found");
         return;
     };
     let tools = crate::image::tools::Tools::discover(ff.clone(), &std::env::temp_dir());
     if !["oxipng", "flac"].iter().all(|t| tools.has(t)) {
-        eprintln!("skipping: oxipng or flac not found");
+        skip_test!("oxipng or flac not found");
         return;
     }
     let root = test_dir("longpath");
@@ -1353,12 +1353,12 @@ fn files_under_long_paths_are_processed() {
 #[test]
 fn a_panic_fails_only_its_own_file() {
     let Some(ff) = ffmpeg() else {
-        eprintln!("skipping: bundled ffmpeg not found");
+        skip_test!("bundled ffmpeg not found");
         return;
     };
     let tools = crate::image::tools::Tools::discover(ff.clone(), &std::env::temp_dir());
     if !tools.has("oxipng") {
-        eprintln!("skipping: oxipng not found");
+        skip_test!("oxipng not found");
         return;
     }
     let root = test_dir("panic");
@@ -1396,7 +1396,7 @@ fn a_panic_fails_only_its_own_file() {
 #[test]
 fn tools_that_cannot_start_do_not_mark_files_broken() {
     let Some(ff) = ffmpeg() else {
-        eprintln!("skipping: bundled ffmpeg not found");
+        skip_test!("bundled ffmpeg not found");
         return;
     };
     let root = test_dir("toolfail");
@@ -1441,12 +1441,12 @@ fn tools_that_cannot_start_do_not_mark_files_broken() {
 #[test]
 fn same_content_keeps_what_the_original_has() {
     let Some(ff) = ffmpeg() else {
-        eprintln!("skipping: bundled ffmpeg not found");
+        skip_test!("bundled ffmpeg not found");
         return;
     };
     let tools = crate::image::tools::Tools::discover(ff.clone(), &std::env::temp_dir());
     if !["jpegtran", "djpeg"].iter().all(|t| tools.has(t)) {
-        eprintln!("skipping: image tools not found");
+        skip_test!("image tools not found");
         return;
     }
     let root = test_dir("samekeep");
@@ -1487,12 +1487,12 @@ fn same_content_keeps_what_the_original_has() {
 #[test]
 fn same_names_and_wrong_extensions() {
     let Some(ff) = ffmpeg() else {
-        eprintln!("skipping: bundled ffmpeg not found");
+        skip_test!("bundled ffmpeg not found");
         return;
     };
     let tools = crate::image::tools::Tools::discover(ff.clone(), &std::env::temp_dir());
     if !["oxipng", "ssimulacra2", "djpeg"].iter().all(|t| tools.has(t)) {
-        eprintln!("skipping: image tools not found");
+        skip_test!("image tools not found");
         return;
     }
     let root = test_dir("samename");
@@ -1584,12 +1584,12 @@ fn real_folder_run() {
 #[test]
 fn dropped_items_join_the_queue() {
     let Some(ff) = ffmpeg() else {
-        eprintln!("skipping: bundled ffmpeg not found");
+        skip_test!("bundled ffmpeg not found");
         return;
     };
     let tools = crate::image::tools::Tools::discover(ff.clone(), &std::env::temp_dir());
     if !tools.has("oxipng") {
-        eprintln!("skipping: oxipng not found");
+        skip_test!("oxipng not found");
         return;
     }
     let root = test_dir("drop");
@@ -1636,12 +1636,12 @@ fn dropped_items_join_the_queue() {
 #[test]
 fn queue_runs_in_stages_and_types_can_be_skipped() {
     let Some(ff) = ffmpeg() else {
-        eprintln!("skipping: bundled ffmpeg not found");
+        skip_test!("bundled ffmpeg not found");
         return;
     };
     let tools = crate::image::tools::Tools::discover(ff.clone(), &std::env::temp_dir());
     if !["oxipng", "flac"].iter().all(|t| tools.has(t)) {
-        eprintln!("skipping: tools not found");
+        skip_test!("tools not found");
         return;
     }
     let root = test_dir("stages");
@@ -1690,7 +1690,7 @@ fn queue_runs_in_stages_and_types_can_be_skipped() {
 #[test]
 fn several_chosen_folders_replace_the_queue() {
     let Some(ff) = ffmpeg() else {
-        eprintln!("skipping: bundled ffmpeg not found");
+        skip_test!("bundled ffmpeg not found");
         return;
     };
     let root = test_dir("multi");

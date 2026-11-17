@@ -599,7 +599,7 @@ mod tests {
     fn pause_suspends_a_tool_without_timing_it_out() {
         let ffmpeg = Path::new(env!("CARGO_MANIFEST_DIR")).join("bin").join("ffmpeg.exe");
         if !ffmpeg.exists() {
-            eprintln!("skipping: bundled ffmpeg not found");
+            skip_test!("bundled ffmpeg not found");
             return;
         }
         let (tx, rx) = tokio::sync::watch::channel(true);

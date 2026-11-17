@@ -990,13 +990,13 @@ mod tests {
     fn work_folder_moves_to_the_files_drive_when_temp_is_short() {
         let file = Path::new(r"D:\mediaopti-test\some file.wav");
         let (Some(temp_free), Some(d_free)) = (system::free_space(&std::env::temp_dir()), system::free_space(Path::new(r"D:\"))) else {
-            eprintln!("skipping: no D: drive");
+            skip_test!("no D: drive");
             return;
         };
         // 4x this must exceed the temp drive's free space but fit on D:.
         let size = temp_free / 4 + (1 << 30);
         if volume_root(&std::env::temp_dir()) == volume_root(file) || size * 4 + DISK_RESERVE + (1 << 30) > d_free {
-            eprintln!("skipping: needs a temp drive with less free space than D:");
+            skip_test!("needs a temp drive with less free space than D:");
             return;
         }
         let w = WorkDir::new(file, size, 4, &std::env::temp_dir(), "mediaopti-img-test-0").expect("fits on D:");

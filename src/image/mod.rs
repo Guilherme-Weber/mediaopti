@@ -942,7 +942,7 @@ mod tests {
     #[test]
     fn png_and_jpeg_lossless_and_lossy() {
         let Some(t) = tools() else {
-            eprintln!("skipping: image tools not found");
+            skip_test!("image tools not found");
             return;
         };
         let dir = std::env::temp_dir().join(format!("mo-image-{}", std::process::id()));
@@ -984,7 +984,7 @@ mod tests {
     #[test]
     fn metadata_is_removed_only_when_asked() {
         let Some(t) = tools().filter(|t| t.has("gifsicle")) else {
-            eprintln!("skipping: image tools not found");
+            skip_test!("image tools not found");
             return;
         };
         let dir = std::env::temp_dir().join(format!("mo-strip-{}", std::process::id()));
@@ -1107,11 +1107,11 @@ mod tests {
     #[test]
     fn gif_timing_is_verified_and_pictures_are_sniffed() {
         let Some(t) = tools() else {
-            eprintln!("skipping: image tools not found");
+            skip_test!("image tools not found");
             return;
         };
         let Some(gifsicle) = t.get("gifsicle").map(Path::to_path_buf) else {
-            eprintln!("skipping: gifsicle not found");
+            skip_test!("gifsicle not found");
             return;
         };
         let dir = std::env::temp_dir().join(format!("mo-giftime-{}", std::process::id()));
@@ -1142,7 +1142,7 @@ mod tests {
     #[test]
     fn pictures_with_data_after_the_end_are_kept() {
         let Some(t) = tools() else {
-            eprintln!("skipping: image tools not found");
+            skip_test!("image tools not found");
             return;
         };
         let dir = std::env::temp_dir().join(format!("mo-trailing-{}", std::process::id()));
@@ -1184,7 +1184,7 @@ mod tests {
     #[test]
     fn big_decodes_are_not_held_in_memory() {
         let Some(t) = tools() else {
-            eprintln!("skipping: image tools not found");
+            skip_test!("image tools not found");
             return;
         };
         // 64 frames of 1000x1000 RGBA = 256 MB, over a 16 MB cap: stopped, reported as failed.
@@ -1223,7 +1223,7 @@ mod tests {
     #[test]
     fn bmp_and_tga_become_identical_pngs() {
         let Some(t) = tools() else {
-            eprintln!("skipping: image tools not found");
+            skip_test!("image tools not found");
             return;
         };
         let dir = std::env::temp_dir().join(format!("mo-topng-{}", std::process::id()));

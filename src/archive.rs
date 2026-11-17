@@ -524,7 +524,7 @@ mod tests {
     #[test]
     fn documents_and_comics_repack() {
         let Some(c) = ctx() else {
-            eprintln!("skipping: tools not found");
+            skip_test!("tools not found");
             return;
         };
         let dir = std::env::temp_dir().join(format!("mo-zip-{}", std::process::id()));
@@ -575,7 +575,7 @@ mod tests {
     #[test]
     fn comic_pages_run_in_parallel() {
         let Some(mut c) = ctx() else {
-            eprintln!("skipping: tools not found");
+            skip_test!("tools not found");
             return;
         };
         c.lossy = false;

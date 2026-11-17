@@ -5,6 +5,18 @@
 #[cfg(not(windows))]
 compile_error!("mediaopti is a Windows app");
 
+/// A test that needs something this machine lacks (bin/ffmpeg.exe, an image tool, a D:
+/// drive) skips itself and passes. With MEDIAOPTI_REQUIRE_TOOLS set (a development machine,
+/// before a release), it fails instead: a green run then means every test really ran.
+#[cfg(test)]
+macro_rules! skip_test {
+    ($($why:tt)*) => {{
+        let why = format!($($why)*);
+        assert!(std::env::var_os("MEDIAOPTI_REQUIRE_TOOLS").is_none(), "MEDIAOPTI_REQUIRE_TOOLS is set but the test would skip: {why}");
+        eprintln!("skipping: {why}");
+    }};
+}
+
 mod app;
 mod archive;
 mod args;

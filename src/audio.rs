@@ -984,7 +984,7 @@ mod tests {
     #[test]
     fn lossless_audio_becomes_flac() {
         let Some(c) = ctx() else {
-            eprintln!("skipping: tools not found");
+            skip_test!("tools not found");
             return;
         };
         let dir = std::env::temp_dir().join(format!("mo-lossless-{}", std::process::id()));
@@ -1024,7 +1024,7 @@ mod tests {
     #[test]
     fn wav_loop_points_survive_conversion() {
         let Some(c) = ctx() else {
-            eprintln!("skipping: tools not found");
+            skip_test!("tools not found");
             return;
         };
         let dir = std::env::temp_dir().join(format!("mo-wavsmpl-{}", std::process::id()));
@@ -1067,7 +1067,7 @@ mod tests {
     #[test]
     fn cover_art_and_reencode() {
         let Some(c) = ctx() else {
-            eprintln!("skipping: audio tools not found");
+            skip_test!("audio tools not found");
             return;
         };
         let dir = std::env::temp_dir().join(format!("mo-audio-{}", std::process::id()));
@@ -1108,7 +1108,7 @@ mod tests {
     #[test]
     fn flac_padding_goes_only_when_stripping() {
         let Some(c) = ctx() else {
-            eprintln!("skipping: audio tools not found");
+            skip_test!("audio tools not found");
             return;
         };
         let dir = std::env::temp_dir().join(format!("mo-padding-{}", std::process::id()));
@@ -1150,7 +1150,7 @@ mod tests {
     #[test]
     fn ogg_vorbis_repack() {
         let Some(c) = ctx().filter(|c| c.tools.has("optivorbis")) else {
-            eprintln!("skipping: optivorbis not found");
+            skip_test!("optivorbis not found");
             return;
         };
         let dir = std::env::temp_dir().join(format!("mo-ogg-{}", std::process::id()));

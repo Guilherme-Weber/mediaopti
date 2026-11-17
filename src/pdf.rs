@@ -405,7 +405,7 @@ mod tests {
     #[test]
     fn damaged_pdfs_are_checked_page_by_page() {
         let Some(c) = ctx(false) else {
-            eprintln!("skipping: PDF tools not found");
+            skip_test!("PDF tools not found");
             return;
         };
         let dir = std::env::temp_dir().join(format!("mo-pdfdamaged-{}", std::process::id()));
@@ -484,7 +484,7 @@ mod tests {
     #[test]
     fn pdf_images_lossless_and_lossy() {
         let (Some(lossless), Some(lossy)) = (ctx(false), ctx(true)) else {
-            eprintln!("skipping: PDF tools not found");
+            skip_test!("PDF tools not found");
             return;
         };
         let dir = std::env::temp_dir().join(format!("mo-pdf-{}", std::process::id()));
