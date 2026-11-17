@@ -83,6 +83,10 @@ const QUALITY_CHECK: &[(u32, &str)] = &[
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 struct Prefs {
+    /// The file's format version; a file without one (0) is from before 3.1 and goes through
+    /// the migrations in `load`.
+    #[serde(default)]
+    version: u32,
     encoder: String,
     concurrency: u32,
     crf: u32,
@@ -116,7 +120,9 @@ struct Prefs {
     nav_compact: bool,
     /// Advanced: GPU decoding allowed.
     gpu_decoding: bool,
-    /// Advanced: the maximum-effort parts in use (`image::Max` field names).
+    /// Advanced: the maximum-effort parts in use (`image::Max` field names). Saved only when
+    /// they differ from the default, so a better default reaches everyone who kept it.
+    #[serde(skip_serializing_if = "is_default_parts")]
     max_parts: Vec<String>,
     /// Advanced: leave out data tracks no container can carry over.
     drop_data: bool,
@@ -151,6 +157,7 @@ impl Default for Prefs {
             fix_ext: 0,
             nav_compact: false,
             gpu_decoding: true,
+            version: PREFS_VERSION,
             max_parts: crate::image::Max::chosen().names().into_iter().map(String::from).collect(),
             drop_data: false,
             strip: false,
@@ -165,10 +172,33 @@ fn position<K: PartialEq>(choices: &[(K, &str)], value: &K, default: &K) -> i32 
     find(value).or_else(|| find(default)).unwrap_or(0) as i32
 }
 
+/// The settings file's format version (see `Prefs::version`).
+const PREFS_VERSION: u32 = 1;
+
+/// Whether `parts` are the default maximum-effort parts (in any order).
+fn is_default_parts(parts: &[String]) -> bool {
+    let sorted = |v: &[String]| {
+        let mut v = v.to_vec();
+        v.sort();
+        v
+    };
+    sorted(parts) == sorted(&Prefs::default().max_parts)
+}
+
 impl Prefs {
-    fn load(path: &Path) -> Self {
-        let Some(text) = std::fs::read_to_string(path).ok() else { return Self::default() };
-        let Ok(mut p) = serde_json::from_str::<Prefs>(&text) else { return Self::default() };
+    /// The saved settings, and what went wrong reading them, if anything (for the log). A
+    /// field of an unexpected type costs that field only; an unreadable file gives defaults.
+    fn load(path: &Path) -> (Self, Option<String>) {
+        let Some(text) = std::fs::read_to_string(path).ok() else { return (Self::default(), None) };
+        let (mut p, problem) = match serde_json::from_str::<Prefs>(&text) {
+            Ok(p) => (p, None),
+            Err(err) => match serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&text) {
+                Ok(fields) => Self::field_by_field(fields),
+                Err(_) => {
+                    return (Self::default(), Some(format!("The settings file {} could not be read ({err}); default settings are used", path.display())));
+                }
+            },
+        };
         // Older settings: "Don't process" was a quality choice, conversions one switch.
         let old: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
         if p.images == 0 {
@@ -180,12 +210,35 @@ impl Prefs {
         if old.get("conv_wav").is_none() && old.get("convert").and_then(serde_json::Value::as_u64) == Some(0) {
             (p.conv_wav, p.conv_img, p.conv_cbr) = (false, false, false);
         }
-        p
+        p.version = PREFS_VERSION;
+        (p, problem)
     }
 
+    /// The defaults with each saved field that reads as its type: one bad field doesn't
+    /// throw away the others (the backup folder among them).
+    fn field_by_field(fields: serde_json::Map<String, serde_json::Value>) -> (Self, Option<String>) {
+        let mut good = match serde_json::to_value(Self::default()) {
+            Ok(serde_json::Value::Object(m)) => m,
+            _ => serde_json::Map::new(),
+        };
+        let mut bad = Vec::new();
+        for (key, value) in fields {
+            let mut trial = good.clone();
+            trial.insert(key.clone(), value.clone());
+            if serde_json::from_value::<Prefs>(serde_json::Value::Object(trial)).is_ok() {
+                good.insert(key, value);
+            } else {
+                bad.push(key);
+            }
+        }
+        let p = serde_json::from_value(serde_json::Value::Object(good)).unwrap_or_default();
+        (p, Some(format!("Some saved settings had unexpected values and are back to their defaults: {}", bad.join(", "))))
+    }
+
+    /// Written whole or not at all (a crash mid-write must not leave a cut-off file).
     fn save(&self, path: &Path) {
         if let Ok(json) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(path, json);
+            let _ = crate::history::write_atomically(path, json.as_bytes());
         }
     }
 
@@ -193,6 +246,7 @@ impl Prefs {
     fn from_window(w: &AppWindow) -> Self {
         let pick = |i: i32, len: usize| (i.max(0) as usize).min(len - 1);
         Self {
+            version: PREFS_VERSION,
             encoder: ENCODERS[pick(w.get_encoder_index(), ENCODERS.len())].0.into(),
             concurrency: JOBS[pick(w.get_jobs_index(), JOBS.len())].0,
             crf: QUALITY[pick(w.get_quality_index(), QUALITY.len())].0,
@@ -830,7 +884,10 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
     window.set_fix_ext_options(labels(FIX_EXT));
     window.set_system_temp(std::env::temp_dir().to_string_lossy().trim_end_matches('\\').into());
     window.set_audio_options(labels(AUDIO));
-    let prefs = Prefs::load(&prefs_path);
+    let (prefs, prefs_problem) = Prefs::load(&prefs_path);
+    if let Some(problem) = prefs_problem {
+        engine.log(problem);
+    }
     prefs.apply_to_window(&window);
     engine.apply_options(prefs.to_raw());
 
@@ -1526,6 +1583,48 @@ mod tests {
         assert_eq!(format_duration(std::time::Duration::from_secs(3725)), "1:02:05");
         assert_eq!(folder_name(r"D:\Videos\Family 2024"), "Family 2024");
         assert_eq!(folder_name(r"D:\"), r"D:\");
+    }
+
+    /// One field of an unexpected type (an older or hand-edited file) costs that field only:
+    /// the others, the backup folder above all, are kept, and the problem is reported.
+    #[test]
+    fn a_bad_field_doesnt_reset_the_other_settings() {
+        let dir = std::env::temp_dir().join(format!("mo-prefs-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ui-settings.json");
+        std::fs::write(&path, r#"{"version":1,"concurrency":"four","originals":2,"backup_dir":"F:\\backup"}"#).unwrap();
+        let (p, problem) = Prefs::load(&path);
+        assert_eq!((p.originals, p.backup_dir.as_str()), (2, r"F:\backup"));
+        assert_eq!(p.concurrency, Prefs::default().concurrency);
+        assert!(problem.is_some_and(|w| w.contains("concurrency")));
+        // An unreadable file: defaults, reported.
+        std::fs::write(&path, "{ not json").unwrap();
+        let (p, problem) = Prefs::load(&path);
+        assert!(p == Prefs::default() && problem.is_some());
+        // No file yet: defaults, nothing to report.
+        let (_, problem) = Prefs::load(&dir.join("none.json"));
+        assert!(problem.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Saved settings name their format version, and the parts of maximum effort only when
+    /// they differ from the default (so a better default reaches everyone who kept it).
+    #[test]
+    fn saved_settings_have_a_version_and_only_changed_parts() {
+        let dir = std::env::temp_dir().join(format!("mo-prefs-save-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ui-settings.json");
+        Prefs::default().save(&path);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(r#""version": 1"#) && !text.contains("max_parts"), "{text}");
+        let custom = Prefs { max_parts: vec!["flac_e".into()], ..Prefs::default() };
+        custom.save(&path);
+        assert_eq!(Prefs::load(&path).0, custom);
+        // A file from before versions: read like before, version 0.
+        std::fs::write(&path, r#"{"encoder":"av1_nvenc","images":0}"#).unwrap();
+        let (old, problem) = Prefs::load(&path);
+        assert!(problem.is_none() && !old.images_on && old.version == PREFS_VERSION);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
