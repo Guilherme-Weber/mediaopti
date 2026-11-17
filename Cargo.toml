@@ -1,6 +1,6 @@
 [package]
 name = "mediaopti"
-version = "3.0.6"
+version = "3.0.7"
 description = "Batch media optimizer: videos, images, audio and documents"
 license = "MIT"
 edition = "2021"
