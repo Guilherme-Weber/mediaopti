@@ -741,23 +741,12 @@ mod tests {
             encoder: Some("rm -rf".into()),
             concurrency: Some(9.0),
             originals: Some(9),
-            backup_dir: None,
             gif_min_mb: Some(3),
             vmaf_floor: Some(50),
             images: Some(7),
-            convert: None,
-            lossy_docs: None,
             audio: Some(9),
             temp_dir: Some("  ".into()),
-            fix_ext: None,
-            conversions: None,
-            videos: None,
-            docs: None,
-            gpu_decoding: None,
-            drop_data: None,
-            strip: None,
-            redo_stripped: None,
-            max_parts: None,
+            ..RawOptions::default()
         });
         assert_eq!(o.audio, ImageMode::Lossy, "audio: cover art visually lossless by default");
         assert!(o.temp_dir.is_none() && !o.fix_ext);

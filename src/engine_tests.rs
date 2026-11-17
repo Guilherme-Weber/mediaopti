@@ -79,23 +79,13 @@ fn opts(encoder: &str, concurrency: f64) -> RawOptions {
         // Tests must not fill the user's Recycle Bin; GIF limit and VMAF retry off so the
         // older tests keep checking what they were written for.
         originals: Some(0),
-        backup_dir: None,
         gif_min_mb: Some(0),
         vmaf_floor: Some(0),
         images: Some(0),
         convert: Some(0),
         lossy_docs: Some(0),
         audio: Some(0),
-        temp_dir: None,
-        fix_ext: None,
-        conversions: None,
-        videos: None,
-        docs: None,
-        gpu_decoding: None,
-        drop_data: None,
-        strip: None,
-        redo_stripped: None,
-        max_parts: None,
+        ..RawOptions::default()
     }
 }
 
@@ -1335,23 +1325,13 @@ fn real_folder_run() {
         encoder: Some("av1_nvenc".into()),
         concurrency: Some(std::env::var("MEDIAOPTI_BENCH_JOBS").ok().and_then(|v| v.parse().ok()).unwrap_or(2.0)),
         originals: Some(2),
-        backup_dir: None,
         gif_min_mb: Some(1),
         vmaf_floor: Some(93),
         images: Some(2),
         convert: Some(1),
         lossy_docs: Some(1),
         audio: Some(2),
-        temp_dir: None,
-        fix_ext: None,
-        conversions: None,
-        videos: None,
-        docs: None,
-        gpu_decoding: None,
-        drop_data: None,
-        strip: None,
-        redo_stripped: None,
-        max_parts: None,
+        ..RawOptions::default()
     };
     let t = std::time::Instant::now();
     rt.block_on(async {
