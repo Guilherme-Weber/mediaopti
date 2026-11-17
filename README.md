@@ -46,6 +46,15 @@ disk-bound), documents, and images (on every free core).
 Command line: `mediaopti.exe [--start] [folder]` opens a folder; `--start` begins at once with the
 last settings (useful with Task Scheduler).
 
+Updates: at start-up mediaopti checks the latest GitHub release. When a newer version exists, the
+**About** page offers **Update and restart**, which downloads the release zip, verifies its
+SHA-256 against the checksum GitHub publishes, and replaces the program files in place (all or
+nothing). Settings and history are kept. It is available only while no batch is queued or running.
+
+**About > Advanced options** holds settings meant for testing and troubleshooting, with a warning:
+GPU decoding on or off, and each extra optimizer step of the maximum effort (only the measured
+default is on). Every result is still verified before a file is replaced.
+
 For very large libraries, choose *Move to a backup folder*: the Recycle Bin handles only about 25
 files per second and drops its oldest items when full.
 

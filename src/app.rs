@@ -114,6 +114,10 @@ struct Prefs {
     fix_ext: u32,
     /// The side navigation shows only icons.
     nav_compact: bool,
+    /// Advanced: GPU decoding allowed.
+    gpu_decoding: bool,
+    /// Advanced: the maximum-effort parts in use (`image::Max` field names).
+    max_parts: Vec<String>,
 }
 
 impl Default for Prefs {
@@ -140,6 +144,8 @@ impl Default for Prefs {
             temp_dir: String::new(),
             fix_ext: 0,
             nav_compact: false,
+            gpu_decoding: true,
+            max_parts: crate::image::Max::chosen().names().into_iter().map(String::from).collect(),
         }
     }
 }
@@ -199,6 +205,8 @@ impl Prefs {
             temp_dir: w.get_temp_dir().into(),
             fix_ext: FIX_EXT[pick(w.get_fix_ext_index(), FIX_EXT.len())].0,
             nav_compact: w.get_nav_compact(),
+            gpu_decoding: w.get_gpu_decoding(),
+            max_parts: w.get_adv_parts().iter().filter(|p| p.on).map(|p| p.name.to_string()).collect(),
         }
     }
 
@@ -227,6 +235,25 @@ impl Prefs {
         w.set_temp_dir(self.temp_dir.as_str().into());
         w.set_fix_ext_index(position(FIX_EXT, &self.fix_ext, &d.fix_ext));
         w.set_nav_compact(self.nav_compact);
+        w.set_gpu_decoding(self.gpu_decoding);
+        let parts: Vec<AdvPart> = crate::image::Max::PARTS
+            .iter()
+            .map(|(name, label, detail)| AdvPart {
+                name: (*name).into(),
+                label: (*label).into(),
+                detail: (*detail).into(),
+                on: self.max_parts.iter().any(|p| p == name),
+            })
+            .collect();
+        w.set_adv_parts(ModelRc::new(VecModel::from(parts)));
+        let d = Prefs::default();
+        w.set_adv_default(self.gpu_decoding == d.gpu_decoding && self.max_parts_sorted() == d.max_parts_sorted());
+    }
+
+    fn max_parts_sorted(&self) -> Vec<&str> {
+        let mut v: Vec<&str> = self.max_parts.iter().map(String::as_str).collect();
+        v.sort_unstable();
+        v
     }
 
     fn to_raw(&self) -> RawOptions {
@@ -248,6 +275,8 @@ impl Prefs {
             audio: Some(if self.audio_on { self.audio } else { 0 }),
             temp_dir: Some(self.temp_dir.clone()),
             fix_ext: Some(self.fix_ext),
+            gpu_decoding: Some(u32::from(self.gpu_decoding)),
+            max_parts: Some(self.max_parts.clone()),
         }
     }
 }
@@ -703,7 +732,7 @@ fn hwnd(w: &AppWindow) -> Option<isize> {
 pub struct Launch {
     pub folder: Option<PathBuf>,
     pub start: bool,
-    /// The page shown first (`--page=settings` / `--page=about`).
+    /// The page shown first (`--page=settings` / `--page=about` / `--page=advanced`).
     pub page: i32,
 }
 
@@ -717,6 +746,7 @@ impl Launch {
                 launch.page = match page {
                     "settings" => 1,
                     "about" => 2,
+                    "advanced" => 3,
                     _ => 0,
                 };
             } else if arg.starts_with("--") {
@@ -813,6 +843,69 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
         });
     }
 
+    // Advanced options (reached from About).
+    {
+        let engine = engine.clone();
+        let weak = window.as_weak();
+        let prefs_path = prefs_path.clone();
+        window.on_toggle_part(move |index| {
+            let Some(w) = weak.upgrade() else { return };
+            let parts = w.get_adv_parts();
+            let Some(mut part) = parts.row_data(index.max(0) as usize) else { return };
+            part.on = !part.on;
+            parts.set_row_data(index as usize, part);
+            save_advanced(&w, &engine, &prefs_path);
+        });
+    }
+    {
+        let engine = engine.clone();
+        let weak = window.as_weak();
+        let prefs_path = prefs_path.clone();
+        window.on_advanced_changed(move || {
+            if let Some(w) = weak.upgrade() {
+                save_advanced(&w, &engine, &prefs_path);
+            }
+        });
+    }
+    {
+        let engine = engine.clone();
+        let weak = window.as_weak();
+        let prefs_path = prefs_path.clone();
+        window.on_restore_advanced(move || {
+            let Some(w) = weak.upgrade() else { return };
+            let d = Prefs::default();
+            let prefs = Prefs { gpu_decoding: d.gpu_decoding, max_parts: d.max_parts, ..Prefs::from_window(&w) };
+            prefs.apply_to_window(&w);
+            prefs.save(&prefs_path);
+            engine.apply_options_in_background(prefs.to_raw());
+        });
+    }
+
+    // Updates: a check when the app opens (it also removes what the last update left).
+    crate::update::app_exe();
+    spawn_update_check(&engine, window.as_weak(), data_dir.to_path_buf());
+    {
+        let engine = engine.clone();
+        let weak = window.as_weak();
+        let scratch = data_dir.to_path_buf();
+        window.on_check_update(move || {
+            if let Some(w) = weak.upgrade() {
+                w.set_update_text("Checking for updates…".into());
+            }
+            spawn_update_check(&engine, weak.clone(), scratch.clone());
+        });
+    }
+    {
+        let engine = engine.clone();
+        let weak = window.as_weak();
+        window.on_install_update(move || install_update(&engine, &weak));
+    }
+    window.on_open_release_page(|| {
+        if let Some(release) = crate::update::found() {
+            let _ = system::spawn_detached(std::process::Command::new("explorer").arg(&release.page));
+        }
+    });
+
     CONTROLLER.with(|c| {
         *c.borrow_mut() = Some(Controller {
             engine: engine.clone(),
@@ -859,6 +952,9 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
         let prefs_path = prefs_path.clone();
         window.on_start(move || {
             let Some(w) = weak.upgrade() else { return };
+            if w.get_update_running() {
+                return;
+            }
             let prefs = Prefs::from_window(&w);
             prefs.save(&prefs_path);
             engine.start(prefs.to_raw());
@@ -919,8 +1015,10 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
         let prefs_path = prefs_path.clone();
         window.on_restore_defaults(move || {
             let Some(w) = weak.upgrade() else { return };
-            // The layout of the window isn't a setting: it stays as it is.
-            let prefs = Prefs { nav_compact: w.get_nav_compact(), ..Prefs::default() };
+            // The layout of the window isn't a setting, and Advanced options have their own
+            // Restore: both stay as they are.
+            let current = Prefs::from_window(&w);
+            let prefs = Prefs { nav_compact: current.nav_compact, gpu_decoding: current.gpu_decoding, max_parts: current.max_parts, ..Prefs::default() };
             prefs.apply_to_window(&w);
             prefs.save(&prefs_path);
             engine.apply_options_in_background(prefs.to_raw());
@@ -1065,6 +1163,74 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
 }
 
 /// Windows 11 ships "Segoe Fluent Icons"; Windows 10 has the same glyphs in "Segoe MDL2 Assets".
+/// Saves the settings after a change on the Advanced page and shows whether they are the defaults.
+fn save_advanced(w: &AppWindow, engine: &Arc<Engine>, prefs_path: &Path) {
+    let prefs = Prefs::from_window(w);
+    prefs.save(prefs_path);
+    let d = Prefs::default();
+    w.set_adv_default(prefs.gpu_decoding == d.gpu_decoding && prefs.max_parts_sorted() == d.max_parts_sorted());
+    engine.apply_options_in_background(prefs.to_raw());
+}
+
+/// Asks GitHub for a newer release in the background and shows the answer on the About page.
+fn spawn_update_check(engine: &Arc<Engine>, weak: slint::Weak<AppWindow>, scratch: PathBuf) {
+    let engine = engine.clone();
+    std::thread::spawn(move || {
+        crate::update::remove_leftovers();
+        let result = crate::update::check(&scratch);
+        if let Ok(Some(release)) = &result {
+            engine.log(format!("mediaopti {} is available (About > Update and restart)", release.version));
+        }
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(w) = weak.upgrade() else { return };
+            match result {
+                Ok(Some(release)) => {
+                    w.set_update_version(release.version.as_str().into());
+                    w.set_update_text(format!("Version {} is available.", release.version).into());
+                }
+                Ok(None) => {
+                    w.set_update_version(SharedString::new());
+                    w.set_update_text("mediaopti is up to date.".into());
+                }
+                Err(why) => w.set_update_text(format!("Could not check for updates: {why}.").into()),
+            }
+        });
+    });
+}
+
+/// Downloads and installs the release found, then closes the app; `main` starts the new one.
+fn install_update(engine: &Arc<Engine>, weak: &slint::Weak<AppWindow>) {
+    let Some(w) = weak.upgrade() else { return };
+    let Some(release) = crate::update::found() else { return };
+    if w.get_busy() || w.get_processing() || w.get_update_running() {
+        return;
+    }
+    w.set_update_running(true);
+    w.set_update_text(format!("Downloading and installing version {}…", release.version).into());
+    let (engine, weak) = (engine.clone(), weak.clone());
+    std::thread::spawn(move || {
+        engine.log(format!("Updating to mediaopti {}", release.version));
+        let result = crate::update::install(&release);
+        if let Err(why) = &result {
+            engine.log(format!("Update failed: {why}; nothing was changed"));
+        }
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(w) = weak.upgrade() else { return };
+            match result {
+                Ok(()) => {
+                    crate::update::request_restart();
+                    w.set_update_text("Restarting…".into());
+                    let _ = slint::quit_event_loop();
+                }
+                Err(why) => {
+                    w.set_update_running(false);
+                    w.set_update_text(format!("The update failed: {why}. Nothing was changed.").into());
+                }
+            }
+        });
+    });
+}
+
 fn icon_font() -> &'static str {
     let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
     if Path::new(&windir).join("Fonts").join("SegoeIcons.ttf").exists() {
@@ -1240,5 +1406,26 @@ mod tests {
         assert_eq!(position(ENCODERS, &"libx264_opencl", &d.encoder.as_str()), 0);
         assert_eq!(position(JOBS, &9, &d.concurrency), 3);
         assert_eq!(position(SPEEDS, &"medium", &d.preset.as_str()), 1);
+    }
+
+    #[test]
+    fn advanced_options_default_to_the_measured_choice() {
+        // Settings saved before Advanced options existed take the defaults.
+        let old: Prefs = serde_json::from_str(r#"{"encoder":"av1_nvenc","concurrency":2}"#).unwrap();
+        assert!(old.gpu_decoding);
+        assert_eq!(old.max_parts, ["png_ect"]);
+        let o = crate::args::Options::normalize(old.to_raw());
+        assert!(o.gpu_decoding);
+        assert_eq!(o.max, crate::image::Max::chosen());
+        // Chosen parts reach the engine; unknown names are ignored.
+        let p = Prefs { gpu_decoding: false, max_parts: vec!["flac_e".into(), "bogus".into()], ..Prefs::default() };
+        let o = crate::args::Options::normalize(p.to_raw());
+        assert!(!o.gpu_decoding);
+        assert_eq!(o.max, crate::image::Max { flac_e: true, ..crate::image::Max::default() });
+        // Every part has a name that round-trips.
+        for (name, _, _) in crate::image::Max::PARTS {
+            assert_eq!(crate::image::Max::from_names(&[name]).names(), [*name]);
+        }
+        assert_eq!(crate::image::Max::PARTS.len(), 10);
     }
 }

@@ -15,6 +15,7 @@ mod pdf;
 mod progress;
 mod system;
 mod taskbar;
+mod update;
 
 fn main() -> Result<(), slint::PlatformError> {
     let appdata = std::env::var_os("APPDATA").map_or_else(std::env::temp_dir, std::path::PathBuf::from);
@@ -27,7 +28,17 @@ fn main() -> Result<(), slint::PlatformError> {
     history::import_imageopti(&appdata.join("imageopti"), &data_dir);
 
     // Two instances would append to the same history and fight over the same files.
-    let Some(_instance) = system::SingleInstance::acquire(r"Local\mediaopti-single-instance") else {
+    // Started by an update: the old version may still be closing.
+    let after_update = std::env::args().any(|a| a == update::UPDATED_FLAG);
+    let started = std::time::Instant::now();
+    let instance = loop {
+        let instance = system::SingleInstance::acquire(r"Local\mediaopti-single-instance");
+        if instance.is_some() || !after_update || started.elapsed() > std::time::Duration::from_secs(30) {
+            break instance;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
+    let Some(_instance) = instance else {
         rfd::MessageDialog::new()
             .set_level(rfd::MessageLevel::Info)
             .set_title("mediaopti")
@@ -36,5 +47,7 @@ fn main() -> Result<(), slint::PlatformError> {
         return Ok(());
     };
 
-    app::run(&data_dir, app::Launch::from_args(std::env::args().skip(1)))
+    let result = app::run(&data_dir, app::Launch::from_args(std::env::args().skip(1)));
+    update::restart_if_requested();
+    result
 }

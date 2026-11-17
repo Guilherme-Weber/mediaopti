@@ -165,7 +165,7 @@ impl Engine {
             parallel: slots > 1,
             timeout: std::time::Duration::from_secs(900),
             gate: image::tools::Gate::new(cancel, Some(self.paused.subscribe())),
-            max: max_parts(),
+            max: max_parts(options),
             slots: (slots > 1).then(|| image::tools::Slots::new(slots)),
             progress: None,
         }
@@ -516,15 +516,15 @@ impl Drop for WorkDir {
     }
 }
 
-/// The maximum-effort parts in use. Benchmarks can pick parts with the
+/// The maximum-effort parts in use (Advanced options). Benchmarks can pick parts with the
 /// `MEDIAOPTI_MAX_PARTS` environment variable (comma-separated `Max` field names; test builds only).
-fn max_parts() -> image::Max {
+fn max_parts(options: &crate::args::Options) -> image::Max {
     if cfg!(test) {
         if let Ok(names) = std::env::var("MEDIAOPTI_MAX_PARTS") {
             return image::Max::from_names(&names.split(',').map(str::trim).collect::<Vec<_>>());
         }
     }
-    image::Max::chosen()
+    options.max
 }
 
 /// "812 KB", "4.5 MB".

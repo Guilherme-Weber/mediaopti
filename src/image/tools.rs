@@ -149,11 +149,18 @@ fn download_tool(name: &str, url: &str, dir: &Path) -> Result<PathBuf, String> {
 
 /// Downloads `url` to `to` with what Windows itself has: curl.exe (in System32 since
 /// Windows 10 1803), or else the URL moniker (urlmon). Both use the system's certificates.
-fn url_download(url: &str, to: &Path) -> Result<(), String> {
+pub(crate) fn url_download(url: &str, to: &Path) -> Result<(), String> {
+    url_download_within(url, to, 300)
+}
+
+/// [`url_download`] with a time limit in seconds (curl only).
+pub(crate) fn url_download_within(url: &str, to: &Path, max_secs: u32) -> Result<(), String> {
     let curl = std::env::var_os("SystemRoot").map(|r| Path::new(&r).join("System32").join("curl.exe")).filter(|p| p.is_file());
     if let Some(curl) = curl {
         let mut cmd = Command::new(curl);
-        cmd.args(["--fail", "--location", "--silent", "--show-error", "--proto", "=https", "--max-time", "300", "--output"])
+        cmd.args(["--fail", "--location", "--silent", "--show-error", "--proto", "=https", "--max-time"])
+            .arg(max_secs.to_string())
+            .arg("--output")
             .arg(to)
             .arg(url)
             .stdin(Stdio::null())

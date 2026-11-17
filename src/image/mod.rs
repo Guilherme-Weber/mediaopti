@@ -245,6 +245,43 @@ impl Max {
         Self { png_ect: true, ..Self::default() }
     }
 
+    /// Every part: its name (saved settings, `MEDIAOPTI_MAX_PARTS`), a label, and what it was
+    /// measured to give (see [`Max::chosen`]). Every part keeps the same verification.
+    pub const PARTS: &'static [(&'static str, &'static str, &'static str)] = &[
+        ("png_ect", "PNG: ECT after oxipng", "Default. 80 real PNGs: -2.57% -> -2.87%, for about a quarter more time."),
+        ("oxipng_max", "PNG: oxipng -o max instead of -o 4", "+0.03 points for +77% time."),
+        ("png_pingo", "PNG (lossy): pingo -quality as a third method", "No gain measured."),
+        ("jpg_ect9", "JPEG: ECT -9 instead of -4", "No gain measured on 80 real JPEGs."),
+        ("jpg_pingo", "JPEG: pingo -s4 after ECT", "No gain measured on 80 real JPEGs."),
+        ("jpg_low_q", "JPEG (lossy): also JPEGs saved below quality 90", "No gain measured on 80 real JPEGs."),
+        ("jpg_wide", "JPEG (lossy): search from quality 50 instead of 84", "No gain measured; +65% time."),
+        ("flac_all", "FLAC: re-encode files from libFLAC 1.4+ too", "-0.11%: under the replace threshold for almost every file."),
+        ("flac_e", "FLAC: exhaustive model search (-e)", "+0.02 points for 8x the time."),
+        ("pdf_any_q", "PDF (lossy): re-encode JPEGs whatever their quality", "No gain measured on 21 PDFs."),
+    ];
+
+    /// Whether the part called `name` is on.
+    pub fn has(self, name: &str) -> bool {
+        match name {
+            "oxipng_max" => self.oxipng_max,
+            "png_ect" => self.png_ect,
+            "png_pingo" => self.png_pingo,
+            "jpg_ect9" => self.jpg_ect9,
+            "jpg_pingo" => self.jpg_pingo,
+            "jpg_low_q" => self.jpg_low_q,
+            "jpg_wide" => self.jpg_wide,
+            "flac_all" => self.flac_all,
+            "flac_e" => self.flac_e,
+            "pdf_any_q" => self.pdf_any_q,
+            _ => false,
+        }
+    }
+
+    /// The names of the parts that are on.
+    pub fn names(self) -> Vec<&'static str> {
+        Self::PARTS.iter().map(|p| p.0).filter(|n| self.has(n)).collect()
+    }
+
     pub fn from_names(names: &[&str]) -> Self {
         let on = |n: &str| names.contains(&n);
         Self {

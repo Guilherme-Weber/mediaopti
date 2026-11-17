@@ -329,9 +329,12 @@ impl Engine {
     /// scale_cuda hand the encoder were checked to be bit-identical to the CPU path; MPEG-4
     /// Part 2 decodes differently and 4:2:2 is converted differently, so they stay on the CPU.
     pub(super) async fn gpu_decodable(&self, input: &Path) -> Option<(u32, u32)> {
-        let encoder = self.lock().options.encoder.clone();
-        // MEDIAOPTI_GPU_DECODE=0 turns it off (comparisons, or a driver that misbehaves).
-        let off = std::env::var_os("MEDIAOPTI_GPU_DECODE").is_some_and(|v| v == "0");
+        let (encoder, allowed) = {
+            let inner = self.lock();
+            (inner.options.encoder.clone(), inner.options.gpu_decoding)
+        };
+        // Off in Advanced options, or MEDIAOPTI_GPU_DECODE=0 (comparisons, a driver that misbehaves).
+        let off = !allowed || std::env::var_os("MEDIAOPTI_GPU_DECODE").is_some_and(|v| v == "0");
         if off || !matches!(encoder.as_str(), "av1_nvenc" | "hevc_nvenc") || args::is_gif(input) {
             return None;
         }

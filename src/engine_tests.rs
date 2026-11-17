@@ -91,6 +91,8 @@ fn opts(encoder: &str, concurrency: f64) -> RawOptions {
         conversions: None,
         videos: None,
         docs: None,
+        gpu_decoding: None,
+        max_parts: None,
     }
 }
 
@@ -1080,6 +1082,8 @@ fn real_folder_run() {
         conversions: None,
         videos: None,
         docs: None,
+        gpu_decoding: None,
+        max_parts: None,
     };
     let t = std::time::Instant::now();
     rt.block_on(async {

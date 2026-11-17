@@ -9,6 +9,14 @@ export struct FileRow {
     progress: float,
 }
 
+// One maximum-effort part on the Advanced page.
+export struct AdvPart {
+    name: string,
+    label: string,
+    detail: string,
+    on: bool,
+}
+
 export struct WorkerRow {
     title: string,
     meta: string,
@@ -263,6 +271,8 @@ component NavItem inherits Rectangle {
     in property <string> text;
     in property <bool> selected;
     in property <bool> compact;
+    // A dot on the icon (an update is available).
+    in property <bool> badge;
     callback clicked();
     height: 40px;
     border-radius: Theme.radius-small;
@@ -285,6 +295,14 @@ component NavItem inherits Rectangle {
         spacing: 14px;
         Glyph { glyph: root.glyph; font-size: 16px; width: 18px; color: Theme.text; }
         if !root.compact: Text { text: root.text; font-size: 14px; color: Theme.text; vertical-alignment: center; }
+    }
+    if root.badge: Rectangle {
+        x: 28px;
+        y: parent.height / 2 - 11px;
+        width: 8px;
+        height: 8px;
+        border-radius: 4px;
+        background: Theme.accent;
     }
     touch := TouchArea {
         mouse-cursor: pointer;
@@ -462,6 +480,14 @@ export component AppWindow inherits Window {
     in property <string> tools-found;
     in property <string> tools-missing;
     in property <string> data-dir;
+    in property <string> update-text: "Checking for updates…";
+    // The newer version found, or empty.
+    in property <string> update-version;
+    in property <bool> update-running;
+    // ---- advanced page (reached from About)
+    in-out property <bool> gpu-decoding: true;
+    in-out property <[AdvPart]> adv-parts;
+    in property <bool> adv-default: true;
 
     // ---- settings (two-way with Rust)
     in property <[string]> encoder-options;
@@ -514,6 +540,12 @@ export component AppWindow inherits Window {
     callback forget-history();
     callback clear-log();
     callback open-logs();
+    callback check-update();
+    callback install-update();
+    callback open-release-page();
+    callback toggle-part(int);
+    callback advanced-changed();
+    callback restore-advanced();
     callback open-data-folder();
     callback settings-changed();
     callback restore-defaults();
@@ -560,7 +592,7 @@ export component AppWindow inherits Window {
                 NavItem { glyph: "\u{E8FD}"; text: "Queue"; compact: root.nav-compact; selected: root.page == 0; clicked => { root.page = 0; } }
                 Rectangle { vertical-stretch: 1; }
                 NavItem { glyph: "\u{E713}"; text: "Settings"; compact: root.nav-compact; selected: root.page == 1; clicked => { root.page = 1; } }
-                NavItem { glyph: "\u{E946}"; text: "About"; compact: root.nav-compact; selected: root.page == 2; clicked => { root.page = 2; } }
+                NavItem { glyph: "\u{E946}"; text: "About"; compact: root.nav-compact; selected: root.page == 2 || root.page == 3; badge: root.update-version != ""; clicked => { root.page = 2; } }
             }
         }
 
@@ -631,7 +663,7 @@ export component AppWindow inherits Window {
                             }
                             if !root.processing: VerticalLayout {
                                 alignment: center;
-                                Button { text: "Start"; primary: true; enabled: root.can-start; clicked => { root.start(); } }
+                                Button { text: "Start"; primary: true; enabled: root.can-start && !root.update-running; clicked => { root.start(); } }
                             }
                         }
                         if root.scanning: BusyBar { }
@@ -1199,6 +1231,36 @@ export component AppWindow inherits Window {
                     }
 
                     Card {
+                        SectionTitle { glyph: "\u{E895}"; text: "Updates"; }
+                        HorizontalLayout {
+                            spacing: 12px;
+                            Text {
+                                text: root.update-text;
+                                font-size: 13px;
+                                font-weight: root.update-version != "" ? 600 : 400;
+                                color: root.update-version != "" ? Theme.text : Theme.text-secondary;
+                                wrap: word-wrap;
+                                horizontal-stretch: 1;
+                                vertical-alignment: center;
+                            }
+                            if root.update-version != "": LinkText { text: "What's new"; clicked => { root.open-release-page(); } }
+                            if root.update-version == "" && !root.update-running: LinkText { text: "Check again"; clicked => { root.check-update(); } }
+                            if root.update-version != "": Button {
+                                text: "Update and restart";
+                                primary: true;
+                                enabled: !root.locked && !root.update-running;
+                                clicked => { root.install-update(); }
+                            }
+                        }
+                        if root.update-version != "": Text {
+                            text: root.locked ? "Available when nothing is queued or running." : "The new version is downloaded from GitHub, checked against its published checksum and installed in the app's folder; settings and history are kept.";
+                            font-size: 12px;
+                            color: Theme.text-tertiary;
+                            wrap: word-wrap;
+                        }
+                    }
+
+                    Card {
                         SectionTitle { glyph: "\u{E90F}"; text: "Tools"; }
                         Text { text: "Found: " + root.tools-found; font-size: 13px; color: Theme.text-secondary; wrap: word-wrap; }
                         if root.tools-missing != "": Text { text: "Missing (their steps are skipped): " + root.tools-missing; font-size: 13px; color: Theme.caution; wrap: word-wrap; }
@@ -1232,6 +1294,123 @@ export component AppWindow inherits Window {
                                 text: "Forget processed history";
                                 enabled: !root.busy && root.show-history;
                                 clicked => { root.forget-history(); }
+                            }
+                        }
+                    }
+
+                    HorizontalLayout {
+                        alignment: LayoutAlignment.start;
+                        LinkText { text: "Advanced options"; clicked => { root.page = 3; } }
+                    }
+                }
+            }
+
+            // ================= Advanced (only from About)
+            if root.page == 3: advanced-page := ScrollView {
+                x: 0;
+                y: 0;
+                width: parent.width;
+                height: parent.height;
+                content-width: self.visible-width;
+                content-height: max(self.visible-height, advanced-column.preferred-height);
+
+                advanced-column := VerticalLayout {
+                    width: advanced-page.visible-width;
+                    padding: 24px;
+                    padding-left: max(24px, (advanced-page.visible-width - 1000px) / 2);
+                    padding-right: max(24px, (advanced-page.visible-width - 1000px) / 2);
+                    spacing: 14px;
+                    alignment: LayoutAlignment.start;
+
+                    HorizontalLayout {
+                        spacing: 12px;
+                        LinkText { text: "‹ About"; clicked => { root.page = 2; } }
+                        Rectangle { horizontal-stretch: 1; }
+                    }
+                    HorizontalLayout {
+                        spacing: 12px;
+                        Text { text: "Advanced options"; font-size: 26px; font-weight: 600; color: Theme.text; vertical-alignment: center; }
+                        Rectangle { horizontal-stretch: 1; }
+                        Text {
+                            text: root.locked ? "Locked" : root.adv-default ? "Defaults" : "Changed";
+                            font-size: 12px;
+                            color: root.adv-default ? Theme.text-tertiary : Theme.caution;
+                            vertical-alignment: center;
+                        }
+                        Button { text: "Restore defaults"; enabled: !root.locked && !root.adv-default; clicked => { root.restore-advanced(); } }
+                    }
+
+                    Rectangle {
+                        background: #FCE10014;
+                        border-radius: Theme.radius;
+                        border-width: 1px;
+                        border-color: #FCE10059;
+                        HorizontalLayout {
+                            padding: 12px;
+                            spacing: 10px;
+                            Glyph { glyph: "\u{E7BA}"; font-size: 16px; color: Theme.caution; width: 18px; }
+                            VerticalLayout {
+                                spacing: 2px;
+                                Text {
+                                    text: "These options can break things";
+                                    font-weight: 600;
+                                    color: Theme.text;
+                                    wrap: word-wrap;
+                                }
+                                Text {
+                                    text: "They exist for testing and troubleshooting. The defaults were measured on real libraries; other values can make runs much slower, gain nothing, or fail on some systems. Results are still verified before any file is replaced. If something goes wrong, use Restore defaults.";
+                                    font-size: 12px;
+                                    color: Theme.text-secondary;
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+                    }
+
+                    Card {
+                        SectionTitle { glyph: "\u{E950}"; text: "GPU decoding"; }
+                        HorizontalLayout {
+                            spacing: 12px;
+                            Text {
+                                text: "Decode H.264, HEVC, AV1 and VP9 on the GPU when encoding to AV1 or HEVC (NVENC). The output is identical to CPU decoding; turn it off if the graphics driver misbehaves.";
+                                font-size: 13px;
+                                color: Theme.text-secondary;
+                                wrap: word-wrap;
+                                horizontal-stretch: 1;
+                                vertical-alignment: center;
+                            }
+                            Switch {
+                                text: root.gpu-decoding ? "On" : "Off";
+                                enabled: !root.locked;
+                                checked <=> root.gpu-decoding;
+                                toggled => { root.advanced-changed(); }
+                            }
+                        }
+                    }
+
+                    Card {
+                        SectionTitle { glyph: "\u{E9E9}"; text: "Maximum-effort parts"; }
+                        Text {
+                            text: "Extra optimizer steps for images, audio and PDFs. Each was measured alone; only the default one paid off. Files already in the processed history are not redone when these change.";
+                            font-size: 12px;
+                            color: Theme.text-tertiary;
+                            wrap: word-wrap;
+                        }
+                        for part[i] in root.adv-parts: VerticalLayout {
+                            spacing: 0px;
+                            Check {
+                                text: part.label;
+                                checked: part.on;
+                                enabled: !root.locked;
+                                clicked => { root.toggle-part(i); }
+                            }
+                            Text {
+                                text: part.detail + "  (" + part.name + ")";
+                                font-size: 12px;
+                                color: Theme.text-tertiary;
+                                wrap: word-wrap;
+                                x: 30px;
+                                width: parent.width - 30px;
                             }
                         }
                     }

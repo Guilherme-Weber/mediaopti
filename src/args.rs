@@ -111,6 +111,10 @@ pub struct Options {
     pub temp_dir: Option<PathBuf>,
     /// Rename pictures whose extension doesn't match their format (a JPEG named .png).
     pub fix_ext: bool,
+    /// Advanced: GPU decoding allowed (see `Engine::gpu_decodable`).
+    pub gpu_decoding: bool,
+    /// Advanced: the maximum-effort parts in use.
+    pub max: crate::image::Max,
 }
 
 impl Default for Options {
@@ -133,6 +137,8 @@ impl Default for Options {
             audio: ImageMode::Lossy,
             temp_dir: None,
             fix_ext: false,
+            gpu_decoding: true,
+            max: crate::image::Max::chosen(),
         }
     }
 }
@@ -169,6 +175,11 @@ pub struct RawOptions {
     pub temp_dir: Option<String>,
     /// 1 = rename misnamed pictures to their real format.
     pub fix_ext: Option<u32>,
+    /// Advanced: 0 = never decode on the GPU.
+    pub gpu_decoding: Option<u32>,
+    /// Advanced: the maximum-effort parts in use (`image::Max` field names); `None` = the
+    /// measured choice.
+    pub max_parts: Option<Vec<String>>,
 }
 
 impl Options {
@@ -232,6 +243,8 @@ impl Options {
             },
             temp_dir: raw.temp_dir.filter(|t| !t.trim().is_empty()).map(PathBuf::from),
             fix_ext: raw.fix_ext.map_or(d.fix_ext, |f| f != 0),
+            gpu_decoding: raw.gpu_decoding.map_or(d.gpu_decoding, |g| g != 0),
+            max: raw.max_parts.map_or(d.max, |names| crate::image::Max::from_names(&names.iter().map(String::as_str).collect::<Vec<_>>())),
         }
     }
 }
@@ -447,6 +460,8 @@ mod tests {
             conversions: None,
             videos: None,
             docs: None,
+            gpu_decoding: None,
+            max_parts: None,
         });
         assert_eq!(o.audio, ImageMode::Lossy, "audio: cover art visually lossless by default");
         assert!(o.temp_dir.is_none() && !o.fix_ext);
