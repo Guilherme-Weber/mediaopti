@@ -19,6 +19,9 @@ pub const NAMES: &[&str] = &[
 pub struct Tools {
     paths: HashMap<&'static str, PathBuf>,
     pub ffmpeg: PathBuf,
+    /// Tools run through a Scoop shim kept for its arguments: Stop and Pause reach the shim,
+    /// not the tool it starts.
+    behind_shims: Vec<&'static str>,
 }
 
 /// The program a Scoop shim starts (`x.exe` next to `x.shim` holding `path = "..."`). Run
@@ -65,6 +68,7 @@ impl Tools {
             dirs.extend(std::env::split_paths(&path));
         }
         let mut paths = HashMap::new();
+        let mut behind_shims = Vec::new();
         for name in NAMES {
             let file = if cfg!(windows) { format!("{name}.exe") } else { (*name).to_string() };
             let found = overrides
@@ -73,10 +77,14 @@ impl Tools {
                 .cloned()
                 .or_else(|| dirs.iter().map(|d| d.join(&file)).find(|p| p.is_file()));
             if let Some(p) = found {
-                paths.insert(*name, shim_target(&p).unwrap_or(p));
+                let target = shim_target(&p);
+                if target.is_none() && p.with_extension("shim").is_file() {
+                    behind_shims.push(*name);
+                }
+                paths.insert(*name, target.unwrap_or(p));
             }
         }
-        Self { paths, ffmpeg }
+        Self { paths, ffmpeg, behind_shims }
     }
 
     pub fn get(&self, name: &str) -> Option<&Path> {
@@ -93,6 +101,12 @@ impl Tools {
         let mut s = format!("Image tools found: {}", if found.is_empty() { "none".into() } else { found.join(", ") });
         if !missing.is_empty() {
             s.push_str(&format!(" | missing: {}", missing.join(", ")));
+        }
+        if !self.behind_shims.is_empty() {
+            s.push_str(&format!(
+                " | run through a Scoop shim with arguments (Stop and Pause reach only the shim): {}",
+                self.behind_shims.join(", ")
+            ));
         }
         s
     }
@@ -565,6 +579,24 @@ mod tests {
         std::fs::write(dir.join("x.shim"), format!("path = \"{}\"\r\nargs = -q\r\n", real.display())).unwrap();
         assert_eq!(shim_target(&shim), None, "extra arguments: keep the shim");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A tool found only as a shim with arguments runs through the shim, which Stop and
+    /// Pause can't see past: the tool summary in the log says so.
+    #[test]
+    fn shims_kept_for_their_arguments_are_reported() {
+        let data = std::env::temp_dir().join(format!("mediaopti-shimwarn-{}", std::process::id()));
+        let tools = data.join("tools");
+        std::fs::create_dir_all(&tools).unwrap();
+        let real = data.join("real.exe");
+        std::fs::write(&real, b"").unwrap();
+        std::fs::write(tools.join("gifsicle.exe"), b"").unwrap();
+        std::fs::write(tools.join("gifsicle.shim"), format!("path = \"{}\"\r\nargs = --no-warnings\r\n", real.display())).unwrap();
+        let found = Tools::discover(PathBuf::from("ffmpeg.exe"), &data);
+        let summary = found.summary();
+        assert!(found.get("gifsicle").is_some_and(|p| p.starts_with(&tools)), "the data folder's tools come before PATH");
+        assert!(summary.contains("only the shim): gifsicle"), "{summary}");
+        let _ = std::fs::remove_dir_all(&data);
     }
 
     /// A paused tool is suspended, and the time paused doesn't count toward its timeout.
