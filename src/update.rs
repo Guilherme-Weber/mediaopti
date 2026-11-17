@@ -103,10 +103,13 @@ fn parse_release(json: &str, current: &str) -> Result<Option<Release>, String> {
 /// quits the app with [`request_restart`] set; on failure nothing in the app's folder changed.
 pub fn install(release: &Release) -> Result<(), String> {
     let exe = app_exe().ok_or("the app's location is unknown")?;
-    install_into(release, exe.parent().ok_or("the app's location is unknown")?)
+    let (Some(app_dir), Some(name)) = (exe.parent(), exe.file_name()) else { return Err("the app's location is unknown".into()) };
+    install_into(release, app_dir, Path::new(name))
 }
 
-fn install_into(release: &Release, app_dir: &Path) -> Result<(), String> {
+/// `exe_name`: the running program's file name. A portable copy may have been renamed; the
+/// new program takes that name, so the restart opens the new version.
+fn install_into(release: &Release, app_dir: &Path, exe_name: &Path) -> Result<(), String> {
     let stage = app_dir.join(STAGE);
     let _ = std::fs::remove_dir_all(&stage);
     std::fs::create_dir_all(&stage).map_err(|e| format!("cannot write to {}: {e}", app_dir.display()))?;
@@ -116,7 +119,7 @@ fn install_into(release: &Release, app_dir: &Path) -> Result<(), String> {
         crate::image::tools::url_download_within(&release.zip_url, &zip, 1800)?;
         verify_download(&zip, release)?;
         let files = stage.join("files");
-        let list = unpack(&zip, &files)?;
+        let list = rename_program(&files, unpack(&zip, &files)?, exe_name)?;
         let _ = std::fs::remove_file(&zip);
         let _swapping = SWAPPING.lock().unwrap_or_else(PoisonError::into_inner);
         swap(&files, app_dir, &list)
@@ -184,6 +187,23 @@ fn unpack(zip: &Path, to: &Path) -> Result<Vec<PathBuf>, String> {
     let program = std::fs::read(&exe).map_err(|_| format!("{EXE} is not in the release"))?;
     if !program.starts_with(b"MZ") {
         return Err(format!("{EXE} in the release is not a Windows program"));
+    }
+    Ok(list)
+}
+
+/// Gives the release's program the running program's name when they differ.
+fn rename_program(files: &Path, mut list: Vec<PathBuf>, exe_name: &Path) -> Result<Vec<PathBuf>, String> {
+    if exe_name.as_os_str().eq_ignore_ascii_case(EXE) {
+        return Ok(list);
+    }
+    if list.iter().any(|p| p.as_os_str().eq_ignore_ascii_case(exe_name.as_os_str())) {
+        return Err(format!("the release has a file named {}", exe_name.display()));
+    }
+    std::fs::rename(files.join(EXE), files.join(exe_name)).map_err(|e| e.to_string())?;
+    for p in &mut list {
+        if p.as_os_str().eq_ignore_ascii_case(EXE) {
+            *p = exe_name.to_path_buf();
+        }
     }
     Ok(list)
 }
@@ -347,6 +367,28 @@ mod tests {
     }
 
     #[test]
+    fn a_renamed_program_keeps_its_name() {
+        let dir = temp("renamed");
+        let (from, to) = (dir.join("new"), dir.join("app"));
+        std::fs::create_dir_all(&from).unwrap();
+        std::fs::create_dir_all(&to).unwrap();
+        std::fs::write(from.join(EXE), "new exe").unwrap();
+        std::fs::write(from.join("ffmpeg.exe"), "new ffmpeg").unwrap();
+        std::fs::write(to.join("mo.exe"), "old exe").unwrap();
+        let list = rename_program(&from, vec![PathBuf::from(EXE), PathBuf::from("ffmpeg.exe")], Path::new("mo.exe")).unwrap();
+        swap(&from, &to, &list).unwrap();
+        assert_eq!(std::fs::read_to_string(to.join("mo.exe")).unwrap(), "new exe");
+        assert!(!to.join(EXE).exists(), "no second program next to the renamed one");
+        assert_eq!(std::fs::read_to_string(to.join("ffmpeg.exe")).unwrap(), "new ffmpeg");
+        // The usual name (any case) is left as it is.
+        let same = vec![PathBuf::from(EXE)];
+        assert_eq!(rename_program(&from, same.clone(), Path::new("MediaOpti.EXE")).unwrap(), same);
+        // A name that clashes with another file of the release is refused.
+        assert!(rename_program(&from, vec![PathBuf::from(EXE), PathBuf::from("ffmpeg.exe")], Path::new("ffmpeg.exe")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn failed_swap_puts_everything_back() {
         let dir = temp("rollback");
         let (from, to) = (dir.join("new"), dir.join("app"));
@@ -376,7 +418,7 @@ mod tests {
         std::fs::copy(&ping, app.join(EXE)).unwrap();
         let mut running = std::process::Command::new(app.join(EXE)).args(["-n", "60", "127.0.0.1"]).stdout(std::process::Stdio::null()).spawn().unwrap();
         let release = check_against(&dir, "0.0.1").unwrap().expect("a release");
-        let result = install_into(&release, &app);
+        let result = install_into(&release, &app, Path::new(EXE));
         let _ = running.kill();
         let _ = running.wait();
         result.unwrap();
