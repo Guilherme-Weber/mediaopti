@@ -153,6 +153,18 @@ pub(crate) fn audio_hash(ctx: &Ctx, path: &Path) -> Result<Option<[u8; 32]>, Run
     Ok(ran.hash.filter(|_| ran.success))
 }
 
+/// Whether two audio files carry the same tags and as many cover pictures (their bytes may
+/// differ: an optimized cover is the same cover). A file that isn't a native FLAC counts as
+/// having none.
+pub(crate) fn same_tags_and_art(ctx: &Ctx, a: &Path, b: &Path) -> Result<bool, RunError> {
+    let pictures = |p: &Path| flac_read(p).ok().flatten().map_or(0, |f| f.blocks.iter().filter(|(t, _)| *t == 6).count());
+    if pictures(a) != pictures(b) {
+        return Ok(false);
+    }
+    let theirs = tags(ctx, b)?;
+    Ok(theirs.is_some() && tags(ctx, a)? == theirs)
+}
+
 // ---------------------------------------------------------------- FLAC
 
 struct Flac {

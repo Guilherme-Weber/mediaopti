@@ -561,7 +561,9 @@ pub(super) struct JobOpts {
 pub(super) type NoteContent = Arc<dyn Fn(&Path) -> std::io::Result<()> + Send + Sync>;
 
 /// Whether `existing` holds the same content as the original (`src`, its private copy):
-/// the same picture, the same decoded audio, a CBZ with the CBR's files, else the same bytes.
+/// the same picture with the same metadata, the same decoded audio with the same tags and
+/// cover art, a CBZ with the CBR's files, else the same bytes. Only then may one of the two
+/// go: whichever stays must hold everything the other has.
 fn same_content(ctx: &image::Ctx, kind: image::Kind, src: &Path, existing: &Path, work: &Path) -> Result<bool, RunError> {
     let copy = work.join(format!("existing.{}", args::ext_lower(existing)));
     if std::fs::copy(existing, &copy).is_err() {
@@ -570,10 +572,12 @@ fn same_content(ctx: &image::Ctx, kind: image::Kind, src: &Path, existing: &Path
     match args::ext_lower(existing).as_str() {
         "flac" => {
             let want = crate::audio::audio_hash(ctx, src)?;
-            Ok(want.is_some() && crate::audio::audio_hash(ctx, &copy)? == want)
+            Ok(want.is_some() && crate::audio::audio_hash(ctx, &copy)? == want && crate::audio::same_tags_and_art(ctx, src, &copy)?)
         }
         "cbz" if kind == image::Kind::Cbr => crate::archive::same_as_folder(ctx, &work.join("x"), &copy, work),
-        _ if image::real_picture_ext(&copy).is_some() && image::real_picture_ext(src).is_some() => image::same_picture(ctx, src, &copy),
+        _ if image::real_picture_ext(&copy).is_some() && image::real_picture_ext(src).is_some() => {
+            Ok(image::same_metadata(ctx, src, &copy) && image::same_picture(ctx, src, &copy)?)
+        }
         _ => Ok(history::hash_file(src).ok().is_some_and(|h| history::hash_file(&copy).ok() == Some(h))),
     }
 }

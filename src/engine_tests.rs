@@ -1254,6 +1254,54 @@ fn wav_becomes_flac_only_when_safe() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A file already at the new name with the same picture or video, but without something the
+/// original has (an audio track, a JPEG comment), is not "the same content": the original's
+/// new version gets its own name and nothing is lost.
+#[test]
+fn same_content_keeps_what_the_original_has() {
+    let Some(ff) = ffmpeg() else {
+        eprintln!("skipping: bundled ffmpeg not found");
+        return;
+    };
+    let tools = crate::image::tools::Tools::discover(ff.clone(), &std::env::temp_dir());
+    if !["jpegtran", "djpeg"].iter().all(|t| tools.has(t)) {
+        eprintln!("skipping: image tools not found");
+        return;
+    }
+    let root = test_dir("samekeep");
+    let media = root.join("media");
+    std::fs::create_dir_all(&media).unwrap();
+    // clip.mov: lossless video and two audio tracks; clip.mp4: the same video, no audio.
+    let mov = media.join("clip.mov");
+    make(&ff, &["-f", "lavfi", "-i", "testsrc2=size=320x240:rate=30:duration=4", "-f", "lavfi", "-i", "sine=duration=4",
+        "-f", "lavfi", "-i", "sine=frequency=880:duration=4", "-map", "0:v", "-map", "1:a", "-map", "2:a",
+        "-c:v", "libx264", "-preset", "ultrafast", "-qp", "0", "-c:a", "aac"], &mov);
+    make(&ff, &["-i", mov.to_str().unwrap(), "-map", "0:v", "-c:v", "libx264", "-preset", "slow", "-crf", "23"], &media.join("clip.mp4"));
+    // photo.png: a JPEG with a long comment; photo.jpg: the same picture without it.
+    let src = root.join("src.jpg");
+    make(&ff, &["-f", "lavfi", "-i", "testsrc2=s=320x240", "-frames:v", "1", "-q:v", "2"], &src);
+    let data = std::fs::read(&src).unwrap();
+    std::fs::write(media.join("photo.png"), crate::image::jpeg::with_segments(&data, &vec![(0xFE, vec![b'x'; 20_000])])).unwrap();
+    std::fs::write(media.join("photo.jpg"), crate::image::jpeg::with_segments(&data, &Vec::new())).unwrap();
+
+    let rt = runtime();
+    let (engine, rec) = new_engine(&rt, &root, ff);
+    let raw = || RawOptions { originals: Some(2), images: Some(1), fix_ext: Some(1), ..opts("libx264", 1.0) };
+    rt.block_on(async {
+        engine.apply_options(raw());
+        engine.load_dir(media.clone()).await;
+        engine.clone().run_batch(raw()).await;
+    });
+    let logs = rec.logs.lock().unwrap().join("\n");
+    let names: std::collections::BTreeSet<String> =
+        std::fs::read_dir(&media).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    let want = ["clip (2).mp4", "clip.mp4", "photo (2).jpg", "photo.jpg"];
+    assert_eq!(names, want.iter().map(ToString::to_string).collect(), "{logs}");
+    let comment = crate::image::jpeg::segments(&media.join("photo (2).jpg")).unwrap();
+    assert!(comment.iter().any(|(m, d)| *m == 0xFE && d.len() == 20_000), "the comment survives");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Same name, same or other content (pictures and a GIF + MP4), and wrong extensions fixed.
 #[test]
 fn same_names_and_wrong_extensions() {

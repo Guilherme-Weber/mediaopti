@@ -615,12 +615,18 @@ impl Engine {
         Some(secs)
     }
 
-    /// Whether `existing` is the same video as `original`: about the same length and VMAF at
-    /// or above the quality floor (worst 5%: floor - 5). `Err` if Stop was pressed.
+    /// Whether `existing` is the same video as `original`: about the same length, the same
+    /// tracks, chapters and tags either way (whichever copy stays must not lose anything the
+    /// other has), and VMAF at or above the quality floor (worst 5%: floor - 5). `Err` if
+    /// Stop was pressed.
     pub(super) async fn same_video(&self, original: &Path, existing: &Path, duration_sec: f64) -> Result<bool, Stopped> {
         let theirs = self.probe_duration(existing).await;
         let close = |d: f64| duration_sec > 0.0 && (d - duration_sec).abs() <= (duration_sec * 0.02).max(0.5);
         if !theirs.is_some_and(close) {
+            return Ok(false);
+        }
+        let (ours, theirs) = (self.probe_streams(original).await, self.probe_streams(existing).await);
+        if super::ffmpeg::streams_lost(&ours, &theirs).is_some() || super::ffmpeg::streams_lost(&theirs, &ours).is_some() {
             return Ok(false);
         }
         let floor = self.lock().options.vmaf_floor.unwrap_or(93.0);

@@ -178,6 +178,23 @@ pub fn ext_is(real: &str, ext: &str) -> bool {
 /// Whether two pictures show the same thing: identical pixels and frame timing, or (single
 /// frames of the same size) SSIMULACRA2 at or above the target. Used before removing one of
 /// two files that would get the same name.
+/// Whether two pictures carry the same metadata either way (whichever stays must not lose
+/// anything the other has): JPEG APPn/COM segments, PNG text and colour chunks. Pictures of
+/// different formats (a BMP and its PNG) have nothing comparable and count as the same.
+pub fn same_metadata(ctx: &Ctx, a: &Path, b: &Path) -> bool {
+    match (sniff_picture(a), sniff_picture(b)) {
+        (Some(Kind::Jpg), Some(Kind::Jpg)) => match (jpeg::segments(a), jpeg::segments(b)) {
+            (Some(x), Some(y)) => jpeg::meta_ok(&x, &y, ctx.strip) && jpeg::meta_ok(&y, &x, ctx.strip),
+            _ => false,
+        },
+        (Some(Kind::Png), Some(Kind::Png)) => match (png::info(a), png::info(b)) {
+            (Some(x), Some(y)) => png::meta_ok(&x, &y, ctx.strip) && png::meta_ok(&y, &x, ctx.strip),
+            _ => false,
+        },
+        _ => true,
+    }
+}
+
 pub fn same_picture(ctx: &Ctx, a: &Path, b: &Path) -> Result<bool, RunError> {
     let decode = |p: &Path| -> Result<Option<(Vec<u8>, usize)>, RunError> {
         let args = crate::os_args!["-v", "error", "-i", p, "-map", "0:v:0", "-fps_mode", "passthrough", "-enc_time_base", "demux", "-pix_fmt", "rgba", "-f", "framemd5", "-"];
