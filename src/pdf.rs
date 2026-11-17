@@ -99,11 +99,15 @@ pub fn optimize(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, RunErro
         "--decode-level=generalized", "--warning-exit-0"
     ];
     let src_size = size(src);
-    let lossy_ok = ctx.lossy
-        && ctx.lossy_docs
-        && ctx.tools.has("mutool")
-        && ctx.tools.has("ssimulacra2")
-        && reference.pages.parse::<u64>().is_ok_and(|n| n <= MAX_LOSSY_PAGES);
+    let can_render = ctx.tools.has("mutool") && ctx.tools.has("ssimulacra2") && reference.pages.parse::<u64>().is_ok_and(|n| n <= MAX_LOSSY_PAGES);
+    let lossy_ok = ctx.lossy && ctx.lossy_docs && can_render;
+    // A damaged original (qpdf --check reports problems) is rewritten from qpdf's repair,
+    // which passes qpdf's own check whatever the repair lost: every page must also render
+    // the same, or the file is left as it is.
+    let damaged = reference.check_code != Some(0);
+    if damaged && !can_render {
+        return Ok(Optimized::skipped("damaged (qpdf reports problems) and its pages can't be checked: left as it is"));
+    }
 
     if ctx.tools.has("jpegtran") && ctx.tools.has("djpeg") {
         for lossy in if lossy_ok { vec![true, false] } else { vec![false] } {
@@ -119,12 +123,12 @@ pub fn optimize(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, RunErro
             let ok = ran.success
                 && size(&out) < src_size
                 && reference.accepts(ctx, &out)?
-                && (update.lossy == 0 || {
+                && ((update.lossy == 0 && !damaged) || {
                     ctx.phase("checking pages", &[]);
                     pages_look_same(ctx, src, &out, &dir.join("render"))?
                 });
             if ok {
-                let mut label = "qpdf".to_string();
+                let mut label = if damaged { "qpdf (damaged original, pages checked)" } else { "qpdf" }.to_string();
                 if update.lossless > 0 {
                     label += &format!("+{} jpeg", update.lossless);
                 }
@@ -140,8 +144,15 @@ pub fn optimize(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, RunErro
     let mut args = rewrite;
     args.extend([src.into(), out.clone().into()]);
     ctx.phase("rewriting", &[]);
-    let ok = qpdf(ctx, args, Capture::None)?.success && size(&out) < src_size && reference.accepts(ctx, &out)?;
-    Ok(if ok { Optimized::found(Some(out), vec!["qpdf".into()]) } else { Optimized::nothing() })
+    let ok = qpdf(ctx, args, Capture::None)?.success
+        && size(&out) < src_size
+        && reference.accepts(ctx, &out)?
+        && (!damaged || {
+            ctx.phase("checking pages", &[]);
+            pages_look_same(ctx, src, &out, &work.join("render"))?
+        });
+    let label = if damaged { "qpdf (damaged original, pages checked)" } else { "qpdf" };
+    Ok(if ok { Optimized::found(Some(out), vec![label.into()]) } else { Optimized::nothing() })
 }
 
 /// Renders every page of both PDFs at 96 dpi (screen size); each page of `b` must be
@@ -388,6 +399,37 @@ mod tests {
     use super::*;
     use crate::image::tools::Tools;
     use std::time::Duration;
+
+    /// A damaged original (qpdf repairs it while reading) is rewritten only when every page
+    /// renders the same: the repaired copy passes qpdf's own check whatever it lost.
+    #[test]
+    fn damaged_pdfs_are_checked_page_by_page() {
+        let Some(c) = ctx(false) else {
+            eprintln!("skipping: PDF tools not found");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("mo-pdfdamaged-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (ff, mutool) = (c.tools.ffmpeg.clone(), c.tools.get("mutool").unwrap().to_path_buf());
+        let png = dir.join("page.png");
+        run_ok(&ff, &["-v".as_ref(), "error".as_ref(), "-f".as_ref(), "lavfi".as_ref(), "-i".as_ref(), "testsrc2=s=400x300".as_ref(), "-frames:v".as_ref(), "1".as_ref(), png.as_os_str()]);
+        let pdf = dir.join("doc.pdf");
+        run_ok(&mutool, &["convert".as_ref(), "-o".as_ref(), pdf.as_os_str(), png.as_os_str()]);
+        // A wrong cross-reference offset: readers (and qpdf) rebuild it, with a warning.
+        let text = std::fs::read(&pdf).unwrap();
+        let at = text.windows(9).rposition(|w| w == b"startxref").unwrap() + 10;
+        let end = at + text[at..].iter().position(|b| !b.is_ascii_digit()).unwrap();
+        let damaged = [&text[..at], b"1", &text[end..]].concat();
+        std::fs::write(&pdf, damaged).unwrap();
+        assert_ne!(Reference::read(&c, &pdf).unwrap().unwrap().check_code, Some(0), "damaged");
+        let work = dir.join("w");
+        std::fs::create_dir_all(&work).unwrap();
+        let r = optimize(&c, &pdf, &work).unwrap();
+        assert!(r.best.is_some(), "the repaired rewrite renders the same and is smaller: {:?}", r.note);
+        assert!(r.steps[0].contains("pages checked"), "{:?}", r.steps);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Re-encoded JPEGs go into PDFs only when sequential: the check must read the frame
     /// marker (it looked for it among the APPn/COM segments, where it never is).
