@@ -536,12 +536,19 @@ pub fn unused_name(path: &Path) -> std::path::PathBuf {
     if !path.exists() {
         return path.to_path_buf();
     }
-    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    let ext = path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
-    (2..)
-        .map(|n| path.with_file_name(format!("{stem} ({n}){ext}")))
-        .find(|p| !p.exists())
-        .expect("an unused name exists")
+    // Built from the name's own characters (not a lossy string: a name that isn't valid
+    // UTF-16 keeps them).
+    let stem = path.file_stem().unwrap_or_default();
+    let numbered = |n: u32| {
+        let mut name = stem.to_os_string();
+        name.push(format!(" ({n})"));
+        if let Some(ext) = path.extension() {
+            name.push(".");
+            name.push(ext);
+        }
+        path.with_file_name(name)
+    };
+    (2..).map(numbered).find(|p| !p.exists()).expect("an unused name exists")
 }
 
 /// Moves a file, also across drives (copy, keep its dates, then delete). Returns where it went.
@@ -1009,6 +1016,28 @@ mod tests {
         }
         assert_eq!(fs::read_to_string(&backup).unwrap(), "original 1");
         assert_eq!(fs::read_to_string(backup.with_file_name("clip (2).mp4")).unwrap(), "original 2");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// "name (2)" keeps the name's own characters, even ones that aren't valid UTF-16 (a
+    /// lone surrogate, which NTFS allows): they used to become U+FFFD.
+    #[cfg(windows)]
+    #[test]
+    fn numbered_names_keep_the_original_characters() {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let dir = std::env::temp_dir().join(format!("mo-unused-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let stem = std::ffi::OsString::from_wide(&[0xD800, u16::from(b'a')]);
+        let mut name = stem.clone();
+        name.push(".png");
+        let taken = dir.join(&name);
+        fs::write(&taken, b"x").unwrap();
+        let free = unused_name(&taken);
+        let wide: Vec<u16> = free.file_name().unwrap().encode_wide().collect();
+        let mut want: Vec<u16> = stem.encode_wide().collect();
+        want.extend(" (2).png".encode_utf16());
+        assert_eq!(wide, want);
         let _ = fs::remove_dir_all(&dir);
     }
 
