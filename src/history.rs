@@ -223,48 +223,88 @@ impl History {
         self.needs_rewrite = true;
     }
 
+    /// Takes and writes a save at once (tests; the engine writes outside its lock).
+    #[cfg(test)]
     pub fn save(&mut self) -> std::io::Result<()> {
+        let Some(job) = self.take_save() else { return Ok(()) };
+        job.write().inspect_err(|_| self.give_back(job))
+    }
+
+    /// What is to be written, taken out of the history (quick, under its owner's lock) so the
+    /// writing can happen outside that lock. `None` if nothing is to be saved. Saves must be
+    /// written in the order they were taken.
+    pub fn take_save(&mut self) -> Option<SaveJob> {
         if !self.needs_rewrite && self.unsaved.is_empty() && self.unsaved_content.is_empty() {
-            return Ok(());
+            return None;
         }
+        let rewrite = std::mem::take(&mut self.needs_rewrite).then(|| self.hashes.iter().copied().collect());
+        Some(SaveJob {
+            path: self.path.clone(),
+            content_path: self.content_path.clone(),
+            rewrite,
+            append: std::mem::take(&mut self.unsaved),
+            content: std::mem::take(&mut self.unsaved_content),
+        })
+    }
+
+    /// Puts back a save that could not be written: the next save writes it.
+    pub fn give_back(&mut self, job: SaveJob) {
+        self.needs_rewrite |= job.rewrite.is_some();
+        let mut append = job.append;
+        append.append(&mut self.unsaved);
+        self.unsaved = append;
+        let mut content = job.content;
+        content.append(&mut self.unsaved_content);
+        self.unsaved_content = content;
+    }
+}
+
+/// One save of the history files (see [`History::take_save`]).
+pub struct SaveJob {
+    path: PathBuf,
+    content_path: PathBuf,
+    /// After a clear: every location entry, written as the whole file.
+    rewrite: Option<Vec<Hash>>,
+    append: Vec<Hash>,
+    content: Vec<(ContentHash, u64, &'static str)>,
+}
+
+impl SaveJob {
+    pub fn write(&self) -> std::io::Result<()> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-
-        if self.needs_rewrite {
-            let lines: Vec<String> = self.hashes.iter().map(hex::encode).collect();
+        if let Some(all) = &self.rewrite {
+            // `all` already holds the entries added since the clear (`append`).
+            let lines: Vec<String> = all.iter().map(hex::encode).collect();
             write_atomically(&self.path, lines.join("\n").as_bytes())?;
             // Cleared: the content history restarts with what was added since.
             write_atomically(&self.content_path, b"")?;
-            self.needs_rewrite = false;
-        } else if !self.unsaved.is_empty() {
+        } else if !self.append.is_empty() {
             // The file has no trailing newline, so separate from existing content first.
             let has_content = std::fs::metadata(&self.path).is_ok_and(|m| m.len() > 0);
-            let mut data = String::with_capacity(self.unsaved.len() * 65);
-            for (i, h) in self.unsaved.iter().enumerate() {
+            let mut data = String::with_capacity(self.append.len() * 65);
+            for (i, h) in self.append.iter().enumerate() {
                 if has_content || i > 0 {
                     data.push('\n');
                 }
                 data.push_str(&hex::encode(h));
             }
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.path)?;
+            let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&self.path)?;
             file.write_all(data.as_bytes())?;
         }
-        self.unsaved.clear();
-
-        if !self.unsaved_content.is_empty() {
-            let mut data = String::with_capacity(self.unsaved_content.len() * 56);
-            for (hash, size, mode) in &self.unsaved_content {
+        if !self.content.is_empty() {
+            let mut data = String::with_capacity(self.content.len() * 56);
+            for (hash, size, mode) in &self.content {
                 data.push_str(&content_line(hash, *size, mode));
             }
             append_lines(&self.content_path, &data, false)?;
-            self.unsaved_content.clear();
         }
         Ok(())
     }
+}
+
+impl History {
 
     /// Adds content now and returns where and what to append so the caller can write it
     /// durably outside its lock ([`append_lines`]); `None` if it was already known.
@@ -377,6 +417,32 @@ mod tests {
                 assert!(!h.contains_image(Path::new(r"F:\other.png"), false, false));
             }
         }
+    }
+
+    /// A save is taken under the engine's lock and written outside it; one that can't be
+    /// written goes back into the history, so nothing is lost and the next save retries it.
+    #[test]
+    fn a_save_taken_and_written_later_loses_nothing() {
+        let dir = temp("savejob");
+        let mut h = History::load(dir.join("processedFiles.txt"));
+        h.add(Path::new(r"C:\v\a.mp4"));
+        let job = h.take_save().unwrap();
+        assert!(h.take_save().is_none(), "nothing left to save");
+        h.add(Path::new(r"C:\v\b.mp4"));
+        job.write().unwrap();
+        h.save().unwrap();
+        let again = History::load(dir.join("processedFiles.txt"));
+        assert!(again.contains(Path::new(r"C:\v\a.mp4")) && again.contains(Path::new(r"C:\v\b.mp4")));
+
+        // Its folder is a file: the save fails and the entry stays to be saved.
+        let blocked = dir.join("blocked");
+        std::fs::write(&blocked, b"").unwrap();
+        let mut h = History::load(blocked.join("processedFiles.txt"));
+        h.add(Path::new(r"C:\v\c.mp4"));
+        let job = h.take_save().unwrap();
+        assert!(job.write().is_err());
+        h.give_back(job);
+        assert!(h.take_save().is_some(), "kept for the next save");
     }
 
     fn temp(name: &str) -> PathBuf {

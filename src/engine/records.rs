@@ -38,11 +38,22 @@ impl Engine {
         });
     }
 
+    /// Writes what the history gained since the last save. The engine's lock is held only to
+    /// take it; the disk writes happen outside (after a clear, a library's whole history is
+    /// rewritten). `SAVING` keeps saves in the order they were taken.
     pub fn flush_history(&self) {
-        let mut inner = self.lock();
-        inner.history_save_pending = false;
-        if let Err(err) = inner.history.save() {
-            eprintln!("Error saving processed files: {err}");
+        static SAVING: Mutex<()> = Mutex::new(());
+        let _in_order = SAVING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let job = {
+            let mut inner = self.lock();
+            inner.history_save_pending = false;
+            inner.history.take_save()
+        };
+        if let Some(job) = job {
+            if let Err(err) = job.write() {
+                self.log(format!("Could not save the processed history (tried again at the next save): {err}"));
+                self.lock().history.give_back(job);
+            }
         }
     }
 
