@@ -13,6 +13,19 @@ pub(super) struct Attempt {
     pub(super) diag: Diagnostics,
 }
 
+/// What a failure to start ffmpeg means. Windows refusing for lack of memory
+/// (ERROR_NOT_ENOUGH_MEMORY, ERROR_COMMITMENT_LIMIT) is a memory shortage: an attempt that
+/// failed out of memory, which `Engine::encode` waits out and retries. Anything else (ffmpeg
+/// missing, access denied) stops the videos of the batch.
+pub(super) fn spawn_failure(err: &std::io::Error, diag: &mut Diagnostics) -> AttemptStatus {
+    if matches!(err.raw_os_error(), Some(8 | 1455)) {
+        diag.out_of_memory = true;
+        AttemptStatus::Exited(1)
+    } else {
+        AttemptStatus::SpawnError(err.to_string())
+    }
+}
+
 /// Finds the ffmpeg binary: next to the executable (release zip), in the project's `bin/`
 /// folder (development), otherwise on PATH.
 pub fn locate_ffmpeg() -> PathBuf {
@@ -101,10 +114,8 @@ impl Engine {
         let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(err) => {
-                return Attempt {
-                    status: AttemptStatus::SpawnError(err.to_string()),
-                    diag,
-                }
+                let status = spawn_failure(&err, &mut diag);
+                return Attempt { status, diag };
             }
         };
         system::assign_to_kill_on_exit_job(&child);
@@ -564,6 +575,20 @@ pub(super) fn gpu_decodable_stream(report: &str) -> Option<(u32, u32)> {
 mod tests {
     use super::gpu_decodable_stream as ok;
     use super::{packet_timing, timing_mismatch};
+
+    /// Windows refusing to start ffmpeg for lack of memory (commit) is a memory shortage,
+    /// waited out like one; it used to end every video of the batch.
+    #[test]
+    fn starting_without_memory_is_a_memory_shortage() {
+        for code in [8, 1455] {
+            let mut diag = crate::progress::Diagnostics::default();
+            let status = super::spawn_failure(&std::io::Error::from_raw_os_error(code), &mut diag);
+            assert!(matches!(status, super::AttemptStatus::Exited(1)) && diag.out_of_memory, "os error {code}");
+        }
+        let mut diag = crate::progress::Diagnostics::default();
+        let status = super::spawn_failure(&std::io::Error::from_raw_os_error(2), &mut diag);
+        assert!(matches!(status, super::AttemptStatus::SpawnError(_)) && !diag.out_of_memory, "a missing ffmpeg is fatal");
+    }
 
     #[test]
     fn lost_streams_are_named() {
