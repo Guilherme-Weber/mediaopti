@@ -113,7 +113,18 @@ impl Inner {
         } else if !self.options.videos {
             Place::Off { gif: false }
         } else if self.history.contains(file) {
-            Place::Known
+            // A GIF still here was not replaced by a video. If it never went through the GIF
+            // optimizer (images were off, or older versions), it goes there now, without
+            // being encoded again.
+            if args::is_gif(file)
+                && self.cpu_job_enabled(file)
+                && !self.history.contains_image(file, self.lossy_for(file))
+                && !self.failed.contains(file)
+            {
+                Place::Cpu
+            } else {
+                Place::Known
+            }
         } else if self.failed.contains(file) {
             Place::Failed
         } else {

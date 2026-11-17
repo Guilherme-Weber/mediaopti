@@ -18,6 +18,25 @@ impl Drop for Completion<'_> {
 }
 
 impl Engine {
+    /// A GIF the video path can't use (not smaller, the encode failed, damaged to ffmpeg, no
+    /// free name): it stays a GIF and goes through the GIF optimizer, whose own checks decide.
+    /// `None`: not a GIF, or images are off. `why` is logged when not empty.
+    async fn gif_fallback(self: &Arc<Self>, worker_id: u32, input: &Path, display: &str, why: &str) -> Option<Outcome> {
+        if !args::is_gif(input) || self.lock().options.images == ImageMode::Off {
+            return None;
+        }
+        if !why.is_empty() {
+            self.log(format!("[Worker {worker_id}] {display}: {why}; optimizing it as a GIF instead"));
+        }
+        let outcome = self.gif_as_image(worker_id, input, display).await;
+        if !matches!(outcome, Outcome::Stopped) {
+            // Done as a video: later runs only retry the GIF optimizer if it didn't finish
+            // (see `Inner::place`), never the encode.
+            self.add_processed(input);
+        }
+        Some(outcome)
+    }
+
     pub(super) async fn process_one(self: &Arc<Self>, worker_id: u32) -> Outcome {
         let cancel = self.lock().cancel.clone();
         if !self.wait_while_paused(&cancel).await {
@@ -92,6 +111,10 @@ impl Engine {
                 .await;
             if !valid {
                 self.lock().in_progress.remove(&input);
+                // Changed since the scan (or never checked): the GIF optimizer decides.
+                if let Some(outcome) = self.gif_fallback(worker_id, &input, &display, "not an animated GIF for the video encoder").await {
+                    return outcome;
+                }
                 self.remember(&input, &input).await;
                 {
                     let mut inner = self.lock();
@@ -170,6 +193,10 @@ impl Engine {
         if attempt.diag.corrupt_input && !attempt.diag.out_of_memory {
             self.release_tracking(worker_id, &input);
             self.log_remove(&tmp);
+            // gifsicle may still read it; its result is checked frame by frame.
+            if let Some(outcome) = self.gif_fallback(worker_id, &input, &display, "ffmpeg reported damaged data").await {
+                return outcome;
+            }
             self.remember(&input, &input).await;
             {
                 let mut inner = self.lock();
@@ -285,13 +312,17 @@ impl Engine {
             return Outcome::Failed;
         }
         if code != 0 {
-            self.lock().failed.insert(input.clone());
-            self.remember(&input, &input).await; // Remember unrecoverable files so future runs skip them
-            self.lock().run.failed += 1;
             self.log_remove(&tmp);
             for line in &attempt.diag.error_lines {
                 self.log(line.clone());
             }
+            if let Some(outcome) = self.gif_fallback(worker_id, &input, &display, &format!("the video encode failed (ffmpeg exit code {code})")).await {
+                completion.armed = false; // counted as an image instead
+                return outcome;
+            }
+            self.lock().failed.insert(input.clone());
+            self.remember(&input, &input).await; // Remember unrecoverable files so future runs skip them
+            self.lock().run.failed += 1;
             self.log(format!(
                 "[Worker {worker_id}] ffmpeg exited with code {code} for {display} (remembered in history)"
             ));
@@ -366,9 +397,9 @@ impl Engine {
                     ));
                     // A GIF that doesn't make a smaller video stays a GIF, but is still
                     // optimized as an image (e.g. slideshow-like "process" GIFs).
-                    if args::is_gif(&input) && self.lock().options.images != ImageMode::Off {
+                    if let Some(outcome) = self.gif_fallback(worker_id, &input, &display, "").await {
                         completion.armed = false; // counted as an image instead
-                        return self.gif_as_image(worker_id, &input, &display).await;
+                        return outcome;
                     }
                     self.remember(&input, &input).await;
                     self.lock().run.skipped_larger += 1;
@@ -432,9 +463,13 @@ impl Engine {
                     }
                 }
                 if tries > 20 {
+                    self.log_remove(&tmp);
+                    if let Some(outcome) = self.gif_fallback(worker_id, &input, &display, "no free name for the video").await {
+                        completion.armed = false;
+                        return outcome;
+                    }
                     self.remember(&input, &input).await;
                     self.lock().run.skipped_larger += 1;
-                    self.log_remove(&tmp);
                     self.log(format!("[Worker {worker_id}] No free name for the new version of {display}; kept the original"));
                     self.send_state(false);
                     return Outcome::Skipped;

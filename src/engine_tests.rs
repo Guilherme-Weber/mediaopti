@@ -610,6 +610,101 @@ fn hard_links_are_left_alone_and_small_gifs_stay_gifs() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A GIF the video path can't use still goes through the GIF optimizer: one whose video
+/// encode fails (its temp name is taken by a folder, so ffmpeg can't write) and one that is no
+/// longer animated when its turn comes. Neither is counted as failed or remembered as a video.
+#[test]
+fn gifs_the_video_path_cannot_use_are_optimized_as_gifs() {
+    let Some(ff) = ffmpeg() else {
+        eprintln!("skipping: bundled ffmpeg not found");
+        return;
+    };
+    let root = test_dir("gif-fallback");
+    let media = root.join("media");
+    std::fs::create_dir_all(&media).unwrap();
+    let (broken, still) = (media.join("broken.gif"), media.join("still.gif"));
+    make(&ff, &["-f", "lavfi", "-i", "testsrc2=size=320x240:rate=10:duration=3"], &broken);
+    make(&ff, &["-f", "lavfi", "-i", "testsrc2=size=320x240:rate=10:duration=3"], &still);
+    // Every video attempt (NVENC, then x264) writes to this name: a folder makes them fail.
+    let blocked = crate::args::temp_name(&broken, 1);
+    std::fs::create_dir_all(&blocked).unwrap();
+
+    let rt = runtime();
+    let (engine, rec) = new_engine(&rt, &root, ff.clone());
+    // Every GIF is a video job (limit 0); images lossless so the GIF optimizer runs.
+    let raw = || RawOptions { images: Some(1), ..opts("av1_nvenc", 1.0) };
+    rt.block_on(async {
+        engine.apply_options(raw());
+        engine.load_dir(media.clone()).await;
+        assert_eq!(engine.snapshot().pending_files, 2);
+        // Queued as an animated GIF; a single still frame by the time it is encoded.
+        make(&ff, &["-f", "lavfi", "-i", "testsrc2=size=320x240:rate=1:duration=1", "-frames:v", "1"], &still);
+        engine.clone().run_batch(raw()).await;
+    });
+    let logs = rec.logs.lock().unwrap().join("\n");
+    println!("{logs}");
+    assert!(logs.contains("broken.gif: the video encode failed"), "{logs}");
+    assert!(logs.contains("still.gif: not an animated GIF for the video encoder"), "{logs}");
+    assert_eq!(logs.matches("optimizing it as a GIF instead").count(), 2, "{logs}");
+    assert!(!logs.contains("remembered in history"), "{logs}");
+    let s = engine.snapshot();
+    assert_eq!(s.failed_this_run, 0, "{logs}");
+    assert!(broken.exists() && still.exists(), "both stay GIFs");
+    std::fs::remove_dir(&blocked).unwrap();
+
+    // Both are remembered as done: a second scan queues nothing.
+    let (engine2, _) = new_engine(&rt, &root, ff);
+    engine2.apply_options(raw());
+    rt.block_on(engine2.load_dir(media));
+    assert_eq!(engine2.snapshot().pending_files, 0, "{logs}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A big GIF remembered as a video without going through the GIF optimizer (images were off)
+/// gets the GIF optimizer once images are on, without another video encode; after that it is
+/// known.
+#[test]
+fn a_gif_remembered_as_video_gets_the_gif_optimizer_later() {
+    let Some(ff) = ffmpeg() else {
+        eprintln!("skipping: bundled ffmpeg not found");
+        return;
+    };
+    let root = test_dir("gif-later");
+    let media = root.join("media");
+    std::fs::create_dir_all(&media).unwrap();
+    let gif = media.join("anim.gif");
+    make(&ff, &["-f", "lavfi", "-i", "testsrc2=size=320x240:rate=10:duration=3"], &gif);
+    let blocked = crate::args::temp_name(&gif, 1);
+    std::fs::create_dir_all(&blocked).unwrap();
+    let rt = runtime();
+    let run = |images: u32| {
+        let (engine, rec) = new_engine(&rt, &root, ff.clone());
+        let raw = || RawOptions { images: Some(images), ..opts("av1_nvenc", 1.0) };
+        rt.block_on(async {
+            engine.apply_options(raw());
+            engine.load_dir(media.clone()).await;
+            let pending = engine.snapshot().pending_files;
+            engine.clone().run_batch(raw()).await;
+            (pending, rec.logs.lock().unwrap().join("\n"))
+        })
+    };
+    // Images off: the failed encode is remembered as a video.
+    let (pending, logs) = run(0);
+    assert_eq!(pending, 1, "{logs}");
+    assert!(logs.contains("remembered in history"), "{logs}");
+    // Images on: straight to the GIF optimizer, no encode.
+    let (pending, logs) = run(1);
+    println!("{logs}");
+    assert_eq!(pending, 1, "{logs}");
+    assert!(!logs.contains("Processing: anim.gif"), "no second video encode: {logs}");
+    assert!(logs.contains("anim.gif"), "{logs}");
+    // Done now.
+    let (pending, logs) = run(1);
+    assert_eq!(pending, 0, "{logs}");
+    std::fs::remove_dir(&blocked).unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// An already-compressed H.264 that AV1 at the preset cannot shrink.
 fn compressed_h264(ffmpeg: &Path, noise: u32, crf: u32, out: &Path) {
     let src = format!("testsrc2=size=1280x720:rate=30:duration=8,noise=alls={noise}:allf=t");
