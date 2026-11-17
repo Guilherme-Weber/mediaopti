@@ -492,9 +492,9 @@ pub(super) fn packet_timing(listing: &str) -> Option<(u64, f64)> {
 }
 
 /// What a new version of a video lost compared with the original, if anything: audio
-/// tracks, subtitles, attachments, cover pictures, chapters, or more than a second (or 1%)
-/// of its length. Only shorter counts: old containers (TS, AVI) often declare a wrong length,
-/// and the new one states the real one.
+/// tracks, subtitles, attachments, cover pictures, chapters, or more than a second of its
+/// length (1% when the original's container only estimates it: TS, AVI...). Only shorter
+/// counts: old containers often declare a wrong length, and the new one states the real one.
 pub(super) fn streams_lost(before: &args::Streams, after: &args::Streams) -> Option<String> {
     let mut lost = Vec::new();
     for (what, b, a) in [
@@ -539,8 +539,11 @@ pub(super) fn streams_lost(before: &args::Streams, after: &args::Streams) -> Opt
     if !missing.is_empty() {
         lost.push(format!("its tags ({})", missing.join(", ")));
     }
+    // A second of slack (audio priming, the last frame's duration); 1% when the original's
+    // length was only its container's estimate.
+    let slack = |b: f64| if before.duration_is_estimate { (b * 0.01).max(1.0) } else { 1.0 };
     match (before.duration, after.duration) {
-        (Some(b), Some(a)) if b - a > (b * 0.01).max(1.0) => lost.push(format!("its length ({b:.1} s -> {a:.1} s)")),
+        (Some(b), Some(a)) if b - a > slack(b) => lost.push(format!("its length ({b:.1} s -> {a:.1} s)")),
         (Some(_), None) => lost.push("its length (unreadable)".into()),
         _ => {}
     }
@@ -667,8 +670,15 @@ mod tests {
         assert_eq!(super::streams_lost(&before, &before), None);
         let longer = Streams { audio: 3, duration: Some(900.0), ..before.clone() };
         assert_eq!(super::streams_lost(&before, &longer), None, "more is fine");
-        let close = Streams { duration: Some(595.0), ..before.clone() };
-        assert_eq!(super::streams_lost(&before, &close), None, "within 1%");
+        let close = Streams { duration: Some(599.5), ..before.clone() };
+        assert_eq!(super::streams_lost(&before, &close), None, "within a second");
+        // A two-hour film cut 70 s short: lost, unless the original's length was only an
+        // estimate (TS, AVI... headers), where 1% is allowed.
+        let film = Streams { duration: Some(7200.0), ..before.clone() };
+        let cut = Streams { duration: Some(7130.0), ..before.clone() };
+        assert!(super::streams_lost(&film, &cut).unwrap().contains("7200.0 s -> 7130.0 s"));
+        let ts = Streams { duration_is_estimate: true, ..film };
+        assert_eq!(super::streams_lost(&ts, &cut), None, "within 1% of an estimate");
         let after = Streams { audio: 1, subtitles: vec![], chapters: 0, duration: Some(500.0), ..before.clone() };
         let why = super::streams_lost(&before, &after).unwrap();
         assert!(why.contains("1 of 2 audio tracks") && why.contains("1 of 1 subtitles") && why.contains("3 of 3 chapters") && why.contains("600.0 s -> 500.0 s"), "{why}");

@@ -89,6 +89,9 @@ pub struct Streams {
     pub chapters: usize,
     /// Container duration in seconds.
     pub duration: Option<f64>,
+    /// The duration comes from a container whose header only estimates it (MPEG-TS/PS, AVI,
+    /// FLV, ASF/WMV): a new version may differ from it by up to 1%.
+    pub duration_is_estimate: bool,
     /// Data tracks by tag (`tmcd` timecode, `qtvr`, `gpmd` telemetry...).
     pub data: Vec<String>,
     /// HDR transfer (PQ or HLG) on the main picture.
@@ -162,6 +165,9 @@ impl Streams {
             let line = raw.trim();
             if line.starts_with("Input #0") {
                 in_tags = true;
+                // "Input #0, mpegts, from 'x.ts':" names the demuxer.
+                let format = line.split(", from").next().unwrap_or_default();
+                s.duration_is_estimate = ["mpegts", "mpeg", "avi", "flv", "asf"].iter().any(|f| format.split([',', ' ']).any(|w| w == *f));
                 continue;
             }
             if in_tags && !line.starts_with("Duration: ") {
@@ -878,6 +884,10 @@ mod tests {
         assert_eq!(s.subtitles, ["subrip", "hdmv_pgs_subtitle"]);
         assert_eq!((s.attachments, s.covers.clone(), s.chapters), (1, vec![6], 2));
         assert!(s.duration.is_some_and(|d| (d - 62.5).abs() < 1e-9));
+        assert!(!s.duration_is_estimate, "Matroska states its length");
+        assert!(Streams::parse("Input #0, mpegts, from 'a.ts':\n  Duration: 00:01:00.00").duration_is_estimate);
+        assert!(Streams::parse("Input #0, avi, from 'a.avi':\n  Duration: 00:01:00.00").duration_is_estimate);
+        assert!(!Streams::parse("Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'a.mp4':\n  Duration: 00:01:00.00").duration_is_estimate);
         assert!(!s.fits_mp4());
         let mp4 = Streams { subtitles: vec!["mov_text".into()], audio: 3, ..Streams::default() };
         assert!(mp4.fits_mp4());
