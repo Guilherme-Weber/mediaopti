@@ -30,14 +30,18 @@ if ($latest -and $latest -ne $optivorbis) {
     Write-Host "OptiVorbis: $optivorbis -> $latest (fetch-tools.ps1 and package.ps1)" -ForegroundColor Yellow
     $outdated++
 }
-# cjpegli stays at libjxl 0.11.2, the last libjxl release that includes it; jpegli
-# (github.com/google/jpegli) publishes no releases. Report it if that changes.
+# cjpegli is built from google/jpegli (scripts/build-jpegli.ps1): new commits on its main branch?
+$versionsFile = Join-Path (Join-Path $root 'bin') 'versions.json'
+$built = if (Test-Path $versionsFile) { (Get-Content $versionsFile -Raw | ConvertFrom-Json).cjpegli } else { $null }
 try {
-    $jpegli = Invoke-RestMethod 'https://api.github.com/repos/google/jpegli/releases' -Headers @{ 'User-Agent' = 'mediaopti-check' }
-    if (@($jpegli).Count -gt 0) {
-        Write-Host "jpegli now publishes releases ($(@($jpegli)[0].tag_name)): cjpegli could come from there" -ForegroundColor Yellow
+    $head = Invoke-RestMethod 'https://api.github.com/repos/google/jpegli/commits/main' -Headers @{ 'User-Agent' = 'mediaopti-check' }
+    $sha = $head.sha.Substring(0, 8)
+    if (-not $built -or $built -notmatch $sha) {
+        Write-Host "jpegli: built $built, main is $sha ($($head.commit.committer.date.ToString().Substring(0, 10))) - check its commits, then scripts/build-jpegli.ps1" -ForegroundColor Yellow
         $outdated++
     }
+    $releases = Invoke-RestMethod 'https://api.github.com/repos/google/jpegli/releases' -Headers @{ 'User-Agent' = 'mediaopti-check' }
+    if (@($releases).Count -gt 0) { Write-Host "jpegli now publishes releases ($(@($releases)[0].tag_name)): a build could be pinned to one" -ForegroundColor Yellow }
 } catch {}
 
 # FFmpeg (gyan.dev essentials build, fetch-ffmpeg.ps1).

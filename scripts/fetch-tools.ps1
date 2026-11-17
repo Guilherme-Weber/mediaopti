@@ -44,9 +44,13 @@ function Get-FromZip([string]$Url, [string[]]$Names) {
     finally { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
-Write-Host "Downloading cjpegli (libjxl 0.11.2, GitHub) ..."
-# cjpegli: libjxl 0.11.2 is the last release that includes it (jpegli has no releases yet).
-Get-FromZip 'https://github.com/libjxl/libjxl/releases/download/v0.11.2/jxl-x64-windows-static.zip' @('cjpegli.exe')
+# cjpegli: the release uses one built from google/jpegli (scripts/build-jpegli.ps1; jpegli
+# publishes no releases). Without a build, libjxl 0.11.2's (the last libjxl release with it,
+# same results) is downloaded; an existing one is kept.
+if (-not (Test-Path (Join-Path $Dest 'cjpegli.exe'))) {
+    Write-Host "Downloading cjpegli (libjxl 0.11.2, GitHub) ..."
+    Get-FromZip 'https://github.com/libjxl/libjxl/releases/download/v0.11.2/jxl-x64-windows-static.zip' @('cjpegli.exe')
+}
 
 Write-Host "Downloading OptiVorbis 0.3.2 (GitHub) ..."
 Get-FromZip 'https://github.com/OptiVorbis/OptiVorbis/releases/download/v0.3.2/OptiVorbis.CLI.x86_64-pc-windows-gnu.zip' @('optivorbis.exe')

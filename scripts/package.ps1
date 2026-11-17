@@ -37,6 +37,14 @@ Copy-Item (Join-Path $root 'LICENSE') $stage
 if (-not $NoTools) {
     $scoop = Join-Path $env:USERPROFILE 'scoop\apps'
     $bin = Join-Path $root 'bin'
+    # cjpegli's version as scripts/build-jpegli.ps1 recorded it; without a build it is libjxl
+    # 0.11.2's (fetch-tools.ps1).
+    $jpegliVersion = 'libjxl 0.11.2'
+    $binVersions = Join-Path $bin 'versions.json'
+    if (Test-Path $binVersions) {
+        $recorded = (Get-Content $binVersions -Raw | ConvertFrom-Json).cjpegli
+        if ($recorded) { $jpegliVersion = $recorded }
+    }
     # folder, licence, source, then (source file, packaged name) pairs; paths relative to the
     # Scoop app's "current" folder, or "bin:" for the project's bin folder.
     $tools = @(
@@ -46,7 +54,10 @@ if (-not $NoTools) {
            files = @('cjpeg-static.exe=cjpeg.exe', 'djpeg-static.exe=djpeg.exe', 'jpegtran-static.exe=jpegtran.exe') },
         @{ dir = 'gifsicle'; app = 'gifsicle'; licence = 'GPL-2.0'; src = 'https://github.com/kohler/gifsicle'; files = @('gifsicle.exe') },
         @{ dir = 'libjxl'; app = 'libjxl'; licence = 'BSD-3-Clause'; src = 'https://github.com/libjxl/libjxl'
-           files = @('bin\ssimulacra2.exe=ssimulacra2.exe', 'bin:cjpegli.exe=cjpegli.exe', 'licenses\LICENSE.libjxl=LICENSE.txt') },
+           files = @('bin\ssimulacra2.exe=ssimulacra2.exe', 'licenses\LICENSE.libjxl=LICENSE.txt') },
+        # Built from google/jpegli by scripts/build-jpegli.ps1 (version in binersions.json).
+        @{ dir = 'jpegli'; app = $null; version = $jpegliVersion; licence = 'BSD-3-Clause'; src = 'https://github.com/google/jpegli'
+           files = @('bin:cjpegli.exe=cjpegli.exe', 'bin:jpegli-LICENSE.txt=LICENSE.txt') },
         @{ dir = 'flac'; app = 'flac'; licence = 'GPL-2.0 (flac tool), BSD-3-Clause (libFLAC)'; src = 'https://github.com/xiph/flac'; files = @('flac.exe', 'libFLAC.dll') },
         @{ dir = '7zip'; app = '7zip'; licence = 'LGPL-2.1 with the unRAR restriction'; src = 'https://www.7-zip.org'; files = @('7z.exe', '7z.dll', 'License.txt') },
         @{ dir = 'qpdf'; app = 'qpdf'; licence = 'Apache-2.0'; src = 'https://github.com/qpdf/qpdf'; files = @('bin\*.dll', 'bin\qpdf.exe=qpdf.exe') },
@@ -57,8 +68,6 @@ if (-not $NoTools) {
                 'pingo and beeim (css-ig.net) are not included: they may not be redistributed.', '')
     # Each packaged program's version, for the About page (some print none themselves).
     $versions = [ordered]@{}
-    # cjpegli comes from libjxl 0.11.2, the last release that includes it (fetch-tools.ps1).
-    $cjpegliVersion = '0.11.2'
     foreach ($t in $tools) {
         $to = Join-Path $stage "tools\$($t.dir)"
         New-Item -ItemType Directory -Force $to | Out-Null
@@ -79,13 +88,11 @@ if (-not $NoTools) {
                 Copy-Item $i.FullName $target
                 if ($target.EndsWith('.exe')) {
                     $exe = [IO.Path]::GetFileNameWithoutExtension($target)
-                    $versions[$exe] = if ($exe -eq 'cjpegli') { $cjpegliVersion } else { $tv }
+                    $versions[$exe] = $tv
                 }
             }
         }
-        $line = "$($t.dir) $tv - $($t.licence) - $($t.src)"
-        if ($t.dir -eq 'libjxl') { $line += " (cjpegli $cjpegliVersion, the last libjxl release that includes it)" }
-        $notice += $line
+        $notice += "$($t.dir) $tv - $($t.licence) - $($t.src)"
     }
     $notice += 'FFmpeg (ffmpeg.exe) - see ffmpeg-LICENSE.txt - https://ffmpeg.org'
     $notice | Set-Content (Join-Path $stage 'THIRD-PARTY.txt') -Encoding utf8
