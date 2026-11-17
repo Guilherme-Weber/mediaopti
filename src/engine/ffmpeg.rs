@@ -50,16 +50,19 @@ pub(super) fn spawn_failure(err: &std::io::Error, diag: &mut Diagnostics) -> Att
 }
 
 /// Finds the ffmpeg binary: next to the executable (release zip), in the project's `bin/`
-/// folder (development), otherwise on PATH.
+/// folder (tests and debug builds only), otherwise on PATH.
 pub fn locate_ffmpeg() -> PathBuf {
     let exe_name = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
     let beside_exe = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join(exe_name)));
-    let dev_copy = Path::new(env!("CARGO_MANIFEST_DIR")).join("bin").join(exe_name);
+    #[cfg(any(test, debug_assertions))]
+    let dev_copy = Some(Path::new(env!("CARGO_MANIFEST_DIR")).join("bin").join(exe_name));
+    #[cfg(not(any(test, debug_assertions)))]
+    let dev_copy: Option<PathBuf> = None;
     beside_exe
         .into_iter()
-        .chain(std::iter::once(dev_copy))
+        .chain(dev_copy)
         .find(|p| p.exists())
         .unwrap_or_else(|| PathBuf::from(exe_name))
 }

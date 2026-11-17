@@ -36,8 +36,8 @@ fn shim_target(exe: &Path) -> Option<PathBuf> {
 
 impl Tools {
     /// Looks each tool up in: `<data_dir>\tools.json` (`{"pingo": "C:\\...\\pingo.exe"}`),
-    /// a `tools` folder next to the executable, the project's `bin` folder (development),
-    /// then PATH.
+    /// a `tools` folder next to the executable, `<data_dir>\tools` (pingo and beeim, which
+    /// the app downloads), the project's `bin` folder (tests and debug builds only), then PATH.
     pub fn discover(ffmpeg: PathBuf, data_dir: &Path) -> Self {
         let overrides: HashMap<String, PathBuf> = std::fs::read_to_string(data_dir.join("tools.json"))
             .ok()
@@ -57,6 +57,9 @@ impl Tools {
         }
         // Tools downloaded by the app itself (pingo, beeim: see `download_missing`).
         dirs.push(data_dir.join("tools"));
+        // The checkout's bin folder, for tests and debug builds only: a release must find its
+        // tools the way users' installs do.
+        #[cfg(any(test, debug_assertions))]
         dirs.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("bin"));
         if let Some(path) = std::env::var_os("PATH") {
             dirs.extend(std::env::split_paths(&path));
