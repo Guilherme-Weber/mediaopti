@@ -1254,6 +1254,49 @@ fn wav_becomes_flac_only_when_safe() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A panic while processing one file (a bug, a malformed file nobody foresaw) fails that
+/// file only: the batch goes on and ends, its counters come back to zero, and the file is
+/// not remembered (tried again next run).
+#[test]
+fn a_panic_fails_only_its_own_file() {
+    let Some(ff) = ffmpeg() else {
+        eprintln!("skipping: bundled ffmpeg not found");
+        return;
+    };
+    let tools = crate::image::tools::Tools::discover(ff.clone(), &std::env::temp_dir());
+    if !tools.has("oxipng") {
+        eprintln!("skipping: oxipng not found");
+        return;
+    }
+    let root = test_dir("panic");
+    let media = root.join("media");
+    std::fs::create_dir_all(&media).unwrap();
+    for name in ["panic-me.png", "fine.png"] {
+        make(&ff, &["-f", "lavfi", "-i", "testsrc=s=200x150", "-frames:v", "1", "-compression_level", "0"], &media.join(name));
+    }
+    lossless_video(&ff, 2, "320x240", &media.join("panic-me-too.mp4"));
+    lossless_video(&ff, 2, "320x240", &media.join("fine.mp4"));
+    crate::system::PANIC_ON.lock().unwrap().extend(["panic-me.png".to_string(), "panic-me-too.mp4".to_string()]);
+
+    let rt = runtime();
+    let (engine, rec) = new_engine(&rt, &root, ff);
+    let raw = || RawOptions { images: Some(1), ..opts("libx264", 1.0) };
+    let finished = rt.block_on(async {
+        engine.apply_options(raw());
+        engine.load_dir(media.clone()).await;
+        tokio::time::timeout(Duration::from_secs(300), engine.clone().run_batch(raw())).await.is_ok()
+    });
+    let logs = rec.logs.lock().unwrap().join("\n");
+    assert!(finished, "the batch must end\n{logs}");
+    assert_eq!(logs.matches("internal error").count(), 2, "{logs}");
+    let s = engine.snapshot();
+    assert_eq!((s.failed_this_run, s.completed_this_run), (2, 4), "{logs}");
+    // The two that panicked are still to do; the others are done.
+    rt.block_on(engine.load_dir(media));
+    assert_eq!(engine.snapshot().pending_files, 2, "{logs}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Tools that can't start (quarantined by an antivirus, a missing DLL) are not the files'
 /// fault: the files are not remembered as broken, and after a run of such failures the
 /// remaining CPU files are left for the next run instead of all failing.

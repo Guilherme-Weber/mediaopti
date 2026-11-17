@@ -342,12 +342,14 @@ impl Engine {
         self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Runs blocking disk work off the async worker threads.
+    /// Runs blocking disk work off the async worker threads. A panic in `f` goes on in the
+    /// caller, with its own message (a video job's panic then fails that file only).
     async fn blocking<T: Send + 'static>(&self, f: impl FnOnce() -> T + Send + 'static) -> T {
-        self.rt
-            .spawn_blocking(f)
-            .await
-            .expect("blocking file task panicked")
+        match self.rt.spawn_blocking(f).await {
+            Ok(v) => v,
+            Err(err) if err.is_panic() => std::panic::resume_unwind(err.into_panic()),
+            Err(err) => panic!("blocking file task ended: {err}"),
+        }
     }
 
     pub fn log(&self, message: impl Into<String>) {

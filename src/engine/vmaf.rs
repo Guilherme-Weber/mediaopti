@@ -430,10 +430,10 @@ impl Engine {
 
 /// Counts a process in `running_processes` while it lives, so encoder admission and the
 /// out-of-memory retry see it.
-struct RunningProcess<'a>(&'a Engine);
+pub(super) struct RunningProcess<'a>(&'a Engine);
 
 impl<'a> RunningProcess<'a> {
-    fn new(engine: &'a Engine) -> Self {
+    pub(super) fn new(engine: &'a Engine) -> Self {
         engine.lock().running_processes += 1;
         Self(engine)
     }

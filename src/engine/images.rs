@@ -304,14 +304,14 @@ impl Engine {
                     if ctx2.slots.as_ref().is_some_and(|s| !s.acquire(&ctx2.gate)) {
                         return ImageResult::Stopped;
                     }
-                    let mut r = process_image(ctx2, &p2, worker_id, &disposal, &opts);
+                    let mut r = isolated(|| process_image(ctx2, &p2, worker_id, &disposal, &opts));
                     // Out of memory: wait for memory and try the file again (twice at most).
                     for _ in 0..2 {
                         if !matches!(r, ImageResult::OutOfMemory) || !wait_for_job_memory(&ctx2.gate) {
                             break;
                         }
                         ctx2.gate.short_of_memory.store(false, std::sync::atomic::Ordering::Relaxed);
-                        r = process_image(ctx2, &p2, worker_id, &disposal, &opts);
+                        r = isolated(|| process_image(ctx2, &p2, worker_id, &disposal, &opts));
                     }
                     if let Some(s) = &ctx2.slots {
                         s.release(1);
@@ -465,6 +465,23 @@ impl Engine {
         }
         self.send_state(false);
     }
+}
+
+/// Runs one CPU job so that a panic in it (a bug, a malformed file nobody foresaw) fails that
+/// file only, not remembered: the worker, its CPU slot and the counters carry on as for any
+/// failure.
+fn isolated(job: impl FnOnce() -> ImageResult) -> ImageResult {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
+        .unwrap_or_else(|payload| ImageResult::Failed(format!("internal error: {}", panic_text(payload.as_ref()))))
+}
+
+/// A panic's message.
+pub(super) fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(ToString::to_string)
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".into())
 }
 
 /// CPU files in a row whose tools could not run before the rest of the CPU queue is left for
@@ -632,6 +649,7 @@ fn same_content(ctx: &image::Ctx, kind: image::Kind, src: &Path, existing: &Path
 /// with the same content, the smaller of the two is kept (the other and the original go
 /// as `disposal` says), else the new file gets a number ("a (2).png"). Blocking.
 pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, disposal: &system::Disposal, opts: &JobOpts) -> ImageResult {
+    system::panic_here_in_tests(path);
     static NEXT_JOB: AtomicU64 = AtomicU64::new(0);
     let Some(named) = image::kind_of(path) else {
         return ImageResult::Skipped("not an image".into());

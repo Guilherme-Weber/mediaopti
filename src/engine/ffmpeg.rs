@@ -145,7 +145,8 @@ impl Engine {
             }
         };
         system::assign_to_kill_on_exit_job(&child);
-        self.lock().running_processes += 1;
+        // Counted until it exits, also on the way out of a panic.
+        let running = super::vmaf::RunningProcess::new(self);
 
         // Give the new encoder time to allocate before the next one checks memory, unless
         // memory is plentiful. The hold ends early at the first progress line (buffers are
@@ -262,7 +263,7 @@ impl Engine {
 
         warmup_done.cancel();
         let exit = child.wait().await;
-        self.lock().running_processes -= 1;
+        drop(running);
 
         let status = if killed_for_stop || self.lock().stop_requested {
             AttemptStatus::Stopped

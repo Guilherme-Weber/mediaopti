@@ -86,6 +86,24 @@ mod job {
     }
 }
 
+/// Files whose job panics on purpose (test builds only): see [`panic_here_in_tests`].
+#[cfg(test)]
+pub static PANIC_ON: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Panic tests: a job panics at its start when its file's name is in `PANIC_ON` (test
+/// builds only).
+pub fn panic_here_in_tests(file: &Path) {
+    #[cfg(test)]
+    {
+        let names = PANIC_ON.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if file.file_name().is_some_and(|n| names.iter().any(|p| n == p.as_str())) {
+            panic!("test panic on {}", file.display());
+        }
+    }
+    #[cfg(not(test))]
+    let _ = file;
+}
+
 /// Crash tests: MEDIAOPTI_DIE_AT=<point> ends the process at that point of a replacement,
 /// like a forced quit or a power cut would (test builds only).
 pub fn die_here_in_tests(point: &str) {

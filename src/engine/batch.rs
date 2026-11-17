@@ -163,7 +163,8 @@ impl Engine {
                 next
             };
             if let Some((name, handle)) = next {
-                // A worker that panicked must not vanish silently (release builds abort instead).
+                // A worker that panicked must not vanish silently. (A panic in one file's job
+                // fails that file and the worker goes on; this catches one outside a job.)
                 if let Err(err) = handle.await {
                     self.log(format!("[{name}] stopped unexpectedly: {err}"));
                 }

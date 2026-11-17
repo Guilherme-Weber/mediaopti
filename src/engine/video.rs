@@ -3,7 +3,7 @@
 use super::*;
 
 /// Counts a video job as completed when dropped (every way out of `process_one` after its
-/// encode), unless disarmed.
+/// encode), unless disarmed. A job that panicked is counted by `job_panicked` instead.
 struct Completion<'a> {
     engine: &'a Engine,
     armed: bool,
@@ -11,7 +11,7 @@ struct Completion<'a> {
 
 impl Drop for Completion<'_> {
     fn drop(&mut self) {
-        if self.armed {
+        if self.armed && !std::thread::panicking() {
             self.engine.lock().run.completed += 1;
         }
     }
@@ -67,6 +67,44 @@ impl Engine {
         let Some((display, input)) = claimed else {
             return Outcome::Empty;
         };
+        // The job runs as a task of its own: a panic in it (a bug, a malformed file nobody
+        // foresaw) fails this file only, instead of ending the worker with its bookkeeping
+        // half done.
+        let job = {
+            let (engine, input, display) = (Arc::clone(self), input.clone(), display.clone());
+            tokio::spawn(async move { engine.process_claimed(worker_id, input, display).await })
+        };
+        match job.await {
+            Ok(outcome) => outcome,
+            Err(err) if err.is_panic() => {
+                let why = super::images::panic_text(err.into_panic().as_ref());
+                self.job_panicked(worker_id, &input, &display, &why);
+                Outcome::Failed
+            }
+            Err(_) => Outcome::Stopped,
+        }
+    }
+
+    /// What a video job that panicked leaves behind: its file is no longer in progress and
+    /// counts as failed, not remembered (tried again next run). Its temp file, if any, is a
+    /// leftover the next scan removes (its original is in place).
+    fn job_panicked(self: &Arc<Self>, worker_id: u32, input: &Path, display: &str, why: &str) {
+        {
+            let mut inner = self.lock();
+            inner.in_progress.remove(input);
+            inner.workers.remove(&worker_id);
+            inner.job_streams.remove(input);
+            inner.failed.insert(input.to_path_buf());
+            inner.run.failed += 1;
+            inner.run.completed += 1;
+        }
+        self.log(format!("[Worker {worker_id}] Failed on {display}: internal error: {why}; left as it was (tried again next run)"));
+        self.send_state(true);
+    }
+
+    /// One claimed video, from its checks to its replacement.
+    async fn process_claimed(self: &Arc<Self>, worker_id: u32, input: PathBuf, display: String) -> Outcome {
+        system::panic_here_in_tests(&input);
 
         // Size and date now, to notice if the file changes while it is being encoded
         // (still downloading, edited, synced). Also leave hard-linked files alone:

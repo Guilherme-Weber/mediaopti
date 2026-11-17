@@ -1,7 +1,7 @@
 //! Persistent diagnostics in %APPDATA%\mediaopti\logs:
 //! - `mediaopti.log`: the activity log, rotated to `mediaopti.1.log` at 5 MB;
-//! - `crash-<timestamp>.txt`: written by the panic hook before the process aborts
-//!   (release builds have no console, so this is the only trace of a crash).
+//! - `crash-<timestamp>.txt`: written by the panic hook for any panic (release builds have no
+//!   console, so this is the only trace of one). A panic in a file's job fails that file only.
 
 use crate::system;
 use std::fs::{self, File, OpenOptions};
@@ -54,7 +54,8 @@ impl FileLog {
     }
 }
 
-/// Writes a crash report for any panic, then lets the default hook run.
+/// Writes a report for any panic, then lets the default hook run. A panic in a file's job
+/// only fails that file (the app goes on); the report is there to find the bug.
 pub fn install_panic_hook(dir: PathBuf) {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -62,7 +63,7 @@ pub fn install_panic_hook(dir: PathBuf) {
         let path = dir.join(format!("crash-{}.txt", system::local_timestamp_compact()));
         let thread = std::thread::current();
         let report = format!(
-            "mediaopti {} crashed at {}\r\nthread: {}\r\n{info}\r\n\r\nbacktrace:\r\n{}\r\n",
+            "mediaopti {}: internal error (panic) at {}\r\nthread: {}\r\n{info}\r\n\r\nbacktrace:\r\n{}\r\n",
             env!("CARGO_PKG_VERSION"),
             system::local_datetime(),
             thread.name().unwrap_or("unnamed"),

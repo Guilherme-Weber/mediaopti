@@ -48,5 +48,8 @@ winresource = "0.1.34"
 codegen-units = 1
 lto = true
 opt-level = 3
-panic = "abort"
+# Unwind (the default), not abort: a panic in one file's job fails that file only
+# (engine::images::isolated, the video job's own task), and never kills the app with its
+# NVENC encoders.
+panic = "unwind"
 strip = true
