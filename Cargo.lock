@@ -2563,7 +2563,7 @@ dependencies = [
  "tokio-util",
  "walkdir",
  "windows",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
  "winresource",
  "zip",
 ]
