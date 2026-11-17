@@ -633,6 +633,11 @@ pub fn replace_file_with_retry(
     original: &Path,
     disposal: &Disposal,
 ) -> std::io::Result<()> {
+    // Checked before the original is touched: with the new version gone, setting the original
+    // aside would leave nothing at its name.
+    if !tmp.is_file() {
+        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("the new version {} is missing", tmp.display())));
+    }
     const MAX_ATTEMPTS: u64 = 6;
     let mut attempt = 1;
     let mut set_aside = false;
@@ -657,14 +662,10 @@ pub fn replace_file_with_retry(
             if final_target != original {
                 clear_readonly(final_target);
             }
-            if let Err(err) = fs::rename(tmp, final_target) {
-                if err.kind() == std::io::ErrorKind::PermissionDenied {
-                    fs::copy(tmp, final_target)?;
-                    fs::remove_file(tmp)?;
-                } else {
-                    return Err(err);
-                }
-            }
+            // Only ever a rename: a failed one (the target held open by another program) is
+            // retried, never replaced by copying over the target, which would rewrite it in
+            // place and could leave it half-written with the temp already gone.
+            fs::rename(tmp, final_target)?;
             if final_target != original && *disposal == Disposal::Delete {
                 let _ = remove_file_if_exists(original);
             }
@@ -923,6 +924,45 @@ mod tests {
         }
         assert_eq!(fs::read_to_string(&backup).unwrap(), "original 1");
         assert_eq!(fs::read_to_string(backup.with_file_name("clip (2).mp4")).unwrap(), "original 2");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An original held open by another program (no delete sharing) can't be renamed over:
+    /// the replacement fails and the original stays whole, never rewritten in place.
+    #[cfg(windows)]
+    #[test]
+    fn an_original_held_open_is_never_rewritten_in_place() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = std::env::temp_dir().join(format!("mo-held-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (orig, tmp) = (dir.join("photo.png"), dir.join("photo.mediaopti.i1.png"));
+        fs::write(&orig, b"original").unwrap();
+        fs::write(&tmp, b"new").unwrap();
+        const FILE_SHARE_READ: u32 = 1;
+        const FILE_SHARE_WRITE: u32 = 2;
+        let viewer = fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE).open(&orig).unwrap();
+        assert!(replace_file_with_retry(&tmp, &orig, &orig, &Disposal::Delete).is_err());
+        drop(viewer);
+        assert_eq!(fs::read(&orig).unwrap(), b"original");
+        assert_eq!(fs::read(&tmp).unwrap(), b"new", "the new version is kept for a later run");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// With the new version gone (removed by something else), the original is not set aside:
+    /// it stays at its name.
+    #[test]
+    fn a_missing_new_version_leaves_the_original_in_place() {
+        let dir = std::env::temp_dir().join(format!("mo-missing-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let orig = dir.join("clip.mp4");
+        fs::write(&orig, b"original").unwrap();
+        let backup = dir.join("backup").join("clip.mp4");
+        let result = replace_file_with_retry(&dir.join("clip.mediaopti.w1.mp4"), &orig, &orig, &Disposal::MoveTo(backup.clone()));
+        assert!(result.is_err());
+        assert_eq!(fs::read(&orig).unwrap(), b"original");
+        assert!(!backup.exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
