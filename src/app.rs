@@ -197,9 +197,10 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
         window.on_toggle_part(move |index| {
             let Some(w) = weak.upgrade() else { return };
             let parts = w.get_adv_parts();
-            let Some(mut part) = parts.row_data(index.max(0) as usize) else { return };
+            let Ok(index) = usize::try_from(index) else { return };
+            let Some(mut part) = parts.row_data(index) else { return };
             part.on = !part.on;
-            parts.set_row_data(index as usize, part);
+            parts.set_row_data(index, part);
             save_advanced(&w, &engine, &prefs_path);
         });
     }

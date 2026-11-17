@@ -4,6 +4,8 @@ version = "3.0.12"
 description = "Batch media optimizer: videos, images, audio and documents"
 license = "MIT"
 edition = "2021"
+# The toolchain it is built and tested with (no older one is checked).
+rust-version = "1.99"
 
 [dependencies]
 blake2 = "0.10"
