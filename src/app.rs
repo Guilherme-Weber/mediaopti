@@ -1015,11 +1015,11 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
     }
     {
         let engine = engine.clone();
-        window.on_stop(move || engine.stop());
+        window.on_stop(move || engine.in_background(Engine::stop));
     }
     {
         let engine = engine.clone();
-        window.on_toggle_pause(move || engine.toggle_pause());
+        window.on_toggle_pause(move || engine.in_background(Engine::toggle_pause));
     }
     {
         let engine = engine.clone();
@@ -1038,7 +1038,7 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
                 .show()
                 == rfd::MessageDialogResult::Yes;
             if confirmed {
-                engine.clear_history();
+                engine.in_background(Engine::clear_history);
             }
         });
     }
@@ -1054,7 +1054,7 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
     }
     {
         let engine = engine.clone();
-        window.on_clear_queue(move || engine.clear_queue());
+        window.on_clear_queue(move || engine.in_background(Engine::clear_queue));
     }
     {
         let dir = data_dir.to_path_buf();

@@ -414,6 +414,14 @@ impl Engine {
         *self.image_tools.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = found;
     }
 
+    /// Runs an action of the window's off its thread: it may wait for the engine's lock while
+    /// a long step holds it (a queue rebuild over a library of a million files takes most of
+    /// a second), and the window must stay responsive meanwhile.
+    pub fn in_background(self: &Arc<Self>, action: impl FnOnce(&Arc<Self>) + Send + 'static) {
+        let engine = Arc::clone(self);
+        self.rt.spawn_blocking(move || action(&engine));
+    }
+
     pub fn data_dir(&self) -> &std::path::Path {
         &self.data_dir
     }
