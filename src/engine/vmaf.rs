@@ -19,6 +19,52 @@ pub(super) enum Retry {
 /// Stop was pressed during a measurement.
 pub(super) struct Stopped;
 
+/// What a video job had finished when Pause ended it (Pause stops every process to free
+/// memory). On Resume the job carries on from there, taking the same decisions, so its
+/// result is the one an uninterrupted run gives; only the step in progress is redone.
+#[derive(Debug, Default)]
+pub(super) struct VideoResume {
+    /// The settings it was made with (`resume_key`): changed while paused, it is dropped.
+    pub(super) settings: String,
+    /// The preset encode was done and not smaller: its size, the input's duration, the
+    /// mode and GPU decoding it used (the quality retry reuses them).
+    pub(super) primary: Option<PrimaryDone>,
+    /// Quality-retry steps done, by CQ boost.
+    pub(super) steps: std::collections::BTreeMap<u32, Step>,
+    /// The best passing step so far: its boost and its output, parked.
+    pub(super) keep: Option<(u32, PathBuf)>,
+}
+
+/// The preset encode's size, the input's duration, its mode and GPU decoding.
+pub(super) type PrimaryDone = (f64, f64, Mode, Option<(u32, u32)>);
+
+#[derive(Debug, Clone)]
+pub(super) enum Step {
+    Failed,
+    /// Encoded, not smaller enough: its size.
+    Size(f64),
+    /// Encoded (output parked), not measured yet.
+    Encoded(f64, PathBuf),
+    Measured(f64, Result<(f64, f64), String>),
+}
+
+impl VideoResume {
+    /// Removes its parked files (dropped, or the batch ended without resuming it).
+    pub(super) fn discard(&self) {
+        for p in self.keep.iter().map(|(_, p)| p).chain(self.steps.values().filter_map(|s| match s {
+            Step::Encoded(_, p) => Some(p),
+            _ => None,
+        })) {
+            let _ = system::remove_file_if_exists(p);
+        }
+    }
+}
+
+/// The settings a video's result depends on.
+pub(super) fn resume_key(o: &Options) -> String {
+    format!("{}|{}|{}|{:?}", o.encoder, o.crf, o.preset, o.vmaf_floor)
+}
+
 /// Per-frame VMAF scores from a libvmaf JSON log.
 pub(super) fn vmaf_frame_scores(json: &str) -> Option<Vec<f64>> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
@@ -57,10 +103,12 @@ impl Engine {
         tmp: &Path,
         display: &str,
         mode: Mode,
+        gpu_decode: Option<(u32, u32)>,
         in_size: f64,
         out_size: f64,
         duration_sec: f64,
         floor: f64,
+        memo: &mut VideoResume,
     ) -> Retry {
         const STEPS: [u32; 4] = [4, 8, 12, 16];
         const SHRINK_PER_STEP: f64 = 0.72;
@@ -77,6 +125,10 @@ impl Engine {
         ));
         // The best passing output is parked under another temp name while stronger steps run.
         let keep = args::temp_name(input, worker_id + 1000);
+        // Parked outputs while paused: named after the file, not the worker (another worker
+        // may resume it).
+        let (park_keep, park_encoded) = (args::temp_name(input, 7000), args::temp_name(input, 7001));
+        let parked_keep = memo.keep.take();
         let mut best: Option<(u32, f64, f64)> = None;
         let mut tried = [false; STEPS.len()];
         let mut stepped_back = false;
@@ -99,23 +151,44 @@ impl Engine {
             let boost = STEPS[k];
             tried[k] = true;
             self.log_remove(tmp);
-            self.reset_worker(worker_id, display, &format!("quality retry +{boost}"));
-            let attempt = self.run_attempt(worker_id, input, tmp, display, mode, boost).await;
-            match attempt.status {
-                AttemptStatus::Stopped => {
-                    self.log_remove(&keep);
-                    return Retry::Stopped;
-                }
-                AttemptStatus::Exited(0) => {}
-                _ => {
+            let done = memo.steps.get(&boost).cloned();
+            let size = match &done {
+                Some(Step::Failed) => {
                     notes.push(format!("the +{boost} encode failed"));
-                    self.log_remove(tmp);
                     return finish(self, best, &notes).await;
                 }
-            }
-            let t = tmp.to_path_buf();
-            let size = self.blocking(move || std::fs::metadata(t).map_or(f64::MAX, |m| m.len() as f64)).await;
+                Some(Step::Size(s) | Step::Measured(s, _)) => *s,
+                Some(Step::Encoded(s, parked)) => {
+                    let (from, to) = (parked.clone(), tmp.to_path_buf());
+                    if self.blocking(move || std::fs::rename(from, to)).await.is_err() {
+                        notes.push(format!("the +{boost} output kept during the pause is gone"));
+                        return finish(self, best, &notes).await;
+                    }
+                    self.log(format!("[Worker {worker_id}] {display}: the +{boost} encode was done before the pause; measuring it"));
+                    *s
+                }
+                None => {
+                    self.reset_worker(worker_id, display, &format!("quality retry +{boost}"));
+                    let attempt = self.encode(worker_id, input, tmp, display, mode, boost, gpu_decode).await;
+                    match attempt.status {
+                        AttemptStatus::Stopped => {
+                            self.park(&keep, &park_keep, best.map(|b| b.0), memo).await;
+                            return Retry::Stopped;
+                        }
+                        AttemptStatus::Exited(0) => {}
+                        _ => {
+                            memo.steps.insert(boost, Step::Failed);
+                            notes.push(format!("the +{boost} encode failed"));
+                            self.log_remove(tmp);
+                            return finish(self, best, &notes).await;
+                        }
+                    }
+                    let t = tmp.to_path_buf();
+                    self.blocking(move || std::fs::metadata(t).map_or(f64::MAX, |m| m.len() as f64)).await
+                }
+            };
             if size >= in_size * 0.99 {
+                memo.steps.insert(boost, Step::Size(size));
                 notes.push(format!("+{boost}: still {:.0}% of the original", size / in_size * 100.0));
                 self.log_remove(tmp);
                 if best.is_none() && !stepped_back && k + 1 < STEPS.len() && !tried[k + 1] {
@@ -124,20 +197,25 @@ impl Engine {
                 }
                 return finish(self, best, &notes).await;
             }
-            self.reset_worker(worker_id, display, &format!("measuring quality at +{boost}"));
-            self.send_state(false);
-            let mut measured = match self.measure_vmaf(input, tmp, duration_sec, None).await {
-                Err(Stopped) => {
-                    self.log_remove(&keep);
-                    return Retry::Stopped;
+            let mut measured = if let Some(Step::Measured(_, m)) = &done {
+                m.clone()
+            } else {
+                self.reset_worker(worker_id, display, &format!("measuring quality at +{boost}"));
+                self.send_state(false);
+                match self.measure_vmaf(input, tmp, duration_sec, None).await {
+                    Err(Stopped) => {
+                        self.park_measuring(tmp, &park_encoded, boost, size, memo).await;
+                        self.park(&keep, &park_keep, best.map(|b| b.0), memo).await;
+                        return Retry::Stopped;
+                    }
+                    Ok(m) => m,
                 }
-                Ok(m) => m,
             };
             // libvmaf fails to allocate when memory is tight (parallel 4K encodes): wait for
             // free memory and measure once more on fewer threads.
             if measured.as_ref().is_err_and(|e| e.contains("alloc")) {
                 self.log(format!("[Worker {worker_id}] {display}: not enough memory to measure quality; waiting to retry"));
-                let cancel = self.lock().cancel.clone();
+                let cancel = self.lock().release.clone();
                 for _ in 0..60 {
                     if system::memory_status().is_none_or(|m| m.available_commit >= 4 << 30) {
                         break;
@@ -145,23 +223,36 @@ impl Engine {
                     tokio::select! {
                         _ = tokio::time::sleep(Duration::from_secs(2)) => {}
                         _ = cancel.cancelled() => {
-                            self.log_remove(&keep);
+                            self.park_measuring(tmp, &park_encoded, boost, size, memo).await;
+                            self.park(&keep, &park_keep, best.map(|b| b.0), memo).await;
                             return Retry::Stopped;
                         }
                     }
                 }
                 measured = match self.measure_vmaf(input, tmp, duration_sec, Some(2)).await {
                     Err(Stopped) => {
-                        self.log_remove(&keep);
+                        self.park_measuring(tmp, &park_encoded, boost, size, memo).await;
+                        self.park(&keep, &park_keep, best.map(|b| b.0), memo).await;
                         return Retry::Stopped;
                     }
                     Ok(m) => m,
                 };
             }
+            memo.steps.insert(boost, Step::Measured(size, measured.clone()));
             match measured {
                 Ok((vmaf, worst)) if vmaf >= floor && worst >= floor - 5.0 => {
-                    let (kp, t) = (keep.clone(), tmp.to_path_buf());
-                    let kept = self.blocking(move || system::remove_file_if_exists(&kp).and_then(|()| std::fs::rename(&t, &kp))).await;
+                    // Replayed: the output is the parked best (if this step was it) or gone
+                    // (a later step beat it before the pause, and will again).
+                    let source = match (&done, &parked_keep) {
+                        (Some(Step::Measured(..)), Some((b, parked))) if *b == boost => Some(parked.clone()),
+                        (Some(Step::Measured(..)), _) => None,
+                        _ => Some(tmp.to_path_buf()),
+                    };
+                    let kp = keep.clone();
+                    let kept = match source {
+                        Some(t) => self.blocking(move || system::remove_file_if_exists(&kp).and_then(|()| std::fs::rename(&t, &kp))).await,
+                        None => Ok(()),
+                    };
                     if let Err(err) = kept {
                         notes.push(format!("could not keep the +{boost} output: {err}"));
                         self.log_remove(tmp);
@@ -197,6 +288,27 @@ impl Engine {
         }
     }
 
+    /// Pause ended a measurement: the step's output is parked, to be measured on Resume.
+    async fn park_measuring(&self, tmp: &Path, parked: &Path, boost: u32, size: f64, memo: &mut VideoResume) {
+        let (from, to) = (tmp.to_path_buf(), parked.to_path_buf());
+        if self.blocking(move || std::fs::rename(from, to)).await.is_ok() {
+            memo.steps.insert(boost, Step::Encoded(size, parked.to_path_buf()));
+        }
+    }
+
+    /// Pause ended the retry: the best output so far is parked for Resume.
+    async fn park(&self, keep: &Path, park_keep: &Path, best_boost: Option<u32>, memo: &mut VideoResume) {
+        match best_boost {
+            Some(b) => {
+                let (from, to) = (keep.to_path_buf(), park_keep.to_path_buf());
+                if self.blocking(move || std::fs::rename(from, to)).await.is_ok() {
+                    memo.keep = Some((b, park_keep.to_path_buf()));
+                }
+            }
+            None => self.log_remove(keep),
+        }
+    }
+
     /// VMAF of `encoded` against `original`: mean and 5th percentile over the frames of
     /// three 8-second windows (20%, 50%, 80% of the video), or of the whole video when it
     /// is short. The original gets the same even-size scaling the encode used, so frames
@@ -208,7 +320,7 @@ impl Engine {
         duration_sec: f64,
         threads: Option<usize>,
     ) -> Result<Result<(f64, f64), String>, Stopped> {
-        let cancel = self.lock().cancel.clone();
+        let cancel = self.lock().release.clone();
         let windows: Vec<(f64, f64)> = if duration_sec > 30.0 {
             [0.2, 0.5, 0.8].iter().map(|f| ((duration_sec * f - 4.0).max(0.0), 8.0)).collect()
         } else {
@@ -249,6 +361,9 @@ impl Engine {
                 "null".into(),
                 "-".into(),
             ]);
+            if !self.wait_for_vmaf_memory(&cancel).await {
+                return Err(Stopped);
+            }
             let mut cmd = tokio::process::Command::new(&self.ffmpeg_path);
             cmd.args(&a)
                 .current_dir(&log_dir)
@@ -262,6 +377,7 @@ impl Engine {
                 Err(err) => return Ok(Err(format!("could not start ffmpeg: {err}"))),
             };
             system::assign_to_kill_on_exit_job(&child);
+            let _running = RunningProcess::new(self);
             let stderr = child.stderr.take();
             let err_task = self.rt.spawn(async move {
                 let mut text = Vec::new();
@@ -311,6 +427,44 @@ impl Engine {
     }
 }
 
+/// Counts a process in `running_processes` while it lives, so encoder admission and the
+/// out-of-memory retry see it.
+struct RunningProcess<'a>(&'a Engine);
+
+impl<'a> RunningProcess<'a> {
+    fn new(engine: &'a Engine) -> Self {
+        engine.lock().running_processes += 1;
+        Self(engine)
+    }
+}
+
+impl Drop for RunningProcess<'_> {
+    fn drop(&mut self) {
+        let mut inner = self.0.lock();
+        inner.running_processes = inner.running_processes.saturating_sub(1);
+    }
+}
+
+impl Engine {
+    /// Waits for `VMAF_MIN_FREE_COMMIT` before a measurement while other work runs (alone,
+    /// it always starts). False on Stop.
+    async fn wait_for_vmaf_memory(&self, cancel: &CancellationToken) -> bool {
+        loop {
+            let busy = {
+                let inner = self.lock();
+                inner.running_processes + inner.images_active
+            };
+            if busy == 0 || system::memory_status().is_none_or(|m| m.available_commit >= VMAF_MIN_FREE_COMMIT) {
+                return true;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                _ = cancel.cancelled() => return false,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,3 +481,4 @@ mod tests {
         assert_eq!(summarize_vmaf(vec![]), None);
     }
 }
+

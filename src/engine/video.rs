@@ -117,11 +117,36 @@ impl Engine {
         } else {
             Mode::Primary
         };
-        let mut attempt = self
-            .run_attempt(worker_id, &input, &tmp, &display, initial_mode, 0)
-            .await;
+        // Paused before: what it had finished (dropped if the settings changed meanwhile).
+        let mut memo = {
+            let mut inner = self.lock();
+            let key = vmaf::resume_key(&inner.options);
+            match inner.resume.remove(&input) {
+                Some(m) if m.settings == key => m,
+                stale => {
+                    if let Some(m) = stale {
+                        m.discard();
+                    }
+                    vmaf::VideoResume { settings: key, ..Default::default() }
+                }
+            }
+        };
+        let primary_done = memo.primary;
+        let gpu = match primary_done {
+            Some((_, _, _, gpu)) => gpu,
+            None => self.gpu_decodable(&input).await,
+        };
+        let mut attempt = match primary_done {
+            Some((_, duration, _, _)) => {
+                self.log(format!("[Worker {worker_id}] {display}: the preset encode was done before the pause; continuing with the quality retry"));
+                let mut diag = Diagnostics::default();
+                diag.duration_sec = duration;
+                Attempt { status: AttemptStatus::Exited(0), diag }
+            }
+            None => self.encode(worker_id, &input, &tmp, &display, initial_mode, 0, gpu).await,
+        };
         // The settings the final output was made with; the quality retry reuses them.
-        let mut used_mode = initial_mode;
+        let mut used_mode = primary_done.map_or(initial_mode, |p| p.2);
 
         // Audio-only file (e.g. a voice note in .mp4): skip and remember.
         if attempt.diag.no_video_stream {
@@ -140,8 +165,9 @@ impl Engine {
             return Outcome::Skipped;
         }
 
-        // Corrupt or incomplete file: remember it so it is never retried.
-        if attempt.diag.corrupt_input {
+        // Corrupt or incomplete file: remember it so it is never retried. Out of memory also
+        // prints "Invalid data found"; that file is fine.
+        if attempt.diag.corrupt_input && !attempt.diag.out_of_memory {
             self.release_tracking(worker_id, &input);
             self.log_remove(&tmp);
             self.remember(&input, &input).await;
@@ -162,6 +188,7 @@ impl Engine {
             matches!(a.status, AttemptStatus::Exited(code) if code != 0)
                 && !a.diag.corrupt_input
                 && !a.diag.no_video_stream
+                && !a.diag.out_of_memory
                 && !inner.stop_requested
                 && inner.working
         };
@@ -177,7 +204,7 @@ impl Engine {
             ));
             self.reset_worker(worker_id, &display, "encoding on the CPU");
             attempt = self
-                .run_attempt(worker_id, &input, &tmp, &display, Mode::CpuFallback, 0)
+                .encode(worker_id, &input, &tmp, &display, Mode::CpuFallback, 0, None)
                 .await;
             used_mode = Mode::CpuFallback;
         }
@@ -194,7 +221,7 @@ impl Engine {
             ));
             self.reset_worker(worker_id, &display, "encoding, audio as AAC");
             attempt = self
-                .run_attempt(worker_id, &input, &tmp, &display, Mode::TranscodeAudio, 0)
+                .encode(worker_id, &input, &tmp, &display, Mode::TranscodeAudio, 0, gpu)
                 .await;
             used_mode = Mode::TranscodeAudio;
         }
@@ -207,7 +234,7 @@ impl Engine {
             ));
             self.reset_worker(worker_id, &display, "encoding on the CPU");
             attempt = self
-                .run_attempt(worker_id, &input, &tmp, &display, Mode::CpuFallback, 0)
+                .encode(worker_id, &input, &tmp, &display, Mode::CpuFallback, 0, None)
                 .await;
             used_mode = Mode::CpuFallback;
         }
@@ -217,9 +244,7 @@ impl Engine {
         let stop_requested = self.lock().stop_requested;
         if matches!(attempt.status, AttemptStatus::Stopped) || stop_requested {
             self.log_remove(&tmp);
-            self.log(format!("[Worker {worker_id}] Stopped while processing {display}"));
-            self.send_state(true);
-            return Outcome::Stopped;
+            return self.ended_early(worker_id, &input, &display);
         }
 
         let code = match attempt.status {
@@ -245,6 +270,20 @@ impl Engine {
         // Counted as completed when this job ends (after a quality retry too), however it ends.
         let mut completion = Completion { engine: self, armed: true };
 
+        if code != 0 && attempt.diag.out_of_memory {
+            // Not the file's fault: left out of the history, so the next run tries it again.
+            {
+                let mut inner = self.lock();
+                inner.failed.insert(input.clone());
+                inner.run.failed += 1;
+            }
+            self.log_remove(&tmp);
+            self.log(format!(
+                "[Worker {worker_id}] Not enough memory to encode {display} (GPU or system); it will be tried again next run"
+            ));
+            self.send_state(true);
+            return Outcome::Failed;
+        }
         if code != 0 {
             self.lock().failed.insert(input.clone());
             self.remember(&input, &input).await; // Remember unrecoverable files so future runs skip them
@@ -261,10 +300,17 @@ impl Engine {
         }
 
         let (in_path, tmp_path) = (input.clone(), tmp.clone());
+        let resumed_size = primary_done.map(|p| p.0);
         let metas = self
-            .blocking(move || (std::fs::metadata(&in_path), std::fs::metadata(&tmp_path)))
+            .blocking(move || {
+                let out = match resumed_size {
+                    Some(s) => Ok(s as u64),
+                    None => std::fs::metadata(&tmp_path).map(|m| m.len()),
+                };
+                (std::fs::metadata(&in_path), out)
+            })
             .await;
-        let (in_meta, out_meta) = match metas {
+        let (in_meta, out_len) = match metas {
             (Ok(i), Ok(o)) => (i, o),
             (Err(err), _) | (_, Err(err)) => {
                 {
@@ -282,7 +328,7 @@ impl Engine {
         };
 
         let in_size = in_meta.len() as f64;
-        let mut out_size = out_meta.len() as f64;
+        let mut out_size = out_len as f64;
 
         if out_size >= in_size {
             // The preset could not shrink it (typically a source that is already
@@ -290,8 +336,9 @@ impl Engine {
             let floor = self.lock().options.vmaf_floor;
             let retry = match floor {
                 Some(floor) if in_size > 0.0 => {
+                    memo.primary = Some((out_size, attempt.diag.duration_sec, used_mode, gpu));
                     let r = self
-                        .quality_retry(worker_id, &input, &tmp, &display, used_mode, in_size, out_size, attempt.diag.duration_sec, floor)
+                        .quality_retry(worker_id, &input, &tmp, &display, used_mode, gpu, in_size, out_size, attempt.diag.duration_sec, floor, &mut memo)
                         .await;
                     self.lock().workers.remove(&worker_id);
                     r
@@ -301,9 +348,8 @@ impl Engine {
             match retry {
                 Retry::Stopped => {
                     self.log_remove(&tmp);
-                    self.log(format!("[Worker {worker_id}] Stopped while processing {display}"));
-                    self.send_state(true);
-                    return Outcome::Stopped;
+                    completion.armed = false;
+                    return self.ended_early_keeping(worker_id, &input, &display, Some(memo));
                 }
                 Retry::Accepted { boost, vmaf, worst } => {
                     let t = tmp.clone();
@@ -367,7 +413,8 @@ impl Engine {
                     match self.same_video(&input, &final_target, attempt.diag.duration_sec).await {
                         Err(Stopped) => {
                             self.log_remove(&tmp);
-                            return Outcome::Stopped;
+                            completion.armed = false;
+                            return self.ended_early(worker_id, &input, &display);
                         }
                         // The other copy is being encoded right now: leave both, compared next time.
                         Ok(true) if self.lock().in_progress.contains(&final_target) => {
@@ -414,7 +461,10 @@ impl Engine {
         let disposal = self.lock().disposal_for(&input);
         let (tmp_c, target_c, input_c) = (tmp.clone(), final_target.clone(), input.clone());
         let replaced = self
-            .blocking(move || replace_original(&tmp_c, &target_c, &input_c, &disposal))
+            .blocking({
+                let engine = Arc::clone(self);
+                move || replace_original(&tmp_c, &target_c, &input_c, &disposal, &|p| engine.note_content_now(p, history::VIDEO_MODE))
+            })
             .await;
         if let Err(err) = replaced {
             if claimed {
@@ -493,6 +543,7 @@ impl Engine {
     pub(super) async fn keep_smaller_video(self: &Arc<Self>, worker_id: u32, input: &Path, existing: &Path, tmp: &Path, display: &str, in_size: f64) -> Outcome {
         let disposal = self.lock().disposal_for(input);
         let (input_c, existing_c, tmp_c) = (input.to_path_buf(), existing.to_path_buf(), tmp.to_path_buf());
+        let engine = Arc::clone(self);
         let result = self
             .blocking(move || -> Result<(bool, f64), String> {
                 let theirs = std::fs::metadata(&existing_c).map_err(|e| e.to_string())?.len();
@@ -500,7 +551,7 @@ impl Engine {
                 let replaced = ours < theirs;
                 if replaced {
                     let attrs = std::fs::metadata(&input_c).map(|m| OriginalAttributes::from_metadata(&m));
-                    replace_original(&tmp_c, &existing_c, &existing_c, &disposal.for_sibling(&existing_c))?;
+                    replace_original(&tmp_c, &existing_c, &existing_c, &disposal.for_sibling(&existing_c), &|p| engine.note_content_now(p, history::VIDEO_MODE))?;
                     if let Ok(a) = attrs {
                         let _ = system::restore_attributes(&existing_c, &a);
                     }
@@ -543,14 +594,56 @@ impl Engine {
         }
     }
 
-    /// Waits until another encoder fits in memory. Returns false if Stop was pressed.
+    /// A job ended by Stop, or by a Pause that gave its memory back: then the file goes
+    /// back to the front of the queue and starts over on Resume.
+    fn ended_early(self: &Arc<Self>, worker_id: u32, input: &Path, display: &str) -> Outcome {
+        self.ended_early_keeping(worker_id, input, display, None)
+    }
+
+    /// [`Self::ended_early`] keeping what was finished (`memo`) for Resume.
+    fn ended_early_keeping(self: &Arc<Self>, worker_id: u32, input: &Path, display: &str, memo: Option<vmaf::VideoResume>) -> Outcome {
+        let (released, kept) = {
+            let mut inner = self.lock();
+            inner.workers.remove(&worker_id);
+            inner.in_progress.remove(input);
+            let released = inner.working && !inner.stop_requested;
+            let mut kept = false;
+            if released {
+                inner.requeue_video(input);
+                if let Some(m) = memo.filter(|m| m.primary.is_some()) {
+                    inner.resume.insert(input.to_path_buf(), m);
+                    kept = true;
+                }
+            } else if let Some(m) = memo {
+                m.discard();
+            }
+            (released, kept)
+        };
+        self.log(if released && kept {
+            format!("[Worker {worker_id}] {display} paused; on Resume it continues from its last finished step")
+        } else if released {
+            format!("[Worker {worker_id}] {display} paused; on Resume its encode starts again")
+        } else {
+            format!("[Worker {worker_id}] Stopped while processing {display}")
+        });
+        self.send_state(true);
+        if released { Outcome::Released } else { Outcome::Stopped }
+    }
+
+    /// Waits until another encoder fits in memory (RAM and, beside other encoders, GPU
+    /// memory). CPU jobs and VMAF measurements count as running work. False on Stop.
     pub(super) async fn wait_for_memory(&self, worker_id: u32, display: &str, cancel: &CancellationToken) -> bool {
         let mut announced = false;
         let step = self.worker_step(worker_id);
         loop {
-            let running = self.lock().running_processes;
+            let (running, gpu_users, nvenc) = {
+                let inner = self.lock();
+                let encoders = inner.running_processes;
+                (encoders + inner.images_active, encoders, inner.options.encoder.ends_with("_nvenc"))
+            };
             let memory = system::memory_status();
-            if may_start_encoder(running, memory) {
+            let vram = if nvenc && gpu_users > 0 { batch::free_vram_mb().await } else { None };
+            if may_start_encoder(running, memory, vram) {
                 if announced {
                     self.reset_worker(worker_id, display, &step);
                     self.log(format!("[Worker {worker_id}] Memory available again; starting {display}"));
@@ -560,8 +653,9 @@ impl Engine {
             if !announced {
                 announced = true;
                 let free_gb = memory.map_or(0.0, |m| m.available_commit as f64 / 1_073_741_824.0);
+                let gpu = vram.map(|v| format!(", {:.1} GB on the GPU", v as f64 / 1024.0)).unwrap_or_default();
                 self.log(format!(
-                    "[Worker {worker_id}] Waiting for free memory before starting {display} ({free_gb:.1} GB available)"
+                    "[Worker {worker_id}] Waiting for free memory before starting {display} ({free_gb:.1} GB available{gpu})"
                 ));
                 self.reset_worker(worker_id, display, "waiting for memory");
             }

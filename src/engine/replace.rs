@@ -75,8 +75,22 @@ impl Drop for ReplacingGuard {
     }
 }
 
-pub(super) fn replace_original(tmp: &Path, final_target: &Path, original: &Path, disposal: &system::Disposal) -> Result<(), String> {
+///
+/// Before the original is touched, the new version is flushed to the disk and `note` records
+/// its content in the history (durably): after a crash, a power cut or a forced quit at any
+/// point, the file at the original's name is either the untouched original or a complete
+/// new version that the next scan recognises as done (never optimized a second time).
+pub(super) fn replace_original(tmp: &Path, final_target: &Path, original: &Path, disposal: &system::Disposal, note: &dyn Fn(&Path) -> std::io::Result<()>) -> Result<(), String> {
     let _replacing = ReplacingGuard::new();
+    if let Err(err) = system::flush_to_disk(tmp) {
+        let _ = system::remove_file_if_exists(tmp);
+        return Err(format!("could not write the new version to the disk: {err}"));
+    }
+    if let Err(err) = note(tmp) {
+        let _ = system::remove_file_if_exists(tmp);
+        return Err(format!("could not note it in the history: {err}"));
+    }
+    system::die_here_in_tests("noted");
     let Err(err) = system::replace_file_with_retry(tmp, final_target, original, disposal) else {
         return Ok(());
     };

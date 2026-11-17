@@ -192,6 +192,53 @@ fn full_batch_handles_every_file_kind() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// NVENC encodes ended by Stop (MEDIAOPTI_STOP_MODE=stop) or by a Pause that frees their
+/// memory (=release), MEDIAOPTI_STOP_ROUNDS times on copies in MEDIAOPTI_STOP_DIR. They must
+/// quit, not be killed (killing NVENC encodes made the NVIDIA driver reset the GPU): watch
+/// the System log for nvlddmkm events meanwhile.
+#[test]
+#[ignore = "needs MEDIAOPTI_STOP_DIR and an NVIDIA GPU"]
+fn nvenc_encodes_quit_cleanly() {
+    let (Some(ff), Ok(src)) = (ffmpeg(), std::env::var("MEDIAOPTI_STOP_DIR")) else { return };
+    let rounds: u32 = std::env::var("MEDIAOPTI_STOP_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+    let release = std::env::var("MEDIAOPTI_STOP_MODE").is_ok_and(|m| m == "release");
+    for round in 1..=rounds {
+        let root = test_dir("nvenc-quit");
+        let media = root.join("media");
+        std::fs::create_dir_all(&media).unwrap();
+        for e in std::fs::read_dir(&src).unwrap().filter_map(Result::ok) {
+            std::fs::copy(e.path(), media.join(e.file_name())).unwrap();
+        }
+        let rt = runtime();
+        let (engine, rec) = new_engine(&rt, &root, ff.clone());
+        let t = std::time::Instant::now();
+        rt.block_on(async {
+            engine.load_dir(media.clone()).await;
+            let runner = tokio::spawn(engine.clone().run_batch(opts("av1_nvenc", 4.0)));
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            if release {
+                engine.set_paused(true);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                engine.release_paused_jobs();
+                while !engine.snapshot().telemetry.workers.is_empty() {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                engine.stop();
+            } else {
+                engine.stop();
+            }
+            tokio::time::timeout(Duration::from_secs(60), runner).await.expect("did not stop").unwrap();
+        });
+        let logs = rec.logs.lock().unwrap().join("\n");
+        let killed = logs.matches("did not quit").count();
+        let temps = std::fs::read_dir(&media).unwrap().filter_map(Result::ok).filter(|e| e.file_name().to_string_lossy().contains(".mediaopti.")).count();
+        println!("round {round}: ended in {:.1} s, {killed} encode(s) had to be killed, {temps} temp file(s) left", t.elapsed().as_secs_f64() - 10.0);
+        assert_eq!(killed, 0, "{logs}");
+        drop(rt);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
 #[test]
 fn stop_kills_ffmpeg_and_keeps_originals() {
     let Some(ff) = ffmpeg() else {
@@ -241,12 +288,11 @@ async fn wait_for_progress(engine: &Arc<Engine>) -> i64 {
     panic!("encoding never made progress");
 }
 
-/// Pause suspends ffmpeg (no progress, no output growth, no new file started); Resume
-/// finishes the batch normally. Set BATCHVIPROC_PAUSE_SECS=70 to also prove that a long
-/// pause does not trip the 30/60 s stall watchdog, and BATCHVIPROC_PAUSE_ENCODER=av1_nvenc
-/// to pause a GPU encode.
+/// Pause ends every process (freeing their memory, CPU and GPU) and starts nothing new;
+/// Resume finishes the batch normally. BATCHVIPROC_PAUSE_SECS sets how long it stays paused,
+/// BATCHVIPROC_PAUSE_ENCODER=av1_nvenc pauses a GPU encode.
 #[test]
-fn pause_suspends_ffmpeg_and_resume_finishes() {
+fn pause_ends_ffmpeg_and_resume_finishes() {
     let Some(ff) = ffmpeg() else {
         eprintln!("skipping: bundled ffmpeg not found");
         return;
@@ -271,21 +317,18 @@ fn pause_suspends_ffmpeg_and_resume_finishes() {
         wait_for_progress(&engine).await;
 
         engine.set_paused(true);
-        tokio::time::sleep(Duration::from_millis(700)).await; // let in-flight output settle
-        let before = engine.snapshot();
-        let pct_before = before.telemetry.workers[0].percent;
-        let size_before = std::fs::metadata(&temp).map_or(0, |m| m.len());
-        assert_eq!(before.status, Status::Paused);
-
+        assert_eq!(engine.snapshot().status, Status::Paused);
+        let until = std::time::Instant::now() + Duration::from_secs(15);
+        while !engine.snapshot().telemetry.workers.is_empty() && std::time::Instant::now() < until {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         tokio::time::sleep(Duration::from_secs(pause_secs)).await;
         let after = engine.snapshot();
         assert_eq!(after.status, Status::Paused);
-        assert_eq!(after.telemetry.workers[0].percent, pct_before, "progress moved while paused");
+        assert!(after.telemetry.workers.is_empty(), "a file is still being processed while paused");
         assert_eq!(after.telemetry.total_fps, 0);
-        assert_eq!(std::fs::metadata(&temp).map_or(0, |m| m.len()), size_before, "output grew while paused");
+        assert!(!temp.exists(), "the stopped encode's output was left");
         assert_eq!(after.completed_this_run, 0);
-        let files: Vec<_> = after.telemetry.workers.iter().map(|w| w.file.as_str()).collect();
-        assert_eq!(files, ["a.mp4"], "a new file started while paused");
 
         engine.set_paused(false);
         assert_eq!(engine.snapshot().status, Status::Running);
@@ -299,9 +342,108 @@ fn pause_suspends_ffmpeg_and_resume_finishes() {
     assert_eq!(s.status, Status::Done, "{logs}");
     assert_eq!(s.compressed_this_run + s.skipped_larger_this_run, 2, "{logs}");
     assert_eq!(s.failed_this_run, 0, "{logs}");
-    assert!(logs.contains("Paused (1 ffmpeg process suspended)"), "{logs}");
+    assert!(logs.contains("Paused: 1 file(s) in progress stopped"), "{logs}");
     assert!(logs.contains("Resumed"), "{logs}");
     assert!(!logs.contains("Stall watchdog"), "{logs}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A Pause that must give memory back (a game started): the files in progress are ended,
+/// their temp output removed, and on Resume they start over and finish like any other.
+#[test]
+fn pause_releases_memory_and_resume_redoes_the_files() {
+    let Some(ff) = ffmpeg() else {
+        eprintln!("skipping: bundled ffmpeg not found");
+        return;
+    };
+    let root = test_dir("pause-release");
+    let videos = root.join("videos");
+    std::fs::create_dir_all(&videos).unwrap();
+    lossless_video(&ff, 12, "1280x720", &videos.join("a.mp4"));
+    lossless_video(&ff, 12, "1280x720", &videos.join("b.mp4"));
+    lossless_video(&ff, 3, "640x360", &videos.join("c.mp4"));
+    let temps = [videos.join("a.mediaopti.w1.mp4"), videos.join("a.mediaopti.w2.mp4"), videos.join("b.mediaopti.w1.mp4"), videos.join("b.mediaopti.w2.mp4")];
+
+    let rt = runtime();
+    let (engine, rec) = new_engine(&rt, &root, ff);
+    rt.block_on(async {
+        engine.load_dir(videos.clone()).await;
+        let runner = tokio::spawn(engine.clone().run_batch(opts("libx264", 2.0)));
+        wait_for_progress(&engine).await;
+        engine.set_paused(true);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        engine.release_paused_jobs();
+        // The jobs end (their processes killed, temp files gone) while still paused.
+        let until = std::time::Instant::now() + Duration::from_secs(20);
+        while !engine.snapshot().telemetry.workers.is_empty() && std::time::Instant::now() < until {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let s = engine.snapshot();
+        assert!(s.telemetry.workers.is_empty(), "jobs still running after release");
+        assert_eq!(s.status, Status::Paused);
+        assert_eq!(s.completed_this_run, 0);
+        assert!(temps.iter().all(|t| !t.exists()), "a temp output was left behind");
+
+        engine.set_paused(false);
+        tokio::time::timeout(Duration::from_secs(180), runner).await
+            .expect("batch did not finish after resume").unwrap();
+    });
+
+    let logs = rec.logs.lock().unwrap().join("\n");
+    let s = engine.snapshot();
+    assert_eq!(s.status, Status::Done, "{logs}");
+    // Every file done exactly once: none lost, none counted twice.
+    assert_eq!(s.completed_this_run, 3, "{logs}");
+    assert_eq!(s.compressed_this_run + s.skipped_larger_this_run, 3, "{logs}");
+    assert_eq!(s.failed_this_run, 0, "{logs}");
+    assert!(logs.contains("on Resume its encode starts again"), "{logs}");
+    let left: Vec<_> = std::fs::read_dir(&videos).unwrap().filter_map(Result::ok).map(|e| e.file_name()).collect();
+    assert_eq!(left.len(), 3, "{left:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A real-size Pause: MEDIAOPTI_PAUSE_DIR=<folder of copies> is processed (4 jobs), paused
+/// after MEDIAOPTI_PAUSE_AT seconds for MEDIAOPTI_PAUSE_FOR seconds (start a game, or a
+/// memory hog, meanwhile), then resumed; results go to MEDIAOPTI_BENCH_KEEP if set.
+#[test]
+#[ignore = "needs MEDIAOPTI_PAUSE_DIR; long"]
+fn pause_for_a_game() {
+    let (Some(ff), Ok(src)) = (ffmpeg(), std::env::var("MEDIAOPTI_PAUSE_DIR")) else { return };
+    let secs = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+    let (at, for_) = (secs("MEDIAOPTI_PAUSE_AT", 15), secs("MEDIAOPTI_PAUSE_FOR", 60));
+    let root = test_dir("pause-game");
+    let media = root.join("media");
+    std::fs::create_dir_all(&media).unwrap();
+    for e in std::fs::read_dir(&src).unwrap().filter_map(Result::ok) {
+        if e.path().is_file() {
+            std::fs::copy(e.path(), media.join(e.file_name())).unwrap();
+        }
+    }
+    let rt = runtime();
+    let (engine, rec) = new_engine(&rt, &root, ff);
+    let raw = || RawOptions { images: Some(2), audio: Some(2), ..opts("av1_nvenc", 4.0) };
+    let t = std::time::Instant::now();
+    rt.block_on(async {
+        engine.apply_options(raw());
+        engine.load_dir(media.clone()).await;
+        let runner = tokio::spawn(engine.clone().run_batch(raw()));
+        tokio::time::sleep(Duration::from_secs(at)).await;
+        engine.set_paused(true);
+        println!("PAUSED at {:.0}s", t.elapsed().as_secs_f64());
+        tokio::time::sleep(Duration::from_secs(for_)).await;
+        engine.set_paused(false);
+        println!("RESUMED at {:.0}s", t.elapsed().as_secs_f64());
+        tokio::time::timeout(Duration::from_secs(1800), runner).await.expect("did not finish").unwrap();
+    });
+    for l in rec.logs.lock().unwrap().iter() {
+        println!("{l}");
+    }
+    let s = engine.snapshot();
+    println!("END at {:.0}s: completed {} of {}, failed {}", t.elapsed().as_secs_f64(), s.completed_this_run, s.run_total, s.failed_this_run);
+    if let Some(keep) = std::env::var_os("MEDIAOPTI_BENCH_KEEP") {
+        let _ = std::fs::remove_dir_all(&keep);
+        std::fs::rename(&media, &keep).unwrap();
+    }
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -477,6 +619,66 @@ fn compressed_h264(ffmpeg: &Path, noise: u32, crf: u32, out: &Path) {
     );
 }
 
+/// Paused during the quality retry (after its first step was encoded), the video carries
+/// on from there on Resume: the steps done are not encoded again and the result is byte for
+/// byte the one of a run without a pause.
+#[test]
+fn pause_during_quality_retry_resumes_from_the_last_step() {
+    let Some(ff) = ffmpeg() else {
+        eprintln!("skipping: bundled ffmpeg not found");
+        return;
+    };
+    let root = test_dir("vmaf-resume");
+    let src = root.join("src.mp4");
+    compressed_h264(&ff, 4, 24, &src);
+    let rt = runtime();
+    let run = |name: &str, pause: bool| {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("light.mp4");
+        std::fs::copy(&src, &file).unwrap();
+        let (engine, rec) = new_engine(&rt, &root.join(format!("{name}-data")), ff.clone());
+        let raw = || RawOptions { crf: Some(20.0), vmaf_floor: Some(93), ..opts("av1_nvenc", 1.0) };
+        rt.block_on(async {
+            engine.apply_options(raw());
+            engine.load_dir(dir.clone()).await;
+            let runner = tokio::spawn(engine.clone().run_batch(raw()));
+            if pause {
+                // Wait for the first quality measurement (the +4 step is encoded by then).
+                loop {
+                    let s = engine.snapshot();
+                    if s.telemetry.workers.iter().any(|w| w.step.starts_with("measuring quality")) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                engine.set_paused(true);
+                while !engine.snapshot().telemetry.workers.is_empty() {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                let parked: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(Result::ok).map(|e| e.file_name()).collect();
+                println!("while paused: {parked:?}");
+                engine.set_paused(false);
+            }
+            tokio::time::timeout(Duration::from_secs(300), runner).await.expect("did not finish").unwrap();
+        });
+        let logs = rec.logs.lock().unwrap().join("\n");
+        (std::fs::read(&file).unwrap(), logs)
+    };
+    let (plain, plain_logs) = run("plain", false);
+    let (paused, logs) = run("paused", true);
+    println!("{logs}");
+    assert!(plain_logs.contains("Quality retry for light.mp4"), "{plain_logs}");
+    assert!(logs.contains("continues from its last finished step"), "{logs}");
+    assert!(logs.contains("the preset encode was done before the pause"), "{logs}");
+    assert!(logs.contains("was done before the pause; measuring it"), "{logs}");
+    assert!(plain == paused, "the paused run's result differs from the plain run's");
+    let leftovers: Vec<_> = walkdir::WalkDir::new(&root).into_iter().filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().contains(".mediaopti.")).collect();
+    assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn quality_retry_accepts_only_above_the_vmaf_floor() {
     let Some(ff) = ffmpeg() else {
@@ -633,7 +835,9 @@ fn bench_folder() {
     let convert = std::env::var("MEDIAOPTI_BENCH_CONVERT").ok().and_then(|e| e.parse().ok());
     // MEDIAOPTI_BENCH_DOCS=1: visually lossless PDF images.
     let docs = std::env::var("MEDIAOPTI_BENCH_DOCS").ok().and_then(|e| e.parse().ok());
-    let raw = || RawOptions { images: Some(2), audio: Some(2), convert: convert.or(Some(0)), lossy_docs: docs.or(Some(0)), ..opts("av1_nvenc", 2.0) };
+    // MEDIAOPTI_BENCH_JOBS=<n>: parallel video encodes (default 2).
+    let jobs = std::env::var("MEDIAOPTI_BENCH_JOBS").ok().and_then(|e| e.parse().ok()).unwrap_or(2.0);
+    let raw = || RawOptions { images: Some(2), audio: Some(2), convert: convert.or(Some(0)), lossy_docs: docs.or(Some(0)), ..opts("av1_nvenc", jobs) };
     let t = std::time::Instant::now();
     rt.block_on(async {
         engine.apply_options(raw());
@@ -644,7 +848,9 @@ fn bench_folder() {
     let after: u64 = std::fs::read_dir(&media).unwrap().filter_map(Result::ok).map(|e| e.metadata().unwrap().len()).sum();
     let s = engine.snapshot();
     let logs = rec.logs.lock().unwrap();
-    for l in logs.iter().filter(|l| l.contains("Failed") || l.starts_with("Done") || l.starts_with("Images:")) {
+    // MEDIAOPTI_BENCH_LOG=1: the whole log, not only failures and totals.
+    let all = std::env::var_os("MEDIAOPTI_BENCH_LOG").is_some();
+    for l in logs.iter().filter(|l| all || l.contains("Failed") || l.starts_with("Done") || l.starts_with("Images:")) {
         println!("{l}");
     }
     println!(
@@ -655,6 +861,11 @@ fn bench_folder() {
         after as f64 / 1048576.0,
         100.0 * (before - after) as f64 / before as f64
     );
+    // MEDIAOPTI_BENCH_KEEP=<dir>: move the results there instead of deleting them.
+    if let Some(keep) = std::env::var_os("MEDIAOPTI_BENCH_KEEP") {
+        let _ = std::fs::remove_dir_all(&keep);
+        std::fs::rename(&media, &keep).unwrap();
+    }
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -855,7 +1066,7 @@ fn real_folder_run() {
         crf: Some(20.0),
         preset: Some("slow".into()),
         encoder: Some("av1_nvenc".into()),
-        concurrency: Some(2.0),
+        concurrency: Some(std::env::var("MEDIAOPTI_BENCH_JOBS").ok().and_then(|v| v.parse().ok()).unwrap_or(2.0)),
         originals: Some(2),
         backup_dir: None,
         gif_min_mb: Some(1),

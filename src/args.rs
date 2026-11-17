@@ -88,6 +88,12 @@ pub struct Options {
     pub vmaf_floor: Option<f64>,
     /// Added to the CQ/CRF for the quality-checked retry (0 for the normal encode).
     pub cq_boost: u32,
+    /// Decode on the GPU (NVDEC) and scale there to this fixed size (set per attempt, only
+    /// for inputs whose decoded frames were checked to match the CPU's: see
+    /// `Engine::gpu_decodable`). Fixed, because NVENC crops silently when the frame size
+    /// changes mid-stream; scaling every frame to the first one's size is what the CPU
+    /// path does too.
+    pub gpu_decode: Option<(u32, u32)>,
     pub images: ImageMode,
     /// Lossless format conversions (WAV -> FLAC, BMP/TGA -> PNG, CBR -> CBZ), each on or off.
     pub convert: Conversions,
@@ -113,11 +119,12 @@ impl Default for Options {
             crf: 23,
             preset: "slow".into(),
             encoder: "av1_nvenc".into(),
-            concurrency: 2,
+            concurrency: 4,
             originals: Originals::RecycleBin,
             gif_min_bytes: 1024 * 1024,
             vmaf_floor: Some(93.0),
             cq_boost: 0,
+            gpu_decode: None,
             images: ImageMode::Lossy,
             convert: Conversions::ALL,
             videos: true,
@@ -201,6 +208,7 @@ impl Options {
             gif_min_bytes,
             vmaf_floor,
             cq_boost: 0,
+            gpu_decode: None,
             images: match raw.images {
                 Some(0) => ImageMode::Off,
                 Some(1) => ImageMode::Lossless,
@@ -341,15 +349,23 @@ pub fn build_ffmpeg_args(input: &Path, tmp: &Path, options: &Options, mode: Mode
     };
 
     let nvenc = |codec: &str, cq: u32, aq: &str, bf: &str, ten_bit: bool| {
-        let mut a = s(&["-i", &input, "-map", "0:V:0", "-map_metadata", "0"]);
-        a.extend(even_scale.clone());
+        // GPU decode only feeds the 10-bit encoders: scale_cuda converts to P010 there, and
+        // for 4:2:0 input it hands the encoder the same frames as the CPU path (checked).
+        let gpu = options.gpu_decode.filter(|_| ten_bit);
+        let mut a = if gpu.is_some() { s(&["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]) } else { Vec::new() };
+        a.extend(s(&["-i", &input, "-map", "0:V:0", "-map_metadata", "0"]));
+        if let Some((w, h)) = gpu {
+            a.extend(s(&["-vf", &format!("scale_cuda=w={w}:h={h}:format=p010le")]));
+        } else {
+            a.extend(even_scale.clone());
+        }
         a.extend(s(&[
             "-c:v", codec, "-preset", nvenc_preset, "-tune", "hq", "-rc", "vbr", "-cq",
             &cq.to_string(), "-b:v", "0", "-multipass", "fullres", "-rc-lookahead", "32",
             "-spatial-aq", "1", "-temporal-aq", "1", "-aq-strength", aq, "-bf", bf,
             "-b_ref_mode", "middle",
         ]));
-        if ten_bit {
+        if ten_bit && gpu.is_none() {
             a.extend(s(&["-pix_fmt", "p010le"]));
         }
         a.extend(audio_flags.clone());
@@ -380,6 +396,14 @@ pub fn build_ffmpeg_args(input: &Path, tmp: &Path, options: &Options, mode: Mode
         }
     }
 
+    // On the GPU path the filter must be rebuilt when the frame size changes: scale_cuda
+    // then scales the new size to the fixed output. Kept as it was, it passes the larger
+    // frames on and NVENC encodes only their top-left corner, without any error.
+    if args.iter().any(|a| a == "-hwaccel") {
+        if let Some(i) = args.iter().position(|a| a == "-reinit_filter") {
+            args.drain(i..i + 2);
+        }
+    }
     args
 }
 
@@ -432,7 +456,7 @@ mod tests {
         assert_eq!(o.crf, 23);
         assert_eq!(o.preset, "slow");
         assert_eq!(o.encoder, "av1_nvenc");
-        assert_eq!(o.concurrency, 2);
+        assert_eq!(o.concurrency, 4);
         assert_eq!(o.originals, Originals::RecycleBin, "originals go to the Recycle Bin by default");
         assert_eq!(o.gif_min_bytes, 1024 * 1024);
         assert_eq!(o.vmaf_floor, Some(93.0));
@@ -465,6 +489,24 @@ mod tests {
         assert!(joined.contains("-c:v av1_nvenc -preset p7 -tune hq -rc vbr -cq 36"));
         assert!(joined.contains("-aq-strength 5 -bf 4 -b_ref_mode middle -pix_fmt p010le"));
         assert!(joined.ends_with("-map 0:a? -c:a copy -movflags +faststart -y out.mp4"));
+    }
+
+    #[test]
+    fn gpu_decode_scales_on_the_gpu_for_10_bit_encoders_only() {
+        let o = Options { gpu_decode: Some((1920, 1080)), ..Options::default() };
+        let a = build_ffmpeg_args(Path::new("in.mp4"), Path::new("out.mp4"), &o, Mode::Primary).join(" ");
+        assert!(a.contains("-hwaccel cuda -hwaccel_output_format cuda -i in.mp4"), "{a}");
+        assert!(a.contains("-vf scale_cuda=w=1920:h=1080:format=p010le"), "{a}");
+        // The filter may be rebuilt when the size changes (it scales to the fixed size).
+        assert!(!a.contains("-reinit_filter 0"), "{a}");
+        assert!(!a.contains("-pix_fmt") && !a.contains("-vf scale="), "{a}");
+        // h264_nvenc (8-bit) and the CPU fallback keep decoding on the CPU.
+        let o = Options { gpu_decode: Some((1920, 1080)), encoder: "h264_nvenc".into(), ..Options::default() };
+        let a = build_ffmpeg_args(Path::new("in.mp4"), Path::new("out.mp4"), &o, Mode::Primary).join(" ");
+        assert!(!a.contains("hwaccel"), "{a}");
+        let o = Options { gpu_decode: Some((1920, 1080)), ..Options::default() };
+        let a = build_ffmpeg_args(Path::new("in.mp4"), Path::new("out.mp4"), &o, Mode::CpuFallback).join(" ");
+        assert!(!a.contains("hwaccel"), "{a}");
     }
 
     /// Writes args for every option combination to $ARGS_DUMP (used for parity checks

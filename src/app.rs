@@ -28,9 +28,9 @@ const ENCODERS: &[(&str, &str)] = &[
 ];
 const JOBS: &[(u32, &str)] = &[
     (1, "1 (single stream)"),
-    (2, "2 (dual NVENC)"),
+    (2, "2 streams"),
     (3, "3 streams"),
-    (4, "4 streams"),
+    (4, "4 streams (fastest)"),
 ];
 const QUALITY: &[(u32, &str)] = &[
     (20, "High quality (camera / raw)"),
@@ -120,7 +120,7 @@ impl Default for Prefs {
     fn default() -> Self {
         Self {
             encoder: "av1_nvenc".into(),
-            concurrency: 2,
+            concurrency: 4,
             crf: 23,
             preset: "slow".into(),
             originals: 1,
@@ -646,9 +646,13 @@ impl Controller {
         } else {
             TaskbarProgress::None
         };
-        if !self.taskbar_tried {
-            self.taskbar_tried = true;
-            self.taskbar = hwnd(&w).and_then(Taskbar::new);
+        // The window may not exist yet on the first renders: try again until it does (once
+        // it does, a failure to get the taskbar is final).
+        if self.taskbar.is_none() && !self.taskbar_tried {
+            if let Some(h) = hwnd(&w) {
+                self.taskbar_tried = true;
+                self.taskbar = Taskbar::new(h);
+            }
         }
         if let Some(taskbar) = &mut self.taskbar {
             taskbar.set(progress);
@@ -906,7 +910,7 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
     {
         let dir = data_dir.to_path_buf();
         window.on_open_data_folder(move || {
-            let _ = std::process::Command::new("explorer").arg(&dir).spawn();
+            let _ = system::spawn_detached(std::process::Command::new("explorer").arg(&dir));
         });
     }
     {
@@ -927,7 +931,7 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
         let logs_dir = data_dir.join("logs");
         window.on_open_logs(move || {
             let _ = std::fs::create_dir_all(&logs_dir);
-            let _ = std::process::Command::new("explorer").arg(&logs_dir).spawn();
+            let _ = system::spawn_detached(std::process::Command::new("explorer").arg(&logs_dir));
         });
     }
     {
@@ -943,7 +947,7 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
                 if prefs.encoder == "libx264" {
                     prefs.concurrency = 1;
                 } else if prefs.concurrency == 1 {
-                    prefs.concurrency = 2;
+                    prefs.concurrency = Prefs::default().concurrency;
                 }
                 prefs.apply_to_window(&w);
                 last_encoder.borrow_mut().clone_from(&prefs.encoder);
@@ -1234,7 +1238,7 @@ mod tests {
         let d = Prefs::default();
         // e.g. the removed OpenCL encoder or an out-of-range job count
         assert_eq!(position(ENCODERS, &"libx264_opencl", &d.encoder.as_str()), 0);
-        assert_eq!(position(JOBS, &9, &d.concurrency), 1);
+        assert_eq!(position(JOBS, &9, &d.concurrency), 3);
         assert_eq!(position(SPEEDS, &"medium", &d.preset.as_str()), 1);
     }
 }

@@ -235,11 +235,14 @@ pub struct Gate {
     pub paused: Option<tokio::sync::watch::Receiver<bool>>,
     /// The job's progress: the bytes each tool reads are added to it.
     pub progress: Option<std::sync::Arc<Progress>>,
+    /// Set when a tool of this job failed for lack of memory (or ffmpeg dropped frames for
+    /// it): the job's result is then not the one a normal run gives, so it is thrown away.
+    pub short_of_memory: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Gate {
     pub fn new(cancel: CancellationToken, paused: Option<tokio::sync::watch::Receiver<bool>>) -> Self {
-        Self { cancel, paused, progress: None }
+        Self { cancel, paused, progress: None, short_of_memory: std::sync::Arc::default() }
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -391,9 +394,13 @@ pub fn run(
         const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
         cmd.creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS);
     }
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| RunError::Failed(format!("could not start {}: {e}", program.display())))?;
+    let mut child = cmd.spawn().map_err(|e| {
+        // ERROR_NOT_ENOUGH_MEMORY, ERROR_COMMITMENT_LIMIT
+        if matches!(e.raw_os_error(), Some(8 | 1455)) {
+            gate.short_of_memory.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        RunError::Failed(format!("could not start {}: {e}", program.display()))
+    })?;
     crate::system::assign_std_child_to_job(&child);
 
     let mut out = child.stdout.take().expect("piped");
@@ -484,7 +491,28 @@ pub fn run(
     let (stdout, hash, stdout_len) = out_thread.join().unwrap_or_default();
     let stderr = err_thread.join().unwrap_or_default();
     let success = status.is_some_and(|s| s.success()) && !overflow.load(std::sync::atomic::Ordering::Relaxed);
-    Ok(Ran { success, stdout, hash, stdout_len, code: status.and_then(|s| s.code()), stderr })
+    let code = status.and_then(|s| s.code());
+    if ran_out_of_memory(success, code, &stderr) {
+        gate.short_of_memory.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(Ran { success, stdout, hash, stdout_len, code, stderr })
+}
+
+/// Whether a tool's run was spoiled by a lack of memory: its own message (ffmpeg's decoders
+/// also drop frames that way and may still exit 0), a Windows out-of-memory exit status, or
+/// any failure while commit memory is all but exhausted (a crash then has any status).
+fn ran_out_of_memory(success: bool, code: Option<i32>, stderr: &[u8]) -> bool {
+    static MESSAGE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?i)out of memory|cannot allocate memory|bad_alloc|memory allocation (error|failed)|failed to allocate|not enough memory|insufficient memory|get_buffer\(\) failed|MemoryError").unwrap()
+    });
+    // STATUS_NO_MEMORY, STATUS_COMMITMENT_LIMIT
+    const NO_MEMORY: [u32; 2] = [0xC000_0017, 0xC000_012D];
+    if MESSAGE.is_match(&String::from_utf8_lossy(stderr)) {
+        return true;
+    }
+    !success
+        && (code.is_some_and(|c| NO_MEMORY.contains(&(c as u32)))
+            || crate::system::memory_status().is_some_and(|m| m.available_commit < 512 << 20))
 }
 
 /// `OsString` arguments from anything path- or string-like.
@@ -497,6 +525,17 @@ macro_rules! os_args {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn running_out_of_memory_is_recognised() {
+        use super::ran_out_of_memory as oom;
+        assert!(oom(false, Some(1), b"[h264 @ 0] get_buffer() failed\n"));
+        assert!(oom(true, Some(0), b"[dec:h264] get_buffer() failed\n"), "ffmpeg drops frames and exits 0");
+        assert!(oom(false, Some(0xC000_0017_u32 as i32), b""));
+        assert!(oom(false, Some(1), b"terminate called after throwing an instance of 'std::bad_alloc'"));
+        assert!(!oom(false, Some(1), b"Invalid data found when processing input"));
+        assert!(!oom(true, Some(0), b""));
+    }
+
     use super::*;
 
     #[test]

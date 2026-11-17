@@ -45,6 +45,9 @@ pub(super) enum ImageResult {
     /// A file with the same content already had the new name: the smaller copy (`kept`) stays,
     /// the original is gone; `before` bytes were freed. `replaced`: the new version replaced it.
     Duplicate { before: u64, kept: PathBuf, content: Option<(ContentHash, u64)>, replaced: bool },
+    /// A tool ran out of memory (even after waiting for memory and trying again): its result
+    /// would differ from a normal run's, so nothing is changed and nothing remembered.
+    OutOfMemory,
     /// Could not be done (disk, permissions): not remembered, tried again next run.
     Failed(String),
     /// Processing this file failed: remembered, not retried.
@@ -98,6 +101,7 @@ impl Inner {
             temp: self.options.temp_dir.clone().filter(|d| d.is_dir()).unwrap_or_else(std::env::temp_dir),
             fix_ext: self.options.fix_ext,
             busy: None,
+            note: None,
         }
     }
 
@@ -269,6 +273,9 @@ impl Engine {
             };
             let engine = Arc::clone(&self);
             opts.busy = Some(Arc::new(move |p: &Path| engine.lock().in_progress.contains(p)));
+            let engine = Arc::clone(&self);
+            let mode = image::mode(lossy);
+            opts.note = Some(Arc::new(move |p: &Path| engine.note_content_now(p, mode)));
             if let Some(line) = announce {
                 self.log(line);
             }
@@ -276,16 +283,30 @@ impl Engine {
             let progress = Arc::new(image::tools::Progress::default());
             self.lock().cpu_progress.insert(path.clone(), Arc::clone(&progress));
             let (cpu2, p2) = (Arc::clone(&cpu), path.clone());
+            let job_cancel = self.lock().release.clone();
             let result = self
                 .blocking(move || {
                     let base = cpu2.for_file(&p2);
-                    let gate = image::tools::Gate { progress: Some(Arc::clone(&progress)), ..base.gate.clone() };
+                    let gate = image::tools::Gate {
+                        cancel: job_cancel,
+                        progress: Some(Arc::clone(&progress)),
+                        short_of_memory: Arc::default(),
+                        ..base.gate.clone()
+                    };
                     let ctx2 = &image::Ctx { progress: Some(progress), gate, ..base.clone() };
                     // A slot is free unless a big job borrowed it: then wait for it back.
                     if ctx2.slots.as_ref().is_some_and(|s| !s.acquire(&ctx2.gate)) {
                         return ImageResult::Stopped;
                     }
-                    let r = process_image(ctx2, &p2, worker_id, &disposal, &opts);
+                    let mut r = process_image(ctx2, &p2, worker_id, &disposal, &opts);
+                    // Out of memory: wait for memory and try the file again (twice at most).
+                    for _ in 0..2 {
+                        if !matches!(r, ImageResult::OutOfMemory) || !wait_for_job_memory(&ctx2.gate) {
+                            break;
+                        }
+                        ctx2.gate.short_of_memory.store(false, std::sync::atomic::Ordering::Relaxed);
+                        r = process_image(ctx2, &p2, worker_id, &disposal, &opts);
+                    }
                     if let Some(s) = &ctx2.slots {
                         s.release(1);
                     }
@@ -389,7 +410,18 @@ impl Engine {
                     remember(&mut inner, None);
                     log = Some(format!("{tag} Failed on {display}: {err} (remembered in history, will not retry)"));
                 }
-                ImageResult::Stopped => {}
+                ImageResult::OutOfMemory => {
+                    inner.run.failed += 1;
+                    inner.failed.insert(path.to_path_buf());
+                    log = Some(format!("{tag} Not enough memory for {display}; left as it was, tried again next run"));
+                }
+                // Stop, or a Pause that released the memory: back to the front of the queue
+                // (it starts over on Resume).
+                ImageResult::Stopped => {
+                    if inner.working && !inner.stop_requested {
+                        inner.requeue_cpu(path);
+                    }
+                }
             }
             let r = &inner.run;
             (r.images_done.is_multiple_of(PROGRESS_EVERY) && r.images_done > 0)
@@ -403,6 +435,21 @@ impl Engine {
         }
         self.send_state(false);
     }
+}
+
+/// Before a CPU job that ran out of memory is tried again: up to a minute for
+/// `IMAGE_MIN_FREE_COMMIT` twice over. False on Stop (or a Pause that released the job).
+fn wait_for_job_memory(gate: &image::tools::Gate) -> bool {
+    for _ in 0..60 {
+        if !gate.wait_while_paused() {
+            return false;
+        }
+        if system::memory_status().is_none_or(|m| m.available_commit >= 2 * IMAGE_MIN_FREE_COMMIT) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    !gate.is_cancelled()
 }
 
 /// Kept free on a drive that holds work folders (C: is often nearly full).
@@ -507,7 +554,11 @@ pub(super) struct JobOpts {
     /// Whether another worker is processing a file now (a duplicate must not be replaced or
     /// removed under it).
     pub busy: Option<BusyCheck>,
+    /// Records a new version's content in the history before it replaces an original.
+    pub note: Option<NoteContent>,
 }
+
+pub(super) type NoteContent = Arc<dyn Fn(&Path) -> std::io::Result<()> + Send + Sync>;
 
 /// Whether `existing` holds the same content as the original (`src`, its private copy):
 /// the same picture, the same decoded audio, a CBZ with the CBR's files, else the same bytes.
@@ -554,6 +605,9 @@ pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, dispo
     }
     // Most music has nothing to try: don't copy (to C:) or decode it.
     if kind.is_audio() && !crate::audio::worth_trying(ctx, kind, path) {
+        if ctx.gate.short_of_memory.load(std::sync::atomic::Ordering::Relaxed) {
+            return ImageResult::OutOfMemory;
+        }
         return ImageResult::Kept { content: content_of(path), note: None };
     }
     let job = NEXT_JOB.fetch_add(1, Ordering::Relaxed);
@@ -583,7 +637,14 @@ pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, dispo
     };
     let before = state.0;
 
-    let result = match image::optimize(ctx, kind, &src, &work) {
+    let optimized = image::optimize(ctx, kind, &src, &work);
+    if matches!(optimized, Err(RunError::Cancelled)) {
+        return ImageResult::Stopped;
+    }
+    if ctx.gate.short_of_memory.load(std::sync::atomic::Ordering::Relaxed) {
+        return ImageResult::OutOfMemory;
+    }
+    let result = match optimized {
         Ok(r) => r,
         Err(RunError::Cancelled) => return ImageResult::Stopped,
         // The file itself couldn't be processed (a tool failed on it): remembered, like a
@@ -627,7 +688,7 @@ pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, dispo
                         let name = target.file_name().unwrap_or_default().to_string_lossy().into_owned();
                         return ImageResult::Skipped(format!("{name} has the same content and is being processed at the same time; compared next time"));
                     }
-                    return keep_smaller_copy(path, &target, smaller.as_ref(), before, disposal, worker_id);
+                    return keep_smaller_copy(path, &target, smaller.as_ref(), before, disposal, worker_id, opts);
                 }
             }
             if tries > 20 {
@@ -669,7 +730,7 @@ pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, dispo
         unclaim();
         return ImageResult::Failed(format!("could not write next to the original: {err}"));
     }
-    if let Err(err) = super::replace_original(&sibling, &target, path, disposal) {
+    if let Err(err) = super::replace_original(&sibling, &target, path, disposal, &|p| note(opts, p)) {
         unclaim();
         return ImageResult::Failed(err);
     }
@@ -682,7 +743,12 @@ pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, dispo
 /// `existing` (the new name's current file) has the same content as `path`: keeps the smaller
 /// of `existing` and the new version (`smaller`, if there is one); the original and the other
 /// copy go as `disposal` says.
-fn keep_smaller_copy(path: &Path, existing: &Path, smaller: Option<&(PathBuf, u64)>, before: u64, disposal: &system::Disposal, worker_id: u32) -> ImageResult {
+fn note(opts: &JobOpts, file: &Path) -> std::io::Result<()> {
+    opts.note.as_ref().map_or(Ok(()), |n| n(file))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn keep_smaller_copy(path: &Path, existing: &Path, smaller: Option<&(PathBuf, u64)>, before: u64, disposal: &system::Disposal, worker_id: u32, opts: &JobOpts) -> ImageResult {
     let theirs = std::fs::metadata(existing).map_or(u64::MAX, |m| m.len());
     match smaller {
         Some((best, after)) if *after < theirs => {
@@ -694,7 +760,7 @@ fn keep_smaller_copy(path: &Path, existing: &Path, smaller: Option<&(PathBuf, u6
                 let _ = system::remove_file_if_exists(&sibling);
                 return ImageResult::Failed(format!("could not write next to the original: {err}"));
             }
-            if let Err(err) = super::replace_original(&sibling, existing, existing, &disposal.for_sibling(existing)) {
+            if let Err(err) = super::replace_original(&sibling, existing, existing, &disposal.for_sibling(existing), &|p| note(opts, p)) {
                 return ImageResult::Failed(err);
             }
             if let Ok(a) = attrs {

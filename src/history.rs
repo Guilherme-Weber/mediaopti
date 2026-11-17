@@ -118,12 +118,15 @@ fn parse_content_line(line: &str) -> Option<(ContentHash, u64, u8)> {
 impl History {
     /// `path` is the location history; the content history sits next to it.
     pub fn load(path: PathBuf) -> Self {
-        let hashes = std::fs::read_to_string(&path)
+        // Read as bytes: a write cut off by a crash or power loss can leave bytes that are
+        // not text; only those lines are lost, never the whole history.
+        let read = |p: &Path| std::fs::read(p).map(|b| String::from_utf8_lossy(&b).into_owned());
+        let hashes = read(&path)
             .map(|data| data.split('\n').filter_map(|l| parse_hex::<32>(l.trim())).collect())
             .unwrap_or_default();
         let content_path = path.with_file_name("processed-content.tsv");
         let (mut content, mut sizes) = (HashMap::new(), HashSet::new());
-        if let Ok(data) = std::fs::read_to_string(&content_path) {
+        if let Ok(data) = read(&content_path) {
             for (hash, size, flag) in data.lines().filter_map(parse_content_line) {
                 *content.entry(hash).or_insert(0) |= flag;
                 sizes.insert(size);
@@ -213,9 +216,9 @@ impl History {
 
         if self.needs_rewrite {
             let lines: Vec<String> = self.hashes.iter().map(hex::encode).collect();
-            std::fs::write(&self.path, lines.join("\n"))?;
+            write_atomically(&self.path, lines.join("\n").as_bytes())?;
             // Cleared: the content history restarts with what was added since.
-            std::fs::write(&self.content_path, "")?;
+            write_atomically(&self.content_path, b"")?;
             self.needs_rewrite = false;
         } else if !self.unsaved.is_empty() {
             // The file has no trailing newline, so separate from existing content first.
@@ -238,17 +241,68 @@ impl History {
         if !self.unsaved_content.is_empty() {
             let mut data = String::with_capacity(self.unsaved_content.len() * 56);
             for (hash, size, mode) in &self.unsaved_content {
-                data.push_str(&format!("{}\t{size}\t{mode}\n", hex::encode(hash)));
+                data.push_str(&content_line(hash, *size, mode));
             }
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.content_path)?;
-            file.write_all(data.as_bytes())?;
+            append_lines(&self.content_path, &data, false)?;
             self.unsaved_content.clear();
         }
         Ok(())
     }
+
+    /// Adds content now and returns where and what to append so the caller can write it
+    /// durably outside its lock ([`append_lines`]); `None` if it was already known.
+    pub fn add_content_now(&mut self, hash: ContentHash, size: u64, mode: &'static str) -> Option<(PathBuf, String)> {
+        let flag = mode_flag(mode);
+        let flags = self.content.entry(hash).or_insert(0);
+        if *flags & flag != 0 {
+            return None;
+        }
+        *flags |= flag;
+        self.sizes.insert(size);
+        Some((self.content_path.clone(), content_line(&hash, size, mode)))
+    }
+}
+
+fn content_line(hash: &ContentHash, size: u64, mode: &str) -> String {
+    format!("{}\t{size}\t{mode}\n", hex::encode(hash))
+}
+
+/// Appends whole lines to a history file. A line cut off by a crash is ended first (it is
+/// then one unreadable line, instead of spoiling the next one too). `durable`: on the disk
+/// before returning.
+pub fn append_lines(path: &Path, lines: &str, durable: bool) -> std::io::Result<()> {
+    static APPENDING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one_at_a_time = APPENDING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    use std::io::{Read, Seek};
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::OpenOptions::new().create(true).read(true).append(true).open(path)?;
+    let len = file.metadata()?.len();
+    let mut last = *b"\n";
+    if len > 0 {
+        file.seek(std::io::SeekFrom::Start(len - 1))?;
+        file.read_exact(&mut last)?;
+    }
+    if last[0] != b'\n' {
+        file.write_all(b"\n")?;
+    }
+    file.write_all(lines.as_bytes())?;
+    if durable {
+        file.sync_data()?;
+    }
+    Ok(())
+}
+
+/// Replaces a file's content so that a crash leaves either the old or the new one whole.
+fn write_atomically(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("saving");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)
 }
 
 /// One-time migration from batchviproc: copies its processed-files list and UI settings
@@ -295,6 +349,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// What a crash or power cut can leave: bytes that are not text and a line cut off.
+    /// Only those lines are lost; the next lines are written whole.
+    #[test]
+    fn damaged_history_keeps_every_whole_line() {
+        let dir = temp("damaged");
+        let path = dir.join("processedFiles.txt");
+        let (a, b) = (hash_path(Path::new(r"C:\a.mp4")), hash_path(Path::new(r"C:\b.mp4")));
+        let mut data = hex::encode(a).into_bytes();
+        data.extend_from_slice(b"\n\xff\xfe\x00garbage\n");
+        data.extend_from_slice(hex::encode(b).as_bytes());
+        std::fs::write(&path, &data).unwrap();
+        let (h1, h2) = ([1u8; 16], [2u8; 16]);
+        std::fs::write(dir.join("processed-content.tsv"), format!("{}\t10\tvideo\n{}", hex::encode(h1), &hex::encode(h2)[..10])).unwrap();
+        let mut h = History::load(path.clone());
+        assert!(h.contains(Path::new(r"C:\a.mp4")) && h.contains(Path::new(r"C:\b.mp4")), "lines lost around unreadable bytes");
+        assert!(h.contains_content(&h1, Want::Video) && !h.contains_content(&h2, Want::Video));
+        // The cut-off content line is ended before the next one is added.
+        let (path3, line) = h.add_content_now([3u8; 16], 30, VIDEO_MODE).unwrap();
+        append_lines(&path3, &line, true).unwrap();
+        assert!(History::load(path).contains_content(&[3u8; 16], Want::Video));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

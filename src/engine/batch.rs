@@ -4,12 +4,26 @@ use super::*;
 
 /// Whether another encoder may start now. The first encoder always may (otherwise a
 /// low-memory machine would wait forever).
-pub fn may_start_encoder(running: usize, memory: Option<system::MemoryStatus>) -> bool {
-    match memory {
-        _ if running == 0 => true,
-        None => true,
-        Some(m) => m.available_commit >= MIN_FREE_COMMIT && m.available_physical >= MIN_FREE_PHYSICAL,
+/// `free_vram_mb`: `None` when unknown (no NVIDIA GPU, or a CPU encoder).
+pub fn may_start_encoder(running: usize, memory: Option<system::MemoryStatus>, free_vram_mb: Option<u64>) -> bool {
+    if running == 0 {
+        return true;
     }
+    let ram = memory.is_none_or(|m| m.available_commit >= MIN_FREE_COMMIT && m.available_physical >= MIN_FREE_PHYSICAL);
+    ram && free_vram_mb.is_none_or(|v| v >= MIN_FREE_VRAM_MB)
+}
+
+/// Free GPU memory now, in MB (one `nvidia-smi` query, ~50 ms; asked only when an encoder
+/// starts). `None` without an NVIDIA driver.
+pub(super) async fn free_vram_mb() -> Option<u64> {
+    let mut cmd = tokio::process::Command::new("nvidia-smi");
+    cmd.args(["--query-gpu=memory.free", "--format=csv,noheader,nounits"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    system::configure_background_command(&mut cmd, false);
+    let out = tokio::time::timeout(Duration::from_secs(5), cmd.output()).await.ok()?.ok()?;
+    String::from_utf8_lossy(&out.stdout).lines().next()?.trim().parse().ok()
 }
 
 fn mode_label(mode: ImageMode) -> &'static str {
@@ -85,6 +99,7 @@ impl Engine {
                 inner.working = true;
                 inner.status = Status::Running;
                 inner.cancel = CancellationToken::new();
+                inner.release = inner.cancel.child_token();
                 inner.power = Some(PowerGuard::acquire());
             } else {
                 inner.status = Status::Done;
@@ -183,6 +198,9 @@ impl Engine {
         {
             let was_stopped = inner.stop_requested;
             inner.cpu = None;
+            for (_, memo) in inner.resume.drain() {
+                memo.discard();
+            }
             inner.gpu_polling = false;
             inner.video_ids.clear();
             inner.cpu_ids.clear();
@@ -271,7 +289,7 @@ impl Engine {
                     inner.video_ids.remove(&worker_id);
                     break;
                 }
-                Outcome::Processed | Outcome::Skipped | Outcome::Failed => {}
+                Outcome::Processed | Outcome::Skipped | Outcome::Failed | Outcome::Released => {}
             }
         }
     }
@@ -322,18 +340,34 @@ impl Engine {
                 inner.power = Some(PowerGuard::acquire());
             }
             self.paused.send_replace(pause);
-            inner.running_processes
+            // Every process ends (encoders asked to quit), freeing RAM, GPU memory, CPU and
+            // GPU; their files continue from their last finished step on Resume.
+            if pause {
+                inner.release.cancel();
+                inner.release = inner.cancel.child_token();
+            }
+            inner.running_processes + inner.images_active
         };
         self.log(if pause {
             match active {
                 0 => "Paused. Press Resume to continue.".to_string(),
-                1 => "Paused (1 ffmpeg process suspended). Press Resume to continue.".to_string(),
-                n => format!("Paused ({n} ffmpeg processes suspended). Press Resume to continue."),
+                n => format!("Paused: {n} file(s) in progress stopped to free memory, CPU and GPU. Press Resume to continue."),
             }
         } else {
             "Resumed".to_string()
         });
         self.send_state(true);
+    }
+
+    /// Ends the files in progress of a paused batch again (Pause already does). Does nothing
+    /// unless paused.
+    #[cfg(test)]
+    pub fn release_paused_jobs(&self) {
+        let mut inner = self.lock();
+        if inner.status == Status::Paused && inner.working && !inner.stop_requested {
+            inner.release.cancel();
+            inner.release = inner.cancel.child_token();
+        }
     }
 
     pub fn toggle_pause(self: &Arc<Self>) {
@@ -356,6 +390,12 @@ impl Engine {
             inner.stop_requested = true;
             inner.cancel.cancel();
             inner.power = None;
+        }
+        // Encoders were asked to quit (see `ask_to_quit`); killing them outright when the app
+        // exits can make the NVIDIA driver reset the GPU.
+        let until = Instant::now() + Duration::from_secs(12);
+        while self.lock().running_processes > 0 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(50));
         }
         // A file being replaced finishes first (a few seconds at most), so quitting never
         // leaves an original in the Recycle Bin with its new version still under a temp name.
@@ -462,12 +502,15 @@ mod tests {
     #[test]
     fn memory_admission() {
         // The first encoder always starts, even when memory is tight.
-        assert!(may_start_encoder(0, mem(1, 1)));
+        assert!(may_start_encoder(0, mem(1, 1), Some(100)));
         // Further encoders need headroom for a 4K encode.
-        assert!(!may_start_encoder(1, mem(4, 8)));
-        assert!(!may_start_encoder(1, mem(10, 1)));
-        assert!(may_start_encoder(1, mem(10, 4)));
-        assert!(may_start_encoder(3, None));
+        assert!(!may_start_encoder(1, mem(4, 8), None));
+        assert!(!may_start_encoder(1, mem(10, 1), None));
+        assert!(may_start_encoder(1, mem(10, 4), None));
+        assert!(may_start_encoder(3, None, None));
+        // ... in GPU memory too.
+        assert!(!may_start_encoder(1, mem(10, 4), Some(2048)));
+        assert!(may_start_encoder(1, mem(10, 4), Some(4096)));
     }
 
 }

@@ -52,7 +52,7 @@ mod job {
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
         SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
 
     static JOB: OnceLock<usize> = OnceLock::new();
@@ -64,7 +64,8 @@ mod job {
                 return 0;
             }
             let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            // Breakaway allowed: windows the user asked for (Explorer) outlive the app.
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
             SetInformationJobObject(
                 job,
                 JobObjectExtendedLimitInformation,
@@ -83,6 +84,42 @@ mod job {
             }
         }
     }
+}
+
+/// Crash tests: MEDIAOPTI_DIE_AT=<point> ends the process at that point of a replacement,
+/// like a forced quit or a power cut would (test builds only).
+pub fn die_here_in_tests(point: &str) {
+    #[cfg(test)]
+    if std::env::var("MEDIAOPTI_DIE_AT").is_ok_and(|v| v == point) {
+        std::process::abort();
+    }
+    #[cfg(not(test))]
+    let _ = point;
+}
+
+/// Puts the app itself in the job, so every process it starts is born inside it. Assigning a
+/// child after it started leaves a gap: a forced quit right then left the child outside the
+/// job, stuck half-created (seen with tools started at the moment of a forced quit).
+pub fn put_app_in_kill_on_exit_job() {
+    #[cfg(windows)]
+    unsafe {
+        job::assign(windows_sys::Win32::System::Threading::GetCurrentProcess() as _);
+    }
+}
+
+/// Starts a program that must outlive the app (Explorer showing a folder): outside the job
+/// when Windows allows it.
+pub fn spawn_detached(cmd: &mut std::process::Command) -> std::io::Result<std::process::Child> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+        if let Ok(child) = cmd.creation_flags(CREATE_BREAKAWAY_FROM_JOB).spawn() {
+            return Ok(child);
+        }
+        cmd.creation_flags(0);
+    }
+    cmd.spawn()
 }
 
 pub fn assign_to_kill_on_exit_job(child: &tokio::process::Child) {
@@ -474,6 +511,11 @@ pub fn init_claims_journal(journal: &Path) -> usize {
     if CLAIMS_JOURNAL.set(journal.to_path_buf()).is_err() {
         return 0;
     }
+    // On a first run the data folder may not exist yet: claims made before it did were
+    // not noted, and a placeholder left by a forced quit then stayed for good.
+    if let Some(dir) = journal.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
     let _guard = CLAIMS_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     clean_claims(journal)
 }
@@ -534,6 +576,28 @@ pub fn unused_name(path: &Path) -> std::path::PathBuf {
 }
 
 /// Moves a file, also across drives (copy, keep its dates, then delete). Returns where it went.
+/// Makes sure `path`'s data is on the disk (not only in the write cache), so a power cut or
+/// a crash right after can't leave it empty or half-written. Works on read-only files too.
+pub fn flush_to_disk(path: &Path) -> std::io::Result<()> {
+    let open = || fs::OpenOptions::new().write(true).open(path);
+    match open() {
+        Ok(f) => f.sync_all(),
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            let readonly = fs::metadata(path)?.permissions().readonly();
+            if !readonly {
+                return Err(err);
+            }
+            clear_readonly(path);
+            let flushed = open().and_then(|f| f.sync_all());
+            let mut perms = fs::metadata(path)?.permissions();
+            perms.set_readonly(true);
+            fs::set_permissions(path, perms)?;
+            flushed
+        }
+        Err(err) => Err(err),
+    }
+}
+
 pub fn move_file(from: &Path, to: &Path) -> std::io::Result<std::path::PathBuf> {
     if let Some(parent) = to.parent() {
         fs::create_dir_all(parent)?;
@@ -544,6 +608,11 @@ pub fn move_file(from: &Path, to: &Path) -> std::io::Result<std::path::PathBuf> 
     }
     let attrs = OriginalAttributes::from_metadata(&fs::metadata(from)?);
     fs::copy(from, &to)?;
+    // The copy is on the disk before the original is removed.
+    if let Err(err) = flush_to_disk(&to) {
+        let _ = remove_file_if_exists(&to);
+        return Err(err);
+    }
     restore_attributes(&to, &attrs)?;
     clear_readonly(from);
     if let Err(err) = fs::remove_file(from) {
@@ -582,6 +651,7 @@ pub fn replace_file_with_retry(
                     Disposal::Delete => {}
                 }
                 set_aside = true;
+                die_here_in_tests("set-aside");
             }
             clear_readonly(original);
             if final_target != original {

@@ -169,6 +169,19 @@ impl Inner {
         self.cpu_queues.iter().zip(self.cpu_cursors).map(|(q, c)| q.len().saturating_sub(c)).sum()
     }
 
+    /// A video whose job was ended by a Pause (to free memory): next in line again.
+    pub(super) fn requeue_video(&mut self, file: &Path) {
+        self.in_progress.remove(file);
+        self.pending_queue.insert(self.queue_cursor, file.to_path_buf());
+    }
+
+    /// A CPU file whose job was ended by a Pause: next in line in its stage again.
+    pub(super) fn requeue_cpu(&mut self, file: &Path) {
+        let stage = cpu_stage(file);
+        self.in_progress.remove(file);
+        self.cpu_queues[stage].insert(self.cpu_cursors[stage], file.to_path_buf());
+    }
+
     /// Adds a CPU file to its stage's queue (and the byte counts).
     pub(super) fn queue_cpu(&mut self, file: PathBuf, size: u64) {
         let stage = cpu_stage(&file);

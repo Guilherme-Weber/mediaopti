@@ -41,13 +41,22 @@ const HISTORY_SAVE_DELAY: Duration = Duration::from_secs(2);
 
 /// Memory needed before starting another ffmpeg while others run. A single 4K AV1 encode
 /// (multipass + 32-frame lookahead) was measured at up to ~5.3 GB of commit; running several
-/// in parallel once exhausted the system commit limit and crashed every process.
+/// in parallel once exhausted the system commit limit and crashed every process. Measured
+/// again 2026-11-16 (peak commit): 4K 4.9 GB (CPU decode) / 4.1 GB (GPU decode), 1440p AV1
+/// 3.4 / 2.6 GB, 1080p 1.4 GB.
 const MIN_FREE_COMMIT: u64 = 6 * 1024 * 1024 * 1024;
 const MIN_FREE_PHYSICAL: u64 = 2 * 1024 * 1024 * 1024;
 /// How long a newly started ffmpeg is given to allocate its buffers before the next
-/// worker re-checks free memory (only when memory is not plentiful).
+/// worker re-checks free memory (only when memory is not plentiful: enough for every job
+/// to start at once, `MIN_FREE_COMMIT` and `MIN_FREE_VRAM_MB` per job).
 const ADMISSION_WARMUP: Duration = Duration::from_secs(4);
-const PLENTIFUL_COMMIT: u64 = 16 * 1024 * 1024 * 1024;
+/// Free commit needed before starting a VMAF measurement while other work runs (a 4K
+/// measurement peaked at ~2.5 GB).
+const VMAF_MIN_FREE_COMMIT: u64 = 4 * 1024 * 1024 * 1024;
+/// Free GPU memory needed before starting another NVENC encode. One 4K AV1 encode with GPU
+/// decoding was measured at ~2.5 GB (1080p: ~0.9 GB); 6-8 parallel 4K encodes ran a 16 GB
+/// RTX 5070 Ti out of memory.
+const MIN_FREE_VRAM_MB: u64 = 3 * 1024;
 
 /// Where the engine sends logs and state (the window, or a recorder in tests).
 pub trait Ui: Send + Sync + 'static {
@@ -192,6 +201,11 @@ struct Inner {
     options: Options,
     run: RunStats,
     cancel: CancellationToken,
+    /// The running jobs' token (a child of `cancel`): Pause cancels it (every process ends
+    /// and frees its memory), and the jobs' files go back to the front of the queue.
+    release: CancellationToken,
+    /// Video jobs that Pause ended, with what they had finished (taken up on Resume).
+    resume: std::collections::HashMap<PathBuf, vmaf::VideoResume>,
     power: Option<PowerGuard>,
     /// Workers of the running batch, awaited by `run_batch` (files added during a run can
     /// start more).
@@ -235,6 +249,8 @@ enum Outcome {
     Skipped,
     Failed,
     Stopped,
+    /// Ended by a Pause that gave its memory back; the file is queued again.
+    Released,
     Empty,
     Fatal,
 }
@@ -246,6 +262,7 @@ impl Engine {
         ffmpeg_path: PathBuf,
         rt: tokio::runtime::Handle,
     ) -> Arc<Self> {
+        system::put_app_in_kill_on_exit_job();
         let history = History::load(data_dir.join("processedFiles.txt"));
         let placeholders = system::init_claims_journal(&data_dir.join("claimed-names.txt"));
         let image_tools = image::tools::Tools::discover(ffmpeg_path.clone(), data_dir);
@@ -295,6 +312,8 @@ impl Engine {
                 options: Options::default(),
                 run: RunStats::default(),
                 cancel: CancellationToken::new(),
+                release: CancellationToken::new(),
+                resume: std::collections::HashMap::new(),
                 power: None,
                 handles: Vec::new(),
                 video_ids: std::collections::BTreeSet::new(),

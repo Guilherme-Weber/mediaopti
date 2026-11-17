@@ -16,6 +16,16 @@ static NO_VIDEO: LazyLock<Regex> = LazyLock::new(|| {
 static NVENC_UNSUPPORTED: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)Frame dimensions are less than the minimum supported value|InitializeEncoder failed|Error while opening encoder|Error reinitializing filters").unwrap()
 });
+/// GPU memory (NVENC buffers, CUDA frames) or system memory ran out: the file is fine; it
+/// is tried again once another encoder has finished. A decoder that can't get a frame
+/// buffer says "get_buffer() failed", then "Invalid data found" (as for a corrupt file),
+/// drops the frame and goes on: ffmpeg may still exit 0 with frames missing.
+static OUT_OF_MEMORY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)out of memory|Cannot allocate memory|get_buffer\(\) failed|Memory allocation error|Failed to allocate").unwrap()
+});
+/// The frame size or format changed mid-stream and ffmpeg rebuilt the filters (only
+/// allowed on the GPU path; the CPU path runs with `-reinit_filter 0`).
+static RECONFIGURED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"Reconfiguring filter graph").unwrap());
 static CORRUPT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)Invalid data found when processing input|Error opening input files: End of file|moov atom not found").unwrap()
 });
@@ -28,6 +38,10 @@ pub struct Diagnostics {
     pub no_video_stream: bool,
     pub nvenc_unsupported: bool,
     pub corrupt_input: bool,
+    /// Ran out of GPU or system memory (also matches `nvenc_unsupported`; this one wins).
+    pub out_of_memory: bool,
+    /// The filters were rebuilt mid-stream (frame size changed).
+    pub reconfigured: bool,
     pub error_lines: Vec<String>,
     /// Input duration in seconds as reported by ffmpeg (0 if unknown).
     pub duration_sec: f64,
@@ -105,6 +119,12 @@ pub fn parse_chunk(
     }
     if NVENC_UNSUPPORTED.is_match(text) {
         diag.nvenc_unsupported = true;
+    }
+    if OUT_OF_MEMORY.is_match(text) {
+        diag.out_of_memory = true;
+    }
+    if RECONFIGURED.is_match(text) {
+        diag.reconfigured = true;
     }
     if CORRUPT.is_match(text) {
         diag.corrupt_input = true;
@@ -185,6 +205,19 @@ mod tests {
         assert!(d.corrupt_input);
         assert_eq!(d.error_lines.len(), 1);
         assert!(d.error_lines[0].starts_with("[W2: a.mp4] Error opening"));
+
+        // Seen with 6-8 parallel 4K encodes: not a file the GPU can't encode.
+        for text in [
+            "[av1_nvenc @ 0] CreateInputBuffer failed: out of memory (10): \n[vost#0:0/av1_nvenc] Error while opening encoder\n",
+            "[CUDA @ 0] cu->cuMemAlloc(&data, size) failed -> CUDA_ERROR_OUT_OF_MEMORY: out of memory\n",
+            "[vf#0:0 @ 0] Error while filtering: Cannot allocate memory\n",
+            "[libaom-av1 @ 0] Failed to decode frame: Memory allocation error\n[dec:libaom-av1 @ 0] Error submitting packet to decoder: Invalid data found when processing input\n",
+            "[h264 @ 0] get_buffer() failed\n[h264 @ 0] thread_get_buffer() failed\n[dec:h264 @ 0] Decoding error: Invalid data found when processing input\n",
+        ] {
+            let mut d = Diagnostics::default();
+            parse_chunk(&mut p, &mut d, 1, "a", text);
+            assert!(d.out_of_memory, "{text}");
+        }
 
         let mut d = Diagnostics::default();
         parse_chunk(&mut p, &mut d, 1, "a", "Stream map '0:V:0' matches no streams.\n");

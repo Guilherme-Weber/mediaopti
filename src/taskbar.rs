@@ -43,9 +43,8 @@ impl Taskbar {
         if self.last == Some(progress) {
             return;
         }
-        self.last = Some(progress);
-        unsafe {
-            let _ = match progress {
+        let done = unsafe {
+            match progress {
                 TaskbarProgress::None => self.list.SetProgressState(self.hwnd, TBPF_NOPROGRESS),
                 TaskbarProgress::Normal(pct) => self
                     .list
@@ -60,8 +59,10 @@ impl Taskbar {
                     .list
                     .SetProgressState(self.hwnd, TBPF_ERROR)
                     .and_then(|_| self.list.SetProgressValue(self.hwnd, 100, 100)),
-            };
-        }
+            }
+        };
+        // Refused (e.g. before Windows made the taskbar button): sent again next time.
+        self.last = done.is_ok().then_some(progress);
     }
 }
 
