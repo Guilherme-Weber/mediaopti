@@ -292,8 +292,6 @@ pub fn restart_if_requested() {
         // Breakaway refused (an outer job forbids it): Explorer starts it on the app's behalf.
         let _ = std::process::Command::new("explorer").arg(&exe).spawn();
     }
-    #[cfg(not(windows))]
-    let _ = cmd.spawn();
 }
 
 #[cfg(test)]

@@ -66,13 +66,4 @@ impl Taskbar {
     }
 }
 
-#[cfg(not(windows))]
-pub struct Taskbar;
 
-#[cfg(not(windows))]
-impl Taskbar {
-    pub fn new(_hwnd: isize) -> Option<Self> {
-        None
-    }
-    pub fn set(&mut self, _progress: TaskbarProgress) {}
-}

@@ -1,6 +1,10 @@
 // Hide the console window in release builds on Windows.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+// NVENC through ffmpeg.exe, the Recycle Bin, job objects, %APPDATA%: Windows only.
+#[cfg(not(windows))]
+compile_error!("mediaopti is a Windows app");
+
 mod app;
 mod archive;
 mod args;

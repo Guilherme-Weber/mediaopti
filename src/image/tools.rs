@@ -219,11 +219,6 @@ fn url_moniker_download(url: &str, to: &Path) -> Result<(), String> {
             Err(format!("no connection or the site refused it, code {hr:#010x}"))
         }
     }
-    #[cfg(not(windows))]
-    {
-        let _ = (url, to);
-        Err("only on Windows".into())
-    }
 }
 
 pub enum Capture {

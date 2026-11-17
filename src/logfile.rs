@@ -92,10 +92,6 @@ fn return_addresses() -> (usize, Vec<usize>) {
         let base = unsafe { GetModuleHandleW(std::ptr::null()) } as usize;
         (base, frames[..usize::from(n)].iter().map(|&f| f as usize).collect())
     }
-    #[cfg(not(windows))]
-    {
-        (0, Vec::new())
-    }
 }
 
 #[cfg(test)]

@@ -29,8 +29,6 @@ impl PowerGuard {
                 let _ = rx.recv();
                 SetThreadExecutionState(ES_CONTINUOUS);
             }
-            #[cfg(not(windows))]
-            let _ = rx.recv();
         });
         Self { release: Some(tx) }
     }
@@ -145,8 +143,6 @@ pub fn assign_to_kill_on_exit_job(child: &tokio::process::Child) {
     if let Some(h) = child.raw_handle() {
         job::assign(h);
     }
-    #[cfg(not(windows))]
-    let _ = child;
 }
 
 /// Same as [`assign_to_kill_on_exit_job`] for a `std::process::Child` (image tools).
@@ -156,8 +152,6 @@ pub fn assign_std_child_to_job(child: &std::process::Child) {
         use std::os::windows::io::AsRawHandle;
         job::assign(child.as_raw_handle());
     }
-    #[cfg(not(windows))]
-    let _ = child;
 }
 
 #[cfg(windows)]
@@ -202,11 +196,6 @@ pub fn set_std_process_suspended(child: &std::process::Child, suspended: bool) -
         };
         status >= 0
     }
-    #[cfg(not(windows))]
-    {
-        let _ = (child, suspended);
-        false
-    }
 }
 
 /// Bytes `child` has read so far (all its reads: files and pipes).
@@ -221,11 +210,6 @@ pub fn bytes_read(child: &std::process::Child) -> Option<u64> {
         let ok = unsafe { GetProcessIoCounters(child.as_raw_handle() as _, &mut counters) };
         (ok != 0).then_some(counters.ReadTransferCount)
     }
-    #[cfg(not(windows))]
-    {
-        let _ = child;
-        None
-    }
 }
 
 /// Free space (for this user) on the drive holding `path`.
@@ -239,11 +223,6 @@ pub fn free_space(path: &Path) -> Option<u64> {
         let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, std::ptr::null_mut(), std::ptr::null_mut()) };
         (ok != 0).then_some(free)
     }
-    #[cfg(not(windows))]
-    {
-        let _ = path;
-        None
-    }
 }
 
 /// Gives a file or folder the hidden attribute (best effort).
@@ -256,8 +235,6 @@ pub fn set_hidden(path: &Path) {
         // SAFETY: `wide` is NUL-terminated and lives through the call.
         unsafe { windows_sys::Win32::Storage::FileSystem::SetFileAttributesW(wide.as_ptr(), current | 0x2) };
     }
-    #[cfg(not(windows))]
-    let _ = path;
 }
 
 /// Whether a process with this id is running.
@@ -277,11 +254,6 @@ pub fn process_alive(pid: u32) -> bool {
             CloseHandle(h);
             alive
         }
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = pid;
-        true
     }
 }
 
@@ -326,8 +298,6 @@ pub fn configure_background_command(cmd: &mut tokio::process::Command, low_prior
         };
         cmd.creation_flags(flags);
     }
-    #[cfg(not(windows))]
-    let _ = (cmd, low_priority);
 }
 
 /// Free physical memory and free commit (RAM + page file) in bytes.
@@ -351,8 +321,6 @@ pub fn memory_status() -> Option<MemoryStatus> {
             available_commit: status.ullAvailPageFile,
         })
     }
-    #[cfg(not(windows))]
-    None
 }
 
 /// Holds a named mutex so only one mediaopti runs at a time (two instances would
@@ -381,11 +349,6 @@ impl SingleInstance {
             }
             // Intentionally kept open for the life of the process.
             Some(Self { _handle: handle as usize })
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = name;
-            Some(Self {})
         }
     }
 }
@@ -457,11 +420,6 @@ pub fn recycle(path: &Path) -> std::io::Result<()> {
         }
         Ok(())
     }
-    #[cfg(not(windows))]
-    {
-        let _ = path;
-        Err(std::io::Error::other("the Recycle Bin is only available on Windows"))
-    }
 }
 
 /// Number of hard links to a file (1 for a normal file). Replacing a hard-linked file
@@ -481,11 +439,6 @@ pub fn hard_link_count(path: &Path) -> std::io::Result<u32> {
             return Err(std::io::Error::last_os_error());
         }
         Ok(info.nNumberOfLinks)
-    }
-    #[cfg(not(windows))]
-    {
-        use std::os::unix::fs::MetadataExt;
-        Ok(fs::metadata(path)?.nlink() as u32)
     }
 }
 
@@ -654,11 +607,6 @@ pub fn copy_alternate_streams(from: &Path, to: &Path) -> std::io::Result<usize> 
         }
         Ok(names.len())
     }
-    #[cfg(not(windows))]
-    {
-        let _ = (from, to);
-        Ok(0)
-    }
 }
 
 /// `path` as a NUL-terminated UTF-16 string for the Windows API. A long absolute path gets
@@ -697,13 +645,6 @@ fn move_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
         }
         Ok(())
     }
-    #[cfg(not(windows))]
-    {
-        if to.exists() {
-            return Err(std::io::ErrorKind::AlreadyExists.into());
-        }
-        fs::rename(from, to)
-    }
 }
 
 /// Copies `from` to `to`, failing with `AlreadyExists` if `to` exists.
@@ -719,11 +660,6 @@ fn copy_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
             return Err(std::io::Error::last_os_error());
         }
         Ok(())
-    }
-    #[cfg(not(windows))]
-    {
-        fs::OpenOptions::new().write(true).create_new(true).open(to)?;
-        fs::copy(from, to).map(drop)
     }
 }
 
@@ -852,8 +788,6 @@ impl OriginalAttributes {
             readonly: meta.permissions().readonly(),
             #[cfg(windows)]
             flags: std::os::windows::fs::MetadataExt::file_attributes(meta) & KEPT_FLAGS,
-            #[cfg(not(windows))]
-            flags: 0,
         }
     }
 }
@@ -901,14 +835,6 @@ fn local_time() -> (u16, u16, u16, u16, u16, u16) {
         windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut t);
         let t: windows_sys::Win32::Foundation::SYSTEMTIME = t;
         (t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond)
-    }
-    #[cfg(not(windows))]
-    {
-        let secs = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        (1970, 1, 1, (secs / 3600 % 24) as u16, (secs / 60 % 60) as u16, (secs % 60) as u16)
     }
 }
 
