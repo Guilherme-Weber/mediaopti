@@ -457,6 +457,12 @@ impl Engine {
             why.map(|why| format!("lost {why}"))
         };
         self.lock().job_streams.remove(&input);
+        // Stop or Pause cut the checks short: that says nothing about the new version.
+        if self.job_released() {
+            self.log_remove(&tmp);
+            completion.armed = false;
+            return self.ended_early(worker_id, &input, &display);
+        }
         {
             if let Some(why) = lost {
                 self.log_remove(&tmp);
@@ -605,7 +611,7 @@ impl Engine {
         let mut cmd = tokio::process::Command::new(&self.ffmpeg_path);
         cmd.args(["-hide_banner", "-i"]).arg(path).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true);
         system::configure_background_command(&mut cmd, true);
-        let out = cmd.output().await.ok()?;
+        let out = super::ffmpeg::probe_output(&mut cmd, self.job_token(), Duration::from_secs(120)).await?;
         let text = String::from_utf8_lossy(&out.stderr);
         let d = text.split("Duration: ").nth(1)?.split(',').next()?.trim();
         let mut secs = 0.0;
@@ -621,11 +627,17 @@ impl Engine {
     /// Stop was pressed.
     pub(super) async fn same_video(&self, original: &Path, existing: &Path, duration_sec: f64) -> Result<bool, Stopped> {
         let theirs = self.probe_duration(existing).await;
+        if self.job_released() {
+            return Err(Stopped);
+        }
         let close = |d: f64| duration_sec > 0.0 && (d - duration_sec).abs() <= (duration_sec * 0.02).max(0.5);
         if !theirs.is_some_and(close) {
             return Ok(false);
         }
         let (ours, theirs) = (self.probe_streams(original).await, self.probe_streams(existing).await);
+        if self.job_released() {
+            return Err(Stopped);
+        }
         if super::ffmpeg::streams_lost(&ours, &theirs).is_some() || super::ffmpeg::streams_lost(&theirs, &ours).is_some() {
             return Ok(false);
         }

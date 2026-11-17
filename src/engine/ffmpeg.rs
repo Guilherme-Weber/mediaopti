@@ -13,6 +13,29 @@ pub(super) struct Attempt {
     pub(super) diag: Diagnostics,
 }
 
+/// Time limits for the short ffmpeg probes (reading a file's listing, its first frame) and
+/// the long ones (decoding a whole audio track, reading every packet).
+const PROBE_LIMIT: Duration = Duration::from_secs(120);
+const LONG_PROBE_LIMIT: Duration = Duration::from_secs(3600);
+
+/// Runs an ffmpeg probe. `None` when it can't start, `cancel` (the job's release token:
+/// Stop or Pause) fires first, or it runs past `limit`; the process is then killed
+/// (`kill_on_drop`). A `None` after a cancel is not the file's fault: callers check
+/// `Engine::job_released` before concluding anything from it.
+pub(super) async fn probe_output(cmd: &mut tokio::process::Command, cancel: Option<CancellationToken>, limit: Duration) -> Option<std::process::Output> {
+    let cancelled = async {
+        match cancel {
+            Some(token) => token.cancelled().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        out = cmd.output() => out.ok(),
+        () = cancelled => None,
+        () = tokio::time::sleep(limit) => None,
+    }
+}
+
 /// What a failure to start ffmpeg means. Windows refusing for lack of memory
 /// (ERROR_NOT_ENOUGH_MEMORY, ERROR_COMMITMENT_LIMIT) is a memory shortage: an attempt that
 /// failed out of memory, which `Engine::encode` waits out and retries. Anything else (ffmpeg
@@ -353,8 +376,22 @@ impl Engine {
         let mut cmd = tokio::process::Command::new(&self.ffmpeg_path);
         cmd.args(["-hide_banner", "-i"]).arg(input).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true);
         system::configure_background_command(&mut cmd, true);
-        let out = cmd.output().await.ok()?;
+        let out = probe_output(&mut cmd, self.job_token(), PROBE_LIMIT).await?;
         gpu_decodable_stream(&String::from_utf8_lossy(&out.stderr))
+    }
+
+    /// The running job's release token (Stop, or a Pause that ends the processes), if a batch
+    /// runs.
+    pub(super) fn job_token(&self) -> Option<CancellationToken> {
+        let inner = self.lock();
+        inner.working.then(|| inner.release.clone())
+    }
+
+    /// Whether the running jobs were released (Stop, or a Pause that ends the processes): an
+    /// unfinished probe then says nothing about the file.
+    pub(super) fn job_released(&self) -> bool {
+        let inner = self.lock();
+        inner.release.is_cancelled() || inner.stop_requested
     }
 
     /// What `path` holds besides its picture (audio, subtitles, attachments, covers,
@@ -363,9 +400,9 @@ impl Engine {
         let mut cmd = tokio::process::Command::new(&self.ffmpeg_path);
         cmd.args(["-hide_banner", "-i"]).arg(path).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true);
         system::configure_background_command(&mut cmd, true);
-        let mut streams = match cmd.output().await {
-            Ok(out) => args::Streams::parse(&String::from_utf8_lossy(&out.stderr)),
-            Err(_) => args::Streams::default(),
+        let mut streams = match probe_output(&mut cmd, self.job_token(), PROBE_LIMIT).await {
+            Some(out) => args::Streams::parse(&String::from_utf8_lossy(&out.stderr)),
+            None => args::Streams::default(),
         };
         if streams.hdr {
             // HDR10's static metadata travels with the frames: read from the first one.
@@ -378,7 +415,7 @@ impl Engine {
                 .stderr(Stdio::piped())
                 .kill_on_drop(true);
             system::configure_background_command(&mut cmd, true);
-            if let Ok(out) = cmd.output().await {
+            if let Some(out) = probe_output(&mut cmd, self.job_token(), PROBE_LIMIT).await {
                 let text = String::from_utf8_lossy(&out.stderr).to_ascii_lowercase();
                 streams.mastering = text.contains("mastering display");
                 streams.light_level = text.contains("content light level");
@@ -401,7 +438,8 @@ impl Engine {
                 .stderr(Stdio::null())
                 .kill_on_drop(true);
             system::configure_background_command(&mut cmd, true);
-            async move { cmd.output().await.ok().filter(|o| o.status.success()).map(|o| o.stdout) }
+            let token = self.job_token();
+            async move { probe_output(&mut cmd, token, LONG_PROBE_LIMIT).await.filter(|o| o.status.success()).map(|o| o.stdout) }
         };
         let (x, y) = (md5(a).await, md5(b).await);
         x.is_some() && x == y
@@ -419,7 +457,7 @@ impl Engine {
             .stderr(Stdio::null())
             .kill_on_drop(true);
         system::configure_background_command(&mut cmd, true);
-        let out = cmd.output().await.ok()?;
+        let out = probe_output(&mut cmd, self.job_token(), LONG_PROBE_LIMIT).await?;
         if !out.status.success() {
             return None;
         }
@@ -575,6 +613,38 @@ pub(super) fn gpu_decodable_stream(report: &str) -> Option<(u32, u32)> {
 mod tests {
     use super::gpu_decodable_stream as ok;
     use super::{packet_timing, timing_mismatch};
+
+    /// A probe that never ends (a pathological file) gives up at its time limit, and Stop or
+    /// Pause ends it at once; the process is killed either way.
+    #[test]
+    fn probes_end_at_their_limit_and_on_stop() {
+        use std::process::Stdio;
+        use std::time::Duration;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let endless = || {
+                let mut cmd = tokio::process::Command::new("ping");
+                cmd.args(["-n", "60", "127.0.0.1"]).stdout(Stdio::null()).kill_on_drop(true);
+                cmd
+            };
+            let t = std::time::Instant::now();
+            assert!(super::probe_output(&mut endless(), None, Duration::from_secs(1)).await.is_none());
+            assert!(t.elapsed() < Duration::from_secs(10), "time limit");
+            let stop = tokio_util::sync::CancellationToken::new();
+            let later = stop.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                later.cancel();
+            });
+            let t = std::time::Instant::now();
+            assert!(super::probe_output(&mut endless(), Some(stop), Duration::from_secs(600)).await.is_none());
+            assert!(t.elapsed() < Duration::from_secs(10), "Stop");
+            let mut quick = tokio::process::Command::new("cmd");
+            quick.args(["/c", "echo", "hi"]).kill_on_drop(true);
+            let out = super::probe_output(&mut quick, None, Duration::from_secs(60)).await.unwrap();
+            assert!(String::from_utf8_lossy(&out.stdout).contains("hi"));
+        });
+    }
 
     /// Windows refusing to start ffmpeg for lack of memory (commit) is a memory shortage,
     /// waited out like one; it used to end every video of the batch.

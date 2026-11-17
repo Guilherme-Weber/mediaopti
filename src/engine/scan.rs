@@ -49,16 +49,13 @@ pub(super) struct ScanResult {
 /// listing itself (on Windows `DirEntry::metadata` needs no extra system call).
 /// Whether ffmpeg can read `path` as media (a half-written encode, e.g. an MP4 without its
 /// index, can't).
+/// Runs through `tools::run` with a time limit: a file that makes ffmpeg hang can't hold up
+/// the scan.
 pub(super) fn media_readable(ffmpeg: &Path, path: &Path) -> bool {
-    let mut cmd = std::process::Command::new(ffmpeg);
-    cmd.args(["-hide_banner", "-v", "error", "-i"]).arg(path).args(["-map", "0", "-c", "copy", "-f", "null", "-"]);
-    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // no console window
-    }
-    cmd.output().is_ok_and(|o| o.status.success() && o.stderr.is_empty())
+    let args = crate::os_args!["-hide_banner", "-v", "error", "-i", path, "-map", "0", "-c", "copy", "-f", "null", "-"];
+    let gate = image::tools::Gate::new(CancellationToken::new(), None);
+    image::tools::run(ffmpeg, args, None, image::tools::Capture::None, Duration::from_secs(600), &gate)
+        .is_ok_and(|r| r.success && r.stderr.is_empty())
 }
 
 /// `settle_temps`: leftover temp files are settled (`settle_orphan_temp`); off while a batch
