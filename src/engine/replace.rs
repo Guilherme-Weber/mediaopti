@@ -262,6 +262,11 @@ impl Drop for ReplacingGuard {
 /// temp name gets the right name at the next scan (`settle_orphan_temp`).
 pub(super) fn replace_original(tmp: &Path, final_target: &Path, original: &Path, disposal: &system::Disposal, note: &dyn Fn(&Path) -> std::io::Result<()>) -> Result<(), String> {
     let _replacing = ReplacingGuard::new();
+    // The Mark of the Web and other streams the tools didn't carry over.
+    if let Err(err) = system::copy_alternate_streams(original, tmp) {
+        let _ = system::remove_file_if_exists(tmp);
+        return Err(format!("could not copy its alternate data streams: {err}"));
+    }
     if let Err(err) = system::flush_to_disk(tmp) {
         let _ = system::remove_file_if_exists(tmp);
         return Err(format!("could not write the new version to the disk: {err}"));
@@ -389,6 +394,28 @@ mod tests {
         journal_start(&tmp, &orig, &orig).unwrap();
         assert_eq!(settle_orphan_temp(&tmp, &unreadable).unwrap(), Settled::Removed);
         assert_eq!(std::fs::read(&orig).unwrap(), b"original");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The new version carries the original's alternate data streams: the Mark of the Web
+    /// (`Zone.Identifier`, which keeps Office's Protected View and macro blocking on a
+    /// downloaded file) and any other.
+    #[cfg(windows)]
+    #[test]
+    fn the_new_version_keeps_the_originals_streams() {
+        let dir = std::env::temp_dir().join(format!("mo-streams-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (orig, tmp) = (dir.join("report.docm"), dir.join("report.mediaopti.i1.docm"));
+        std::fs::write(&orig, b"original").unwrap();
+        let zone = b"[ZoneTransfer]\r\nZoneId=3\r\n";
+        std::fs::write(dir.join("report.docm:Zone.Identifier"), zone).unwrap();
+        std::fs::write(dir.join("report.docm:app.tags"), b"red").unwrap();
+        std::fs::write(&tmp, b"new").unwrap();
+        replace_original(&tmp, &orig, &orig, &system::Disposal::Delete, &|_: &Path| Ok(())).unwrap();
+        assert_eq!(std::fs::read(&orig).unwrap(), b"new");
+        assert_eq!(std::fs::read(dir.join("report.docm:Zone.Identifier")).unwrap(), zone);
+        assert_eq!(std::fs::read(dir.join("report.docm:app.tags")).unwrap(), b"red");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

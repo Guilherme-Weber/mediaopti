@@ -614,6 +614,53 @@ pub fn flush_to_disk(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Copies `from`'s alternate data streams (`file:Zone.Identifier`, the Mark of the Web, and
+/// any other) to `to`, which the tools wrote without them. Returns how many.
+pub fn copy_alternate_streams(from: &Path, to: &Path) -> std::io::Result<usize> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{GetLastError, ERROR_HANDLE_EOF, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{FindClose, FindFirstStreamW, FindNextStreamW, FindStreamInfoStandard, WIN32_FIND_STREAM_DATA};
+        let mut names = Vec::new();
+        // SAFETY: all-zero is a valid value for this plain C struct.
+        let mut data: WIN32_FIND_STREAM_DATA = unsafe { std::mem::zeroed() };
+        // SAFETY: the path is NUL-terminated; `data` is writable for the call.
+        let find = unsafe { FindFirstStreamW(wide(from).as_ptr(), FindStreamInfoStandard, (&raw mut data).cast(), 0) };
+        if find == INVALID_HANDLE_VALUE {
+            // ERROR_HANDLE_EOF: no stream at all to list (a FAT drive has none either).
+            return if unsafe { GetLastError() } == ERROR_HANDLE_EOF { Ok(0) } else { Err(std::io::Error::last_os_error()) };
+        }
+        loop {
+            let len = data.cStreamName.iter().position(|&c| c == 0).unwrap_or(data.cStreamName.len());
+            // ":name:$DATA"; the unnamed "::$DATA" is the file's content.
+            let name = String::from_utf16_lossy(&data.cStreamName[..len]);
+            if let Some(stream) = name.strip_prefix(':').and_then(|n| n.strip_suffix(":$DATA")).filter(|n| !n.is_empty()) {
+                names.push(stream.to_string());
+            }
+            // SAFETY: `find` is a valid search handle; `data` is writable for the call.
+            if unsafe { FindNextStreamW(find, (&raw mut data).cast()) } == 0 {
+                break;
+            }
+        }
+        // SAFETY: `find` came from FindFirstStreamW and is closed once.
+        unsafe { FindClose(find) };
+        let stream_of = |file: &Path, stream: &str| {
+            let mut p = verbatim_if_long(file).into_os_string();
+            p.push(format!(":{stream}"));
+            std::path::PathBuf::from(p)
+        };
+        for stream in &names {
+            fs::write(stream_of(to, stream), fs::read(stream_of(from, stream))?)?;
+        }
+        Ok(names.len())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (from, to);
+        Ok(0)
+    }
+}
+
 /// `path` as a NUL-terminated UTF-16 string for the Windows API. A long absolute path gets
 /// the `\\?\` form, which has no length limit (the plain form stops at 260 characters unless
 /// the system allows long paths). Not for the Shell's functions, which refuse that form.
