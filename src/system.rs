@@ -140,6 +140,10 @@ pub fn lossless_only_in_tests(file: &Path) -> bool {
     }
 }
 
+/// Files whose dates and attributes can't be restored (test builds only).
+#[cfg(test)]
+pub static ATTRIBUTES_FAIL_ON: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
 /// Names a replacement can't rename a new version to, after its original was set aside
 /// (test builds only): like a target held open by another program until the retries end.
 #[cfg(test)]
@@ -787,7 +791,11 @@ pub fn move_file(from: &Path, wanted: &Path) -> std::io::Result<std::path::PathB
         let _ = remove_file_if_exists(&to);
         return Err(err);
     }
-    restore_attributes(&to, &attrs)?;
+    if let Err(err) = restore_attributes(&to, &attrs) {
+        clear_readonly(&to);
+        let _ = remove_file_if_exists(&to);
+        return Err(err);
+    }
     clear_readonly(from);
     if let Err(err) = fs::remove_file(from) {
         let _ = remove_file_if_exists(&to);
@@ -892,6 +900,10 @@ impl OriginalAttributes {
 
 /// Restores creation, access and modification dates, then the read-only flag.
 pub fn restore_attributes(path: &Path, attrs: &OriginalAttributes) -> std::io::Result<()> {
+    #[cfg(test)]
+    if ATTRIBUTES_FAIL_ON.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().any(|n| path.file_name().is_some_and(|f| f == n.as_str())) {
+        return Err(std::io::Error::other("test: dates and attributes can't be set"));
+    }
     clear_readonly(path);
     {
         let file = File::options().write(true).open(path)?;
@@ -1191,6 +1203,16 @@ mod tests {
         assert_eq!(fs::read(dest.join("a.flac")).unwrap(), b"someone else's");
         assert!(!orig.exists());
         clear_readonly(&to);
+        // A copy whose dates can't be set fails the move and is removed: the retries of a
+        // replacement don't leave "b (2)", "b (3)"... behind.
+        let orig = src.join("b.flac");
+        fs::write(&orig, b"original").unwrap();
+        ATTRIBUTES_FAIL_ON.lock().unwrap().push("b.flac".into());
+        let failed = move_file(&orig, &dest.join("b.flac"));
+        ATTRIBUTES_FAIL_ON.lock().unwrap().retain(|n| n != "b.flac");
+        assert!(failed.is_err());
+        assert!(orig.exists(), "the original stays");
+        assert!(!dest.join("b.flac").exists(), "no copy left behind");
         let _ = fs::remove_dir_all(&src);
         let _ = fs::remove_dir_all(&dest);
     }
