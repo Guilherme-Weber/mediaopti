@@ -773,7 +773,7 @@ pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, dispo
     // A big picture's visually lossless search runs alone, and only with its memory free;
     // otherwise this file gets the lossless pass only (and is tried again later).
     let pictured = matches!(kind, image::Kind::Png | image::Kind::Jpg | image::Kind::Bmp | image::Kind::Tga);
-    let lossy_need = if ctx.lossy && pictured { image::pixel_count(path).map_or(0, |px| px * LOSSY_BYTES_PER_PIXEL) } else { 0 };
+    let lossy_need = if ctx.lossy && pictured { image::pixel_count(path).map_or(0, |px| px.saturating_mul(LOSSY_BYTES_PER_PIXEL)) } else { 0 };
     let _big_job = if lossy_need >= BIG_LOSSY_JOB {
         let Some(guard) = one_big_lossy_job(&ctx.gate) else { return ImageResult::Stopped };
         Some(guard)

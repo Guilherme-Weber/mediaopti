@@ -199,10 +199,19 @@ pub fn pixel_count(path: &Path) -> Option<u64> {
     std::io::Read::read_to_end(&mut std::io::Read::take(std::fs::File::open(path).ok()?, 1 << 20), &mut head).ok()?;
     let be32 = |at: usize| Some(u64::from(u32::from_be_bytes(head.get(at..at + 4)?.try_into().ok()?)));
     let le16 = |at: usize| Some(u64::from(u16::from_le_bytes(head.get(at..at + 2)?.try_into().ok()?)));
-    match sniff_picture(path)? {
-        Kind::Png => Some(be32(16)? * be32(20)?),
-        Kind::Jpg => jpeg::dimensions(&head).map(|(w, h)| u64::from(w) * u64::from(h)),
-        Kind::Gif => Some(le16(6)? * le16(8)?),
+    let le32 = |at: usize| Some(u32::from_le_bytes(head.get(at..at + 4)?.try_into().ok()?));
+    match sniff_picture(path) {
+        Some(Kind::Png) => Some(be32(16)? * be32(20)?),
+        Some(Kind::Jpg) => jpeg::dimensions(&head).map(|(w, h)| u64::from(w) * u64::from(h)),
+        Some(Kind::Gif) => Some(le16(6)? * le16(8)?),
+        // BMP: the old core header has 16-bit sizes; the others signed 32-bit ones (a
+        // negative height is a top-down picture).
+        _ if head.starts_with(b"BM") => match le32(14)? {
+            12 => Some(le16(18)? * le16(20)?),
+            _ => Some(u64::from((le32(18)? as i32).unsigned_abs()) * u64::from((le32(22)? as i32).unsigned_abs())),
+        },
+        // TGA has no signature: its extension says it.
+        _ if crate::args::ext_lower(path) == "tga" => Some(le16(12)? * le16(14)?),
         _ => None,
     }
 }
@@ -1211,12 +1220,28 @@ mod tests {
         gif.extend(320u16.to_le_bytes());
         gif.extend(240u16.to_le_bytes());
         gif.extend([0, 0, 0]);
-        for (name, data, want) in [("a.png", png, 13_481 * 12_136), ("a.png.jpg", jpg.clone(), 12_000_000), ("jpeg.png", jpg, 12_000_000), ("a.gif", gif, 76_800)] {
+        // BMP: BITMAPINFOHEADER (top-down: negative height) and the old core header; TGA has
+        // no signature, its extension says it.
+        let bmp = |dib: u32, dims: &[u8]| [b"BM".as_slice(), &[0; 12], &dib.to_le_bytes(), dims, &[0; 16]].concat();
+        let info = bmp(40, &[16_000i32.to_le_bytes(), (-10_000i32).to_le_bytes()].concat());
+        let core = bmp(12, &[640u16.to_le_bytes(), 480u16.to_le_bytes()].concat());
+        let tga = [&[0u8, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0][..], &12_000u16.to_le_bytes(), &9_000u16.to_le_bytes(), &[24, 0]].concat();
+        for (name, data, want) in [
+            ("a.png", png, 13_481 * 12_136),
+            ("a.png.jpg", jpg.clone(), 12_000_000),
+            ("jpeg.png", jpg, 12_000_000),
+            ("a.gif", gif, 76_800),
+            ("big.bmp", info, 160_000_000),
+            ("old.bmp", core, 307_200),
+            ("big.tga", tga, 108_000_000),
+        ] {
             std::fs::write(dir.join(name), data).unwrap();
             assert_eq!(pixel_count(&dir.join(name)), Some(want), "{name}");
         }
         std::fs::write(dir.join("a.txt"), b"not a picture").unwrap();
         assert_eq!(pixel_count(&dir.join("a.txt")), None);
+        std::fs::write(dir.join("short.bmp"), b"BM").unwrap();
+        assert_eq!(pixel_count(&dir.join("short.bmp")), None, "a cut header is unknown, not zero");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
