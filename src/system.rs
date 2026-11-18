@@ -93,8 +93,12 @@ pub static PANIC_ON: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::
 pub fn panic_here_in_tests(file: &Path) {
     #[cfg(test)]
     {
-        let names = PANIC_ON.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if file.file_name().is_some_and(|n| names.iter().any(|p| n == p.as_str())) {
+        // The lock is let go first: panicking while holding it would poison it for the others.
+        let hit = {
+            let names = PANIC_ON.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            file.file_name().is_some_and(|n| names.iter().any(|p| n == p.as_str()))
+        };
+        if hit {
             panic!("test panic on {}", file.display());
         }
     }

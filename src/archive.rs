@@ -125,12 +125,22 @@ type Done = (usize, Vec<u8>, Vec<String>);
 /// slots (a comic's pages then use the whole CPU near the end of a run). Returns, per page,
 /// its index, bytes (optimized or not) and steps.
 fn optimize_pages(ictx: &Ctx, pages: Vec<Page>, work: &Path, progress: Option<&image::tools::Progress>) -> Result<Vec<Done>, RunError> {
+    /// Gives the borrowed slots back however the pages end, a panic included.
+    struct Borrowed<'a>(Option<&'a image::tools::Slots>, usize);
+    impl Drop for Borrowed<'_> {
+        fn drop(&mut self) {
+            if let Some(slots) = self.0 {
+                slots.release(self.1);
+            }
+        }
+    }
     let mut extra = 0;
     if let Some(slots) = &ictx.slots {
         let commit = crate::system::memory_status().map_or(u64::MAX, |m| m.available_commit);
         let affordable = usize::try_from(commit.saturating_sub(2 * PAGE_COMMIT) / PAGE_COMMIT).unwrap_or(usize::MAX);
         extra = slots.borrow_idle(pages.len().saturating_sub(1).min(affordable));
     }
+    let _borrowed = Borrowed(ictx.slots.as_deref(), extra);
     let next = std::sync::atomic::AtomicUsize::new(0);
     let pages: Vec<std::sync::Mutex<Option<Page>>> = pages.into_iter().map(|p| std::sync::Mutex::new(Some(p))).collect();
     let results = std::sync::Mutex::new(Vec::with_capacity(pages.len()));
@@ -145,6 +155,7 @@ fn optimize_pages(ictx: &Ctx, pages: Vec<Page>, work: &Path, progress: Option<&i
                     failure.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert(RunError::Cancelled);
                     break;
                 }
+                crate::system::panic_here_in_tests(work);
                 let r = optimize_entry(ictx, kind, &data, &work.join(format!("z{idx}")));
                 if let Some(p) = progress {
                     p.step();
@@ -162,9 +173,7 @@ fn optimize_pages(ictx: &Ctx, pages: Vec<Page>, work: &Path, progress: Option<&i
             });
         }
     });
-    if let Some(slots) = &ictx.slots {
-        slots.release(extra);
-    }
+    drop(_borrowed);
     if let Some(e) = failure.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner) {
         return Err(e);
     }
@@ -568,6 +577,28 @@ mod tests {
         let r = optimize(&c, Kind::Cbz, &enc, &dir).unwrap();
         assert!(r.best.is_none() && r.note.as_deref().is_some_and(|n| n.contains("encrypted")), "{:?}", r.note);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A page that panics (a bug, a picture nobody foresaw) fails its comic, and the CPU
+    /// slots the comic borrowed come back: the other image workers don't wait for them.
+    #[test]
+    fn borrowed_slots_come_back_after_a_panic() {
+        let Some(mut c) = ctx() else {
+            skip_test!("tools not found");
+            return;
+        };
+        let slots = crate::image::tools::Slots::new(4);
+        assert!(slots.acquire(&c.gate), "the job's own slot");
+        c.slots = Some(slots.clone());
+        let work = std::env::temp_dir().join(format!("mo-slot-panic-{}", std::process::id()));
+        std::fs::create_dir_all(&work).unwrap();
+        crate::system::PANIC_ON.lock().unwrap().push(work.file_name().unwrap().to_string_lossy().into_owned());
+        let pages: Vec<Page> = (0..6).map(|i| (i, Kind::Png, vec![0u8; 16])).collect();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| optimize_pages(&c, pages, &work, None))).is_err();
+        crate::system::PANIC_ON.lock().unwrap().retain(|n| !n.starts_with("mo-slot-panic-"));
+        assert!(panicked);
+        assert_eq!(slots.borrow_idle(usize::MAX), 3, "every borrowed slot is back (the job still holds its own)");
+        let _ = std::fs::remove_dir_all(&work);
     }
 
     /// A comic with more pages than a batch, on borrowed CPU slots: every page optimized,
