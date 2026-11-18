@@ -57,14 +57,17 @@ fn only_new(loaded: &[PathBuf], files: Vec<PathBuf>, sizes: Vec<u64>) -> Vec<(Pa
 }
 
 /// Whether ffmpeg can read `path` as media (a half-written encode, e.g. an MP4 without its
-/// index, can't).
+/// index, can't). `None` when ffmpeg couldn't tell: it didn't start (missing, out of memory)
+/// or ran out of time.
 /// Runs through `tools::run` with a time limit: a file that makes ffmpeg hang can't hold up
 /// the scan.
-pub(super) fn media_readable(ffmpeg: &Path, path: &Path) -> bool {
+pub(super) fn media_readable(ffmpeg: &Path, path: &Path) -> Option<bool> {
     let args = crate::os_args!["-hide_banner", "-v", "error", "-i", path, "-map", "0", "-c", "copy", "-f", "null", "-"];
     let gate = image::tools::Gate::new(CancellationToken::new(), None);
-    image::tools::run(ffmpeg, args, None, image::tools::Capture::None, Duration::from_secs(600), &gate)
-        .is_ok_and(|r| r.success && r.stderr.is_empty())
+    match image::tools::run(ffmpeg, args, None, image::tools::Capture::None, Duration::from_secs(600), &gate) {
+        Ok(r) => Some(r.success && r.stderr.is_empty()),
+        Err(_) => None,
+    }
 }
 
 /// `settle_temps`: leftover temp files are settled (`settle_orphan_temp`); off while a batch

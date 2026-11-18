@@ -34,8 +34,9 @@ pub(super) enum Settled {
 /// audio or document, for the others). A same-stem sibling of another kind (`IMG_1.JPG` beside
 /// a video's temp, `album.cue` beside a FLAC's) doesn't count. With no original, a temp that
 /// `complete` accepts (ffmpeg can read it) is given the stem's name; an unreadable video,
-/// audio or picture temp is half-made and goes; a document's temp is left alone.
-pub(super) fn settle_orphan_temp(temp: &Path, complete: &dyn Fn(&Path) -> bool) -> std::io::Result<Settled> {
+/// audio or picture temp is half-made and goes; a document's temp is left alone, and so is
+/// any temp `complete` couldn't check (`None`: ffmpeg didn't run).
+pub(super) fn settle_orphan_temp(temp: &Path, complete: &dyn Fn(&Path) -> Option<bool>) -> std::io::Result<Settled> {
     let size = std::fs::metadata(temp)?.len();
     if let Some(p) = pending_for(temp).filter(|p| p.size == size) {
         if p.original.is_file() {
@@ -70,16 +71,21 @@ pub(super) fn settle_orphan_temp(temp: &Path, complete: &dyn Fn(&Path) -> bool) 
         system::remove_file_if_exists(temp)?;
         return Ok(Settled::Removed);
     }
-    if !complete(temp) {
-        // A video, audio or picture temp ffmpeg can't read is half-made: an older version
-        // set an original aside only after its new version was verified (and readable). A
-        // document's temp can't be checked that way: never deleted on a guess.
-        let document = image::kind_of(temp).is_some_and(image::Kind::is_document);
-        if document {
-            return Ok(Settled::LeftAlone);
+    match complete(temp) {
+        Some(true) => {}
+        // Not checked: nothing to go by, so nothing is deleted.
+        None => return Ok(Settled::LeftAlone),
+        Some(false) => {
+            // A video, audio or picture temp ffmpeg can't read is half-made: an older version
+            // set an original aside only after its new version was verified (and readable). A
+            // document's temp can't be checked that way: never deleted on a guess.
+            let document = image::kind_of(temp).is_some_and(image::Kind::is_document);
+            if document {
+                return Ok(Settled::LeftAlone);
+            }
+            system::remove_file_if_exists(temp)?;
+            return Ok(Settled::Removed);
         }
-        system::remove_file_if_exists(temp)?;
-        return Ok(Settled::Removed);
     }
     let ext = temp.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default();
     let target = free_target(&dir.join(format!("{stem}.{ext}")))?;
@@ -358,7 +364,7 @@ mod tests {
         w("pic.mediaopti.i3.png", b"finished new version");
         w("sky.png", b""); // the conversion's placeholder
         w("sky.mediaopti.i2.png", b"finished conversion");
-        let yes = |_: &Path| true;
+        let yes = |_: &Path| Some(true);
         assert_eq!(settle_orphan_temp(&dir.join("clip.mediaopti.w1.mp4"), &yes).unwrap(), Settled::Removed);
         assert!(!dir.join("clip.mediaopti.w1.mp4").exists() && dir.join("clip.mkv").exists());
         assert_eq!(settle_orphan_temp(&dir.join("pic.mediaopti.i3.png"), &yes).unwrap(), Settled::Recovered(dir.join("pic.png")));
@@ -367,12 +373,18 @@ mod tests {
         assert_eq!(std::fs::read(dir.join("sky.png")).unwrap(), b"finished conversion");
         // Unreadable media, original gone, not in the journal: half-made, removed.
         w("cut.mediaopti.w2.mp4", b"truncated");
-        assert_eq!(settle_orphan_temp(&dir.join("cut.mediaopti.w2.mp4"), &|_: &Path| false).unwrap(), Settled::Removed);
+        assert_eq!(settle_orphan_temp(&dir.join("cut.mediaopti.w2.mp4"), &|_: &Path| Some(false)).unwrap(), Settled::Removed);
         assert!(!dir.join("cut.mediaopti.w2.mp4").exists() && !dir.join("cut.mp4").exists());
         // A document's temp can't be checked: left alone, never deleted on a guess.
         w("book.mediaopti.i4.pdf", b"maybe the only copy");
-        assert_eq!(settle_orphan_temp(&dir.join("book.mediaopti.i4.pdf"), &|_: &Path| false).unwrap(), Settled::LeftAlone);
+        assert_eq!(settle_orphan_temp(&dir.join("book.mediaopti.i4.pdf"), &|_: &Path| Some(false)).unwrap(), Settled::LeftAlone);
         assert!(dir.join("book.mediaopti.i4.pdf").exists());
+        // ffmpeg couldn't run (missing, out of memory, out of time): nothing was learned
+        // about the temp, which may be the only copy under that name: left alone.
+        w("song.mediaopti.i1.flac", b"maybe the only copy");
+        let no_ffmpeg = |p: &Path| super::super::scan::media_readable(&dir.join("missing-ffmpeg.exe"), p);
+        assert_eq!(settle_orphan_temp(&dir.join("song.mediaopti.i1.flac"), &no_ffmpeg).unwrap(), Settled::LeftAlone);
+        assert!(dir.join("song.mediaopti.i1.flac").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -389,7 +401,7 @@ mod tests {
         w("IMG_1.mediaopti.w1.mp4", b"finished video");
         w("album.cue", b"cue sheet");
         w("album.mediaopti.i2.flac", b"finished flac");
-        let yes = |_: &Path| true;
+        let yes = |_: &Path| Some(true);
         let video = settle_orphan_temp(&dir.join("IMG_1.mediaopti.w1.mp4"), &yes).unwrap();
         assert_eq!(video, Settled::Recovered(dir.join("IMG_1.mp4")));
         assert_eq!(std::fs::read(dir.join("IMG_1.mp4")).unwrap(), b"finished video");
@@ -416,7 +428,7 @@ mod tests {
         std::fs::write(&tmp, b"new pdf").unwrap();
         journal_start(&tmp, &orig, &orig).unwrap();
         std::fs::remove_file(&orig).unwrap(); // set aside, then the app stopped
-        let unreadable = |_: &Path| false;
+        let unreadable = |_: &Path| Some(false);
         assert_eq!(settle_orphan_temp(&tmp, &unreadable).unwrap(), Settled::Recovered(orig.clone()));
         assert_eq!(std::fs::read(&orig).unwrap(), b"new pdf");
         assert!(pending_for(&tmp).is_none());
@@ -496,7 +508,7 @@ mod tests {
         std::fs::write(dir.join(format!("{stem}.mov")), b"original").unwrap();
         let temp = dir.join(format!("{stem}.mediaopti.w1.mp4"));
         std::fs::write(&temp, b"half-made").unwrap();
-        assert_eq!(settle_orphan_temp(&temp, &|_: &Path| true).unwrap(), Settled::Removed);
+        assert_eq!(settle_orphan_temp(&temp, &|_: &Path| Some(true)).unwrap(), Settled::Removed);
         assert!(dir.join(format!("{stem}.mov")).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
