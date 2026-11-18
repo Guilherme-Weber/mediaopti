@@ -93,6 +93,29 @@ Leitura dos números:
 - Severidade alto · Esforço M · Breaking não.
 - Correção: primeiro **medir isolado** (o JPEG de 164 MP sozinho com `bench_folder`; depois 3 VMAF simultâneos), e depois ajustar a admissão do culpado (2.5-9: estimativa pela área; ou VMAF contando a resolução). Entra como A0 no plano.
 
+### Medição final da 3.1.0 (2026-11-18)
+
+Mesmo método e mesma máquina (`D:\mediaopti-test\baseline\measure-310.sh`, resumo em
+`v310-summary-085334.txt`), no commit `6705f10`, depois das fases A–C e das 15 correções da
+revisão cruzada.
+
+| Métrica | 3.0.12 | 3.1.0 |
+|---|---|---|
+| Corpus: tempo | 877 s | 872 s |
+| Corpus: resultado | 10 menores, 27 mantidos, 1 falha | igual; bytes finais idênticos (251.471.551) |
+| Corpus: pico de memória privada | 23.218 MB | 23.219 MB |
+| Vídeo de 2,1 GB: tempo | 4.104 s | 4.082 s |
+| Vídeo de 2,1 GB: resultado | −632,6 MB (+12 CQ, VMAF 93,9) | igual |
+| Vídeo de 2,1 GB: pico de memória privada | 1.723 MB | 1.595 MB |
+| Binário release | 15.068.672 bytes | 19.824.128 bytes (+31,5%, `panic = "unwind"`) |
+
+O pico de 23 GB do corpus continua: é a busca com perda do JPEG de 164 MP, que a 3.1.0 só faz
+quando cabe na memória livre (esta execução começou com ~35 GB de commit livre). Com pouca
+memória ela faz só o passe sem perda; uma execução da Fase A que começou com 28 GB em uso levou
+353 s e teve pico de 3,7 GB por isso, não por ser mais rápida. Ganho de desempenho real: filas
+muito grandes (`queue_scale`: prévia de 1 milhão de arquivos 158 → 2 ms, 129 → 7 bytes por
+arquivo).
+
 
 ## Fase 1: Inventário
 
