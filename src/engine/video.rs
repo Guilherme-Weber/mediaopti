@@ -70,9 +70,12 @@ impl Engine {
         // The job runs as a task of its own: a panic in it (a bug, a malformed file nobody
         // foresaw) fails this file only, instead of ending the worker with its bookkeeping
         // half done.
+        // It keeps the release token it started with: a Pause swaps `Inner::release` for a
+        // new one, and the job must still see that it was released (`job_released`).
         let job = {
             let (engine, input, display) = (Arc::clone(self), input.clone(), display.clone());
-            tokio::spawn(async move { engine.process_claimed(worker_id, input, display).await })
+            let token = self.lock().release.clone();
+            tokio::spawn(super::ffmpeg::JOB_TOKEN.scope(token, async move { engine.process_claimed(worker_id, input, display).await }))
         };
         match job.await {
             Ok(outcome) => outcome,
@@ -83,6 +86,28 @@ impl Engine {
             }
             Err(_) => Outcome::Stopped,
         }
+    }
+
+    /// A check of `input` (or of `what`, its new version) that didn't finish: out of time or
+    /// ffmpeg couldn't start. The original stays; the file fails this run only (not
+    /// remembered: it is tried again next run). Counted as completed here unless the caller's
+    /// `Completion` does it.
+    fn unchecked(self: &Arc<Self>, worker_id: u32, input: &Path, display: &str, what: Option<&str>) -> Outcome {
+        {
+            let mut inner = self.lock();
+            inner.in_progress.remove(input);
+            inner.workers.remove(&worker_id);
+            inner.job_streams.remove(input);
+            inner.failed.insert(input.to_path_buf());
+            inner.run.failed += 1;
+            inner.run.completed += 1;
+        }
+        let what = what.unwrap_or("its tracks");
+        self.log(format!(
+            "[Worker {worker_id}] {display}: {what} could not be checked (ffmpeg didn't finish in time or couldn't start); left as it was (tried again next run)"
+        ));
+        self.send_state(true);
+        Outcome::Failed
     }
 
     /// What a video job that panicked leaves behind: its file is no longer in progress and
@@ -179,7 +204,14 @@ impl Engine {
 
         // What it holds besides the picture decides the container (MKV when MP4 can't
         // hold it) and is carried over by every attempt, then checked in the result.
-        let streams = if args::is_gif(&input) { args::Streams::default() } else { self.probe_streams(&input).await };
+        let streams = if args::is_gif(&input) { Ok(args::Streams::default()) } else { self.probe_streams(&input).await };
+        let Ok(streams) = streams else {
+            // Not knowing its tracks, an encode would drop them: never go on without.
+            if self.job_released() {
+                return self.ended_early(worker_id, &input, &display);
+            }
+            return self.unchecked(worker_id, &input, &display, None);
+        };
         let drop_data = self.lock().options.drop_data;
         if let Some(blocked) = streams.blocker(drop_data) {
             self.lock().in_progress.remove(&input);
@@ -489,20 +521,22 @@ impl Engine {
         // is passed through (no -fps_mode cfr for GIFs), so the two must match. Any other
         // video must keep everything else it held (audio tracks, subtitles, attachments,
         // covers, chapters) and its length.
-        let lost = if args::is_gif(&input) {
-            let (gif_timing, video_timing) = (self.video_timing(&input).await, self.video_timing(&tmp).await);
-            super::ffmpeg::timing_mismatch(gif_timing, video_timing).map(|why| format!("doesn't match the GIF ({why})"))
-        } else {
-            let after = self.probe_streams(&tmp).await;
+        let lost: Result<Option<String>, super::ffmpeg::Unfinished> = async {
+            if args::is_gif(&input) {
+                let (gif_timing, video_timing) = (self.video_timing(&input).await?, self.video_timing(&tmp).await?);
+                return Ok(super::ffmpeg::timing_mismatch(gif_timing, video_timing).map(|why| format!("doesn't match the GIF ({why})")));
+            }
+            let after = self.probe_streams(&tmp).await?;
             let mut why = super::ffmpeg::streams_lost(&streams, &after);
             // PCM made FLAC must decode to exactly the original samples.
             for (i, codec) in streams.audio_codecs.iter().enumerate() {
-                if why.is_none() && args::is_integer_pcm(codec) && !self.same_audio_track(&input, &tmp, i).await {
+                if why.is_none() && args::is_integer_pcm(codec) && !self.same_audio_track(&input, &tmp, i).await? {
                     why = Some(format!("audio track {} (its FLAC doesn't decode to the original PCM)", i + 1));
                 }
             }
-            why.map(|why| format!("lost {why}"))
-        };
+            Ok(why.map(|why| format!("lost {why}")))
+        }
+        .await;
         self.lock().job_streams.remove(&input);
         // Stop or Pause cut the checks short: that says nothing about the new version.
         if self.job_released() {
@@ -510,6 +544,13 @@ impl Engine {
             completion.armed = false;
             return self.ended_early(worker_id, &input, &display);
         }
+        // A check that didn't finish (out of time, ffmpeg couldn't start) says nothing either:
+        // the original stays and the file is tried again next run.
+        let Ok(lost) = lost else {
+            self.log_remove(&tmp);
+            completion.armed = false;
+            return self.unchecked(worker_id, &input, &display, Some("its new version"));
+        };
         {
             if let Some(why) = lost {
                 self.log_remove(&tmp);
@@ -706,6 +747,10 @@ impl Engine {
         if self.job_released() {
             return Err(Stopped);
         }
+        // Unknown tracks: not shown to be the same (the new version gets a numbered name).
+        let (Ok(ours), Ok(theirs)) = (ours, theirs) else {
+            return Ok(false);
+        };
         if super::ffmpeg::streams_lost(&ours, &theirs).is_some() || super::ffmpeg::streams_lost(&theirs, &ours).is_some() {
             return Ok(false);
         }

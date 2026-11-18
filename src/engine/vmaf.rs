@@ -216,7 +216,7 @@ impl Engine {
             // free memory and measure once more on fewer threads.
             if measured.as_ref().is_err_and(|e| e.contains("alloc")) {
                 self.log(format!("[Worker {worker_id}] {display}: not enough memory to measure quality; waiting to retry"));
-                let cancel = self.lock().release.clone();
+                let cancel = self.release_token();
                 for _ in 0..60 {
                     if system::memory_status().is_none_or(|m| m.available_commit >= 4 << 30) {
                         break;
@@ -321,7 +321,7 @@ impl Engine {
         duration_sec: f64,
         threads: Option<usize>,
     ) -> Result<Result<(f64, f64), String>, Stopped> {
-        let cancel = self.lock().release.clone();
+        let cancel = self.release_token();
         let windows: Vec<(f64, f64)> = if duration_sec > 30.0 {
             [0.2, 0.5, 0.8].iter().map(|f| ((duration_sec * f - 4.0).max(0.0), 8.0)).collect()
         } else {

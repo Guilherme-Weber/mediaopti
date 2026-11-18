@@ -757,6 +757,56 @@ fn videos_keep_audio_tracks_subtitles_attachments_and_chapters() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A stream probe that doesn't finish (out of time, ffmpeg couldn't start, or a Pause) says
+/// nothing about the file: the original stays, the file fails this run only (not
+/// remembered), and an input probe never lets the encode go on without knowing the tracks.
+#[test]
+fn unfinished_probes_never_decide() {
+    let Some(ff) = ffmpeg() else {
+        skip_test!("bundled ffmpeg not found");
+        return;
+    };
+    let root = test_dir("probe-fails");
+    let media = root.join("media");
+    std::fs::create_dir_all(&media).unwrap();
+    let srt = root.join("s.srt");
+    std::fs::write(&srt, "1\n00:00:00,000 --> 00:00:02,000\nhello\n").unwrap();
+    let two_tracks = |out: &Path| {
+        make(&ff, &["-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30:duration=3", "-f", "lavfi", "-i", "sine=f=440:d=3",
+            "-f", "lavfi", "-i", "sine=f=880:d=3", "-i", srt.to_str().unwrap(),
+            "-map", "0:v", "-map", "1:a", "-map", "2:a", "-map", "3:s", "-c:v", "libx264", "-qp", "0", "-c:a", "aac", "-c:s", "srt"], out);
+    };
+    // infail: its own probe fails; outfail: the probe of its new version fails.
+    let (infail, outfail) = (media.join("infail.mkv"), media.join("outfail.mkv"));
+    two_tracks(&infail);
+    two_tracks(&outfail);
+    let sizes = [std::fs::metadata(&infail).unwrap().len(), std::fs::metadata(&outfail).unwrap().len()];
+    crate::system::PROBE_FAILS_ON.lock().unwrap().extend(["infail.".to_string(), "outfail.mediaopti.".to_string()]);
+
+    let rt = runtime();
+    let (engine, rec) = new_engine(&rt, &root, ff.clone());
+    rt.block_on(async {
+        engine.apply_options(opts("libx264", 2.0));
+        engine.load_dir(media.clone()).await;
+        engine.clone().run_batch(opts("libx264", 2.0)).await;
+    });
+    crate::system::PROBE_FAILS_ON.lock().unwrap().retain(|n| n != "infail." && n != "outfail.mediaopti.");
+    let logs = rec.logs.lock().unwrap().join("\n");
+    println!("{logs}");
+    let s = engine.snapshot();
+    assert_eq!((s.failed_this_run, s.compressed_this_run), (2, 0), "{logs}");
+    assert_eq!([std::fs::metadata(&infail).unwrap().len(), std::fs::metadata(&outfail).unwrap().len()], sizes, "originals untouched: {logs}");
+    let leftovers: Vec<_> = std::fs::read_dir(&media).unwrap().filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().contains(".mediaopti.")).collect();
+    assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
+    // Not remembered: a new run tries both again.
+    let (engine2, _) = new_engine(&rt, &root, ff);
+    engine2.apply_options(opts("libx264", 2.0));
+    rt.block_on(engine2.load_dir(media));
+    assert_eq!(engine2.snapshot().pending_files, 2, "{logs}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A phone video's tags survive: recording date, place, make and model in the MP4, and the
 /// date in an MKV (a QuickTime date listed twice used to be dropped there).
 #[test]

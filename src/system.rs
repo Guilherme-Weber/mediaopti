@@ -102,6 +102,25 @@ pub fn panic_here_in_tests(file: &Path) {
     let _ = file;
 }
 
+/// Files whose stream probe doesn't finish, as if it ran out of time (test builds only): a
+/// name in it matches every file whose name starts with it (`clip.mediaopti.` = its temps).
+#[cfg(test)]
+pub static PROBE_FAILS_ON: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Whether `file`'s probe should fail on purpose (always false outside tests).
+pub fn probe_fails_in_tests(file: &Path) -> bool {
+    #[cfg(test)]
+    {
+        let names = PROBE_FAILS_ON.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        file.file_name().is_some_and(|n| names.iter().any(|p| n.to_string_lossy().starts_with(p.as_str())))
+    }
+    #[cfg(not(test))]
+    {
+        let _ = file;
+        false
+    }
+}
+
 /// Crash tests: MEDIAOPTI_DIE_AT=<point> ends the process at that point of a replacement,
 /// like a forced quit or a power cut would (test builds only).
 pub fn die_here_in_tests(point: &str) {

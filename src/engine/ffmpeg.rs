@@ -18,6 +18,18 @@ pub(super) struct Attempt {
 const PROBE_LIMIT: Duration = Duration::from_secs(120);
 const LONG_PROBE_LIMIT: Duration = Duration::from_secs(3600);
 
+tokio::task_local! {
+    /// The running video job's release token, taken when the job starts. A Pause cancels it
+    /// and puts a new one in `Inner::release` for the jobs after Resume, so the job must keep
+    /// its own to notice that it was released.
+    pub(super) static JOB_TOKEN: CancellationToken;
+}
+
+/// A probe that didn't finish (out of time, ffmpeg couldn't start, Stop or Pause): it says
+/// nothing about the file.
+#[derive(Debug)]
+pub(super) struct Unfinished;
+
 /// Runs an ffmpeg probe. `None` when it can't start, `cancel` (the job's release token:
 /// Stop or Pause) fires first, or it runs past `limit`; the process is then killed
 /// (`kill_on_drop`). A `None` after a cancel is not the file's fault: callers check
@@ -82,10 +94,7 @@ impl Engine {
         gpu_decode: Option<(u32, u32)>,
     ) -> Attempt {
         let mut diag = Diagnostics::default();
-        let (mut options, cancel) = {
-            let inner = self.lock();
-            (inner.options.clone(), inner.release.clone())
-        };
+        let (mut options, cancel) = (self.lock().options.clone(), self.release_token());
         options.cq_boost = cq_boost;
         options.gpu_decode = gpu_decode;
         options.streams = self.lock().job_streams.get(input).cloned().unwrap_or_default();
@@ -346,7 +355,7 @@ impl Engine {
         let step = self.worker_step(worker_id);
         self.reset_worker(worker_id, display, "waiting for memory");
         self.send_state(false);
-        let cancel = self.lock().release.clone();
+        let cancel = self.release_token();
         let until = Instant::now() + Duration::from_secs(120);
         let busy = || {
             let inner = self.lock();
@@ -384,30 +393,42 @@ impl Engine {
         gpu_decodable_stream(&String::from_utf8_lossy(&out.stderr))
     }
 
+    /// The token that releases the running job: its own inside a video job (`JOB_TOKEN`),
+    /// else the current one.
+    pub(super) fn release_token(&self) -> CancellationToken {
+        JOB_TOKEN.try_with(CancellationToken::clone).unwrap_or_else(|_| self.lock().release.clone())
+    }
+
     /// The running job's release token (Stop, or a Pause that ends the processes), if a batch
     /// runs.
     pub(super) fn job_token(&self) -> Option<CancellationToken> {
+        if let Ok(token) = JOB_TOKEN.try_with(CancellationToken::clone) {
+            return Some(token);
+        }
         let inner = self.lock();
         inner.working.then(|| inner.release.clone())
     }
 
-    /// Whether the running jobs were released (Stop, or a Pause that ends the processes): an
+    /// Whether the running job was released (Stop, or a Pause that ends the processes): an
     /// unfinished probe then says nothing about the file.
     pub(super) fn job_released(&self) -> bool {
+        let own = JOB_TOKEN.try_with(CancellationToken::is_cancelled);
         let inner = self.lock();
-        inner.release.is_cancelled() || inner.stop_requested
+        own.unwrap_or_else(|_| inner.release.is_cancelled()) || inner.stop_requested
     }
 
     /// What `path` holds besides its picture (audio, subtitles, attachments, covers,
-    /// chapters) and its length, from `ffmpeg -i`.
-    pub(super) async fn probe_streams(&self, path: &Path) -> args::Streams {
+    /// chapters) and its length, from `ffmpeg -i`. `Unfinished` when a probe didn't finish:
+    /// never read as "nothing there" (an encode would drop the tracks it didn't know about).
+    pub(super) async fn probe_streams(&self, path: &Path) -> Result<args::Streams, Unfinished> {
         let mut cmd = tokio::process::Command::new(&self.ffmpeg_path);
         cmd.args(["-hide_banner", "-i"]).arg(path).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true);
         system::configure_background_command(&mut cmd, true);
-        let mut streams = match probe_output(&mut cmd, self.job_token(), PROBE_LIMIT).await {
-            Some(out) => args::Streams::parse(&String::from_utf8_lossy(&out.stderr)),
-            None => args::Streams::default(),
-        };
+        if system::probe_fails_in_tests(path) {
+            return Err(Unfinished);
+        }
+        let out = probe_output(&mut cmd, self.job_token(), PROBE_LIMIT).await.ok_or(Unfinished)?;
+        let mut streams = args::Streams::parse(&String::from_utf8_lossy(&out.stderr));
         if streams.hdr {
             // HDR10's static metadata travels with the frames: read from the first one.
             let mut cmd = tokio::process::Command::new(&self.ffmpeg_path);
@@ -419,19 +440,19 @@ impl Engine {
                 .stderr(Stdio::piped())
                 .kill_on_drop(true);
             system::configure_background_command(&mut cmd, true);
-            if let Some(out) = probe_output(&mut cmd, self.job_token(), PROBE_LIMIT).await {
-                let text = String::from_utf8_lossy(&out.stderr).to_ascii_lowercase();
-                streams.mastering = text.contains("mastering display");
-                streams.light_level = text.contains("content light level");
-                streams.hdr10_plus = text.contains("hdr10+") || text.contains("2094-40");
-            }
+            let out = probe_output(&mut cmd, self.job_token(), PROBE_LIMIT).await.ok_or(Unfinished)?;
+            let text = String::from_utf8_lossy(&out.stderr).to_ascii_lowercase();
+            streams.mastering = text.contains("mastering display");
+            streams.light_level = text.contains("content light level");
+            streams.hdr10_plus = text.contains("hdr10+") || text.contains("2094-40");
         }
-        streams
+        Ok(streams)
     }
 
     /// Whether audio track `index` of `a` and `b` decodes to the same samples (compared as
-    /// 32-bit PCM, so 16- and 24-bit sources and their FLAC compare alike).
-    pub(super) async fn same_audio_track(&self, a: &Path, b: &Path, index: usize) -> bool {
+    /// 32-bit PCM, so 16- and 24-bit sources and their FLAC compare alike). `Unfinished` when
+    /// a decode didn't finish; a failed decode is "not the same".
+    pub(super) async fn same_audio_track(&self, a: &Path, b: &Path, index: usize) -> Result<bool, Unfinished> {
         let md5 = |p: &Path| {
             let mut cmd = tokio::process::Command::new(&self.ffmpeg_path);
             cmd.args(["-hide_banner", "-v", "error", "-i"])
@@ -443,15 +464,19 @@ impl Engine {
                 .kill_on_drop(true);
             system::configure_background_command(&mut cmd, true);
             let token = self.job_token();
-            async move { probe_output(&mut cmd, token, LONG_PROBE_LIMIT).await.filter(|o| o.status.success()).map(|o| o.stdout) }
+            async move {
+                let out = probe_output(&mut cmd, token, LONG_PROBE_LIMIT).await.ok_or(Unfinished)?;
+                Ok(out.status.success().then_some(out.stdout))
+            }
         };
-        let (x, y) = (md5(a).await, md5(b).await);
-        x.is_some() && x == y
+        let (x, y) = (md5(a).await?, md5(b).await?);
+        Ok(x.is_some() && x == y)
     }
 
     /// Frame count and length in seconds of the first video stream, read from its packets
-    /// (no decoding, so fast even for big files). `None` when it can't be read.
-    pub(super) async fn video_timing(&self, path: &Path) -> Option<(u64, f64)> {
+    /// (no decoding, so fast even for big files). `Ok(None)` when it can't be read,
+    /// `Unfinished` when the read didn't finish.
+    pub(super) async fn video_timing(&self, path: &Path) -> Result<Option<(u64, f64)>, Unfinished> {
         let mut cmd = tokio::process::Command::new(&self.ffmpeg_path);
         cmd.args(["-hide_banner", "-v", "error", "-i"])
             .arg(path)
@@ -461,11 +486,11 @@ impl Engine {
             .stderr(Stdio::null())
             .kill_on_drop(true);
         system::configure_background_command(&mut cmd, true);
-        let out = probe_output(&mut cmd, self.job_token(), LONG_PROBE_LIMIT).await?;
+        let out = probe_output(&mut cmd, self.job_token(), LONG_PROBE_LIMIT).await.ok_or(Unfinished)?;
         if !out.status.success() {
-            return None;
+            return Ok(None);
         }
-        packet_timing(&String::from_utf8_lossy(&out.stdout))
+        Ok(packet_timing(&String::from_utf8_lossy(&out.stdout)))
     }
 }
 
@@ -620,6 +645,35 @@ pub(super) fn gpu_decodable_stream(report: &str) -> Option<(u32, u32)> {
 mod tests {
     use super::gpu_decodable_stream as ok;
     use super::{packet_timing, timing_mismatch};
+
+    /// A Pause swaps the release token for the jobs after Resume; a job running when it came
+    /// still sees that it was released (it used to look at the new token and go on).
+    #[test]
+    fn a_pause_is_seen_by_the_job_it_released() {
+        struct Quiet;
+        impl super::Ui for Quiet {
+            fn log(&self, _: String) {}
+            fn state(&self, _: &super::StateDto) {}
+        }
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let data = std::env::temp_dir().join(format!("mo-job-token-{}", std::process::id()));
+        let engine = super::Engine::new(Box::new(Quiet), &data, std::path::PathBuf::from("ffmpeg.exe"), rt.handle().clone());
+        let token = {
+            let mut inner = engine.lock();
+            inner.working = true;
+            inner.status = super::Status::Running;
+            inner.release.clone()
+        };
+        rt.block_on(super::JOB_TOKEN.scope(token, async {
+            assert!(!engine.job_released());
+            engine.set_paused(true);
+            assert!(engine.job_released(), "the job's own token was cancelled by the Pause");
+            assert!(engine.job_token().is_some_and(|t| t.is_cancelled()), "its probes end too");
+        }));
+        assert!(!engine.job_released(), "jobs started after Resume use the new token");
+        engine.lock().working = false;
+        let _ = std::fs::remove_dir_all(&data);
+    }
 
     /// A probe that never ends (a pathological file) gives up at its time limit, and Stop or
     /// Pause ends it at once; the process is killed either way.
