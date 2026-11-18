@@ -635,16 +635,28 @@ pub fn flush_to_disk(path: &Path) -> std::io::Result<()> {
 pub fn copy_alternate_streams(from: &Path, to: &Path) -> std::io::Result<usize> {
     #[cfg(windows)]
     {
-        use windows_sys::Win32::Foundation::{GetLastError, ERROR_HANDLE_EOF, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Foundation::{GetLastError, ERROR_HANDLE_EOF, ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::Storage::FileSystem::{FindClose, FindFirstStreamW, FindNextStreamW, FindStreamInfoStandard, WIN32_FIND_STREAM_DATA};
+        // FAT32 and exFAT (memory cards, USB sticks) and some network shares have no named
+        // streams: nothing to carry over there.
+        if !has_named_streams(from) {
+            return Ok(0);
+        }
         let mut names = Vec::new();
         // SAFETY: all-zero is a valid value for this plain C struct.
         let mut data: WIN32_FIND_STREAM_DATA = unsafe { std::mem::zeroed() };
         // SAFETY: the path is NUL-terminated; `data` is writable for the call.
         let find = unsafe { FindFirstStreamW(wide(from).as_ptr(), FindStreamInfoStandard, (&raw mut data).cast(), 0) };
         if find == INVALID_HANDLE_VALUE {
-            // ERROR_HANDLE_EOF: no stream at all to list (a FAT drive has none either).
-            return if unsafe { GetLastError() } == ERROR_HANDLE_EOF { Ok(0) } else { Err(std::io::Error::last_os_error()) };
+            // ERROR_HANDLE_EOF: no stream at all to list. The others: a file system that
+            // can't list streams (its flags said otherwise), so it has none to keep.
+            // SAFETY: reads the calling thread's last error.
+            let code = unsafe { GetLastError() };
+            return if matches!(code, ERROR_HANDLE_EOF | ERROR_INVALID_PARAMETER | ERROR_INVALID_FUNCTION | ERROR_NOT_SUPPORTED) {
+                Ok(0)
+            } else {
+                Err(std::io::Error::from_raw_os_error(code as i32))
+            };
         }
         loop {
             let len = data.cStreamName.iter().position(|&c| c == 0).unwrap_or(data.cStreamName.len());
@@ -666,10 +678,30 @@ pub fn copy_alternate_streams(from: &Path, to: &Path) -> std::io::Result<usize> 
             std::path::PathBuf::from(p)
         };
         for stream in &names {
-            fs::write(stream_of(to, stream), fs::read(stream_of(from, stream))?)?;
+            // Streamed: a stream can be as big as a file.
+            std::io::copy(&mut fs::File::open(stream_of(from, stream))?, &mut fs::File::create(stream_of(to, stream))?)?;
         }
         Ok(names.len())
     }
+}
+
+/// Whether `path`'s volume has named streams (NTFS, ReFS); unknown counts as yes, and then
+/// listing them decides.
+#[cfg(windows)]
+pub fn has_named_streams(path: &Path) -> bool {
+    use windows_sys::Win32::Storage::FileSystem::{GetVolumeInformationW, GetVolumePathNameW};
+    const FILE_NAMED_STREAMS: u32 = 0x0004_0000;
+    let mut root = [0u16; 1024];
+    // SAFETY: the path is NUL-terminated; `root` is writable for its length.
+    if unsafe { GetVolumePathNameW(wide(path).as_ptr(), root.as_mut_ptr(), root.len() as u32) } == 0 {
+        return true;
+    }
+    let mut flags = 0u32;
+    // SAFETY: `root` is NUL-terminated by the call above; the other outputs are optional.
+    let ok = unsafe {
+        GetVolumeInformationW(root.as_ptr(), std::ptr::null_mut(), 0, std::ptr::null_mut(), std::ptr::null_mut(), &raw mut flags, std::ptr::null_mut(), 0)
+    };
+    ok == 0 || flags & FILE_NAMED_STREAMS != 0
 }
 
 /// `path` as a NUL-terminated UTF-16 string for the Windows API. A long absolute path gets

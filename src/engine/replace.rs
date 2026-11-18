@@ -481,6 +481,11 @@ mod tests {
         assert_eq!(std::fs::read(&orig).unwrap(), b"new");
         assert_eq!(std::fs::read(dir.join("report.docm:Zone.Identifier")).unwrap(), zone);
         assert_eq!(std::fs::read(dir.join("report.docm:app.tags")).unwrap(), b"red");
+        // The volume check that lets FAT32/exFAT drives skip the copy says yes on NTFS (and
+        // on the long-path form).
+        assert!(system::has_named_streams(&orig));
+        let deep = dir.join("d".repeat(120)).join("e".repeat(120)).join("f.bin");
+        assert!(system::has_named_streams(&deep), "unknown or long: yes");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
