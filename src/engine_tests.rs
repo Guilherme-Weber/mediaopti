@@ -1167,6 +1167,51 @@ fn images_and_videos_in_one_batch() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A picture whose visually lossless search couldn't have its memory gets the lossless pass
+/// only, remembered as lossless: a later lossy run (with the memory free) still does it, even
+/// though its new content was noted before it replaced the original.
+#[test]
+fn a_lossless_only_picture_is_redone_lossy_later() {
+    let Some(ff) = ffmpeg() else {
+        skip_test!("bundled ffmpeg not found");
+        return;
+    };
+    let tools = crate::image::tools::Tools::discover(ff.clone(), &std::env::temp_dir());
+    if !["oxipng", "ssimulacra2"].iter().all(|t| tools.has(t)) {
+        skip_test!("image tools not found");
+        return;
+    }
+    let root = test_dir("lossless-only");
+    let media = root.join("media");
+    std::fs::create_dir_all(&media).unwrap();
+    let png = media.join("toobig.png");
+    make(&ff, &["-f", "lavfi", "-i", "mandelbrot=s=640x480", "-frames:v", "1", "-compression_level", "1"], &png);
+    let before = std::fs::metadata(&png).unwrap().len();
+    crate::system::LOSSLESS_ONLY_ON.lock().unwrap().push("toobig.png".to_string());
+
+    let rt = runtime();
+    let lossy = || RawOptions { images: Some(2), ..opts("av1_nvenc", 1.0) };
+    let (engine, rec) = new_engine(&rt, &root, ff.clone());
+    rt.block_on(async {
+        engine.apply_options(lossy());
+        engine.load_dir(media.clone()).await;
+        engine.clone().run_batch(lossy()).await;
+    });
+    crate::system::LOSSLESS_ONLY_ON.lock().unwrap().retain(|n| n != "toobig.png");
+    let logs = rec.logs.lock().unwrap().join("\n");
+    println!("{logs}");
+    assert!(logs.contains("lossless only this time"), "{logs}");
+    assert!(std::fs::metadata(&png).unwrap().len() < before, "the lossless pass made it smaller: {logs}");
+
+    // Next run, lossy again: the picture is queued, not recognised by its content.
+    let (engine2, rec2) = new_engine(&rt, &root, ff);
+    engine2.apply_options(lossy());
+    rt.block_on(engine2.load_dir(media));
+    let logs2 = rec2.logs.lock().unwrap().join("\n");
+    assert_eq!(engine2.snapshot().pending_files, 1, "{logs2}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Benchmark on a copy of a real folder: `MEDIAOPTI_BENCH_DIR=<folder> cargo test --release
 /// bench_folder -- --ignored --nocapture`. The folder itself is never modified.
 #[test]

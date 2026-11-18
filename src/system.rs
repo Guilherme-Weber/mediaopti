@@ -121,6 +121,25 @@ pub fn probe_fails_in_tests(file: &Path) -> bool {
     }
 }
 
+/// Pictures whose visually lossless search never has its memory free (test builds only):
+/// they get the lossless pass only, as a picture far too big for the free memory would.
+#[cfg(test)]
+pub static LOSSLESS_ONLY_ON: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Whether `file`'s lossy search is refused on purpose (always false outside tests).
+pub fn lossless_only_in_tests(file: &Path) -> bool {
+    #[cfg(test)]
+    {
+        let names = LOSSLESS_ONLY_ON.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        file.file_name().is_some_and(|n| names.iter().any(|p| n == p.as_str()))
+    }
+    #[cfg(not(test))]
+    {
+        let _ = file;
+        false
+    }
+}
+
 /// Names a replacement can't rename a new version to, after its original was set aside
 /// (test builds only): like a target held open by another program until the retries end.
 #[cfg(test)]

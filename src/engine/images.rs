@@ -282,8 +282,10 @@ impl Engine {
             let engine = Arc::clone(&self);
             opts.busy = Some(Arc::new(move |p: &Path| engine.lock().in_progress.contains(p)));
             let engine = Arc::clone(&self);
-            let mode = image::mode(lossy, self.lock().options.strip);
-            opts.note = Some(Arc::new(move |p: &Path| engine.note_content_now(p, mode)));
+            // The mode as the file was really done: a big picture may get the lossless pass
+            // only (decided inside process_image), and must then be noted as lossless.
+            let (strip, refused) = (self.lock().options.strip, Arc::clone(&opts.lossless_only));
+            opts.note = Some(Arc::new(move |p: &Path| engine.note_content_now(p, image::mode(lossy && !refused.load(Ordering::Relaxed), strip))));
             let engine = Arc::clone(&self);
             opts.warn = Some(Arc::new(move |line: String| engine.log(line)));
             if let Some(line) = announce {
@@ -725,6 +727,8 @@ fn same_content(ctx: &image::Ctx, kind: image::Kind, src: &Path, existing: &Path
 /// as `disposal` says), else the new file gets a number ("a (2).png"). Blocking.
 pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, disposal: &system::Disposal, opts: &JobOpts) -> ImageResult {
     system::panic_here_in_tests(path);
+    // Decided anew by each attempt (an attempt retried after waiting for memory may fit).
+    opts.lossless_only.store(false, Ordering::Relaxed);
     static NEXT_JOB: AtomicU64 = AtomicU64::new(0);
     let Some(named) = image::kind_of(path) else {
         return ImageResult::Skipped("not an image".into());
@@ -763,7 +767,9 @@ pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, dispo
         None
     };
     let lossless_ctx;
-    let ctx = if lossy_need >= BIG_LOSSY_JOB && !big_lossy_fits(lossy_need, system::memory_status().map(|m| m.available_commit)) {
+    let refused = system::lossless_only_in_tests(path)
+        || lossy_need >= BIG_LOSSY_JOB && !big_lossy_fits(lossy_need, system::memory_status().map(|m| m.available_commit));
+    let ctx = if ctx.lossy && refused {
         opts.lossless_only.store(true, Ordering::Relaxed);
         if let Some(warn) = &opts.warn {
             warn(format!(
