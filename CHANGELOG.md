@@ -35,6 +35,8 @@ A release focused on safety and robustness, after an audit of the whole program.
   freeze the window while the engine is busy.
 - Closing the window during a batch keeps it open ("Stopping…") until every job has ended.
 - One unreadable field in the settings file no longer resets every setting.
+- cjpegli rebuilt from google/jpegli `1d0b3565` (a hardening fix in its encoder): byte-identical
+  output to the previous build on 172 encodes.
 
 ### Fixed
 
