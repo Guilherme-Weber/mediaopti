@@ -372,6 +372,7 @@ impl Engine {
                     log = Some(match renamed {
                         Some(new) => {
                             inner.history.add_image(&new, mode);
+                            inner.moved(path, &new, Some(after));
                             format!("{tag} Converted {display} to {}, saved {saved}", new.file_name().unwrap_or_default().to_string_lossy())
                         }
                         None => format!("{tag} Saved {saved} from {display}{}", if lossy { " (visually lossless)" } else { "" }),
@@ -388,6 +389,7 @@ impl Engine {
                 ImageResult::Renamed { to, content } => {
                     inner.run.kept += 1;
                     inner.history.add_image(&to, mode);
+                    inner.moved(path, &to, None);
                     if let Some((hash, size)) = content {
                         inner.history.add_content(hash, size, mode);
                     }
@@ -398,6 +400,7 @@ impl Engine {
                     inner.run.compressed += 1;
                     inner.space_saved_mb += before as f64 / (1024.0 * 1024.0);
                     inner.history.add_image(&kept, mode);
+                    inner.moved(path, &kept, content.as_ref().map(|(_, size)| *size));
                     if let Some((hash, size)) = content {
                         inner.history.add_content(hash, size, mode);
                     }

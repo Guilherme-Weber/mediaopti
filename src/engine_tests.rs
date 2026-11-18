@@ -1515,6 +1515,8 @@ fn same_names_and_wrong_extensions() {
     // anim.gif and anim.mp4 made from it: the same video -> one anim.mp4 stays.
     make(&ff, &["-f", "lavfi", "-i", "testsrc=s=320x240:r=10:d=3", "-vf", "split[a][b];[a]palettegen[p];[b][p]paletteuse"], &media.join("anim.gif"));
     make(&ff, &["-i", media.join("anim.gif").to_str().unwrap(), "-fps_mode", "passthrough", "-c:v", "libx264", "-qp", "0", "-pix_fmt", "yuv444p"], &media.join("anim.mp4"));
+    // wave.gif: nothing has its new name -> wave.mp4.
+    make(&ff, &["-f", "lavfi", "-i", "testsrc2=s=320x240:r=10:d=3"], &media.join("wave.gif"));
 
     let rt = runtime();
     let (engine, rec) = new_engine(&rt, &root, ff.clone());
@@ -1528,10 +1530,16 @@ fn same_names_and_wrong_extensions() {
     let names: std::collections::BTreeSet<String> =
         std::fs::read_dir(&media).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
     println!("{logs}");
-    let want = ["anim.mp4", "other (2).png", "other.png", "photo.jpg", "sky.png", "web.webp"];
+    let want = ["anim.mp4", "other (2).png", "other.png", "photo.jpg", "sky.png", "wave.mp4", "web.webp"];
     assert_eq!(names, want.iter().map(ToString::to_string).collect(), "{logs}");
     let backup = root.join("media (originals)");
     assert!(backup.join("sky.bmp").exists() && backup.join("other.bmp").exists() && backup.join("anim.gif").exists(), "{logs}");
+    // The queue rebuilt after the batch lists what is on the disk now: nothing converted,
+    // renamed or removed as a duplicate comes back as waiting (a GIF made into a video used
+    // to show as "1 ready"). web.webp is not a type the scan takes.
+    let s = engine.snapshot();
+    assert_eq!(s.pending_files, 0, "{:?}", engine.queue_preview(10));
+    assert_eq!(s.total_files, want.len() - 1, "{logs}");
     let _ = std::fs::remove_dir_all(&root);
 }
 

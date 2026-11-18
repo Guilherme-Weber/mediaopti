@@ -652,6 +652,7 @@ impl Engine {
             let mut inner = self.lock();
             if final_target != input {
                 inner.history.add(&final_target);
+                inner.moved(&input, &final_target, Some(out_size as u64));
             }
             inner.run.compressed += 1;
             inner.space_saved_mb += saved_mb;
@@ -723,7 +724,7 @@ impl Engine {
         let (input_c, existing_c, tmp_c) = (input.to_path_buf(), existing.to_path_buf(), tmp.to_path_buf());
         let engine = Arc::clone(self);
         let result = self
-            .blocking(move || -> Result<(bool, f64), String> {
+            .blocking(move || -> Result<(bool, f64, u64), String> {
                 let theirs = std::fs::metadata(&existing_c).map_err(|e| e.to_string())?.len();
                 let ours = std::fs::metadata(&tmp_c).map_err(|e| e.to_string())?.len();
                 let replaced = ours < theirs;
@@ -738,15 +739,16 @@ impl Engine {
                 }
                 system::dispose(&input_c, &disposal).map_err(|e| format!("could not remove the original: {e}"))?;
                 let freed = if replaced { (theirs - ours) as f64 } else { 0.0 };
-                Ok((replaced, freed))
+                Ok((replaced, freed, theirs.min(ours)))
             })
             .await;
         let name = existing.file_name().unwrap_or_default().to_string_lossy().into_owned();
         match result {
-            Ok((replaced, freed)) => {
+            Ok((replaced, freed, size)) => {
                 self.remember(existing, existing).await;
                 {
                     let mut inner = self.lock();
+                    inner.moved(input, existing, Some(size));
                     inner.run.compressed += 1;
                     inner.space_saved_mb += (in_size + freed) / (1024.0 * 1024.0);
                 }

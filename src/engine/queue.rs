@@ -138,7 +138,18 @@ impl Inner {
     }
 
     /// Rebuilds the work queues from the scanned files, history and this run's failures.
+    /// Never during a run: the entries marked gone (`moved`) are dropped, which renumbers them.
     pub(super) fn rebuild_queue(&mut self) {
+        if self.files.iter().any(|f| f.as_os_str().is_empty()) {
+            let mut sizes = std::mem::take(&mut self.file_sizes).into_iter();
+            let (files, kept): (Vec<PathBuf>, Vec<u64>) = std::mem::take(&mut self.files)
+                .into_iter()
+                .map(|f| (f, sizes.next().unwrap_or(u64::MAX)))
+                .filter(|(f, _)| !f.as_os_str().is_empty())
+                .unzip();
+            self.files = files;
+            self.file_sizes = kept;
+        }
         let (mut queue, mut cpu): (Vec<u32>, [Vec<u32>; 3]) = (Vec::new(), Default::default());
         let mut bytes = [0u64; 4];
         let (mut known, mut generated, mut small_gifs) = (0, 0, 0);
@@ -185,9 +196,38 @@ impl Inner {
         self.cpu_queues.iter().zip(self.cpu_cursors).map(|(q, c)| q.len().saturating_sub(c)).sum()
     }
 
-    /// Where `file` is in `files` (a search: only for the rare Pause).
+    /// Where `file` is in `files` (a search: only for the rare Pause). Compared as strings:
+    /// the entries are the scan's own paths, and `Path`'s `==` goes component by component.
     fn index_of(&self, file: &Path) -> Option<u32> {
-        self.files.iter().position(|f| f == file).map(|i| i as u32)
+        self.files.iter().position(|f| f.as_os_str() == file.as_os_str()).map(|i| i as u32)
+    }
+
+    /// `old` is no longer on the disk under its name: a conversion or a rename gave it `new`,
+    /// or a copy with the same content (`new`) took its place. `files` follows, so the queue
+    /// rebuilt after the batch doesn't list a file that is gone: `old`'s entry takes `new`
+    /// (`size`: its size, None when unchanged) when the scan would have listed it and it isn't
+    /// listed yet, else it is marked gone (an empty path, dropped by `rebuild_queue`). A GIF
+    /// never takes an entry: only the scan reads whether it is animated (`static_gifs`).
+    pub(super) fn moved(&mut self, old: &Path, new: &Path, size: Option<u64>) {
+        let (mut at, mut listed) = (None, false);
+        for (i, f) in self.files.iter().enumerate() {
+            if f.as_os_str() == old.as_os_str() {
+                at = Some(i);
+            } else if f.as_os_str() == new.as_os_str() {
+                listed = true;
+            }
+        }
+        let Some(i) = at else { return };
+        let scanned = (args::is_video_file(new) || image::kind_of(new).is_some()) && !args::is_gif(new);
+        if scanned && !listed {
+            self.files[i] = new.to_path_buf();
+            if let (Some(s), Some(size)) = (self.file_sizes.get_mut(i), size) {
+                *s = size;
+            }
+        } else {
+            self.files[i] = PathBuf::new();
+        }
+        self.queue_revision += 1;
     }
 
     /// Adds a scanned file to `files`, returning its index for the queues.
