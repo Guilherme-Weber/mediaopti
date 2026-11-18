@@ -9,11 +9,12 @@ and replaced originals go to the Recycle Bin (or a backup folder) by default.
 | Type | Formats | Method |
 |---|---|---|
 | Videos | mp4, mkv, mov, avi, wmv, webm, flv, m4v, mts, m2ts, ts, 3gp, mpg, mpeg; GIFs over 1 MB | NVENC AV1/HEVC/H.264 or x264. If the preset isn't smaller, stronger settings are retried while VMAF stays ≥ 93. Audio tracks, subtitles, attachments, cover pictures, chapters, tags (recording date, place, camera) and HDR10 metadata are kept (MKV when MP4 can't hold them); PCM audio becomes FLAC. |
-| Images | png, jpg, gif, bmp, tga | beeim/pingo, oxipng, ECT, jpegtran, gifsicle. Lossless, or visually lossless (SSIMULACRA2 ≥ 93). |
-| Audio | flac, mp3, ogg, wav, m4a (ALAC), aiff, ape, wv, tta | Cover art optimized; FLAC and Ogg repacked; the decoded audio stays identical. |
-| Documents | pdf, docx/xlsx/pptx, odt/ods/odp/odg, epub, cbz, cbr | Pictures inside optimized. Text and drawings are never changed, and PDF pages are rendered and compared. |
+| Images | png, jpg, gif, bmp, tga | beeim/pingo, oxipng, ECT, mozjpeg, jpegli, gifsicle. Lossless, or visually lossless (SSIMULACRA2 ≥ 93). |
+| Audio | flac, mp3, ogg, wav, m4a (ALAC), aiff, ape, wv, tta | FLAC and OptiVorbis. Cover art optimized; FLAC and Ogg repacked; the decoded audio stays identical. |
+| Documents | pdf, docx/xlsx/pptx, odt/ods/odp/odg, epub, cbz, cbr | qpdf, MuPDF and 7-Zip. Pictures inside optimized. Text and drawings are never changed, and PDF pages are rendered and compared. |
 
-Optional lossless conversions: WAV, AIFF, ALAC, APE, WavPack and TTA → FLAC (when smaller, tags and cover art kept), BMP/TGA → PNG, CBR → CBZ.
+Lossless conversions, on by default and each switchable in **Settings**: WAV, AIFF, ALAC, APE,
+WavPack and TTA → FLAC (when smaller, tags and cover art kept), BMP/TGA → PNG, CBR → CBZ.
 
 ## Safety
 
@@ -25,6 +26,9 @@ Optional lossless conversions: WAV, AIFF, ALAC, APE, WavPack and TTA → FLAC (w
   kept; otherwise the new file is numbered (`clip (2).mp4`).
 - Processed files are remembered by path and by content, so moved or copied files are not
   processed again.
+- A replacement interrupted by a crash or power loss is completed or undone at the next scan,
+  from a journal written before any original is set aside. Paths longer than 260 characters
+  are supported.
 
 ## Requirements
 
