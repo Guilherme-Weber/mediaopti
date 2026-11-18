@@ -152,6 +152,26 @@ fn pending_for(temp: &Path) -> Option<Pending> {
     journal().live.get(&journal_key(temp)).cloned()
 }
 
+/// Whether `temp` is a new version kept for its name: its replacement failed after the
+/// original was set aside (in the journal; the next scan names it). Never to be removed.
+pub(super) fn kept_for_its_name(temp: &Path) -> bool {
+    pending_for(temp).is_some()
+}
+
+/// The temp name `name(id)` for a job, unless a new version kept for its name has it (a file
+/// with the same stem and output type in that folder, earlier in this batch): then the same
+/// name with a higher number (+10000; still a name `is_orphan_temp` knows).
+pub(super) fn unclaimed_temp(name: impl Fn(u32) -> PathBuf, id: u32) -> PathBuf {
+    let mut n = id;
+    loop {
+        let candidate = name(n);
+        if !kept_for_its_name(&candidate) {
+            return candidate;
+        }
+        n += 10_000;
+    }
+}
+
 impl Journal {
     /// Rewrites the file with only the pending entries. Emptying it needn't be durable: what a
     /// lost truncation leaves are entries whose temps are gone, dropped at the next start.
@@ -407,6 +427,26 @@ mod tests {
         journal_start(&tmp, &orig, &orig).unwrap();
         assert_eq!(settle_orphan_temp(&tmp, &unreadable).unwrap(), Settled::Removed);
         assert_eq!(std::fs::read(&orig).unwrap(), b"original");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A new version kept for its name keeps it: a later job with the same temp name gets
+    /// another number instead of overwriting or removing it.
+    #[test]
+    fn kept_temps_are_never_reused() {
+        let dir = std::env::temp_dir().join(format!("mo-kept-temp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (orig, tmp) = (dir.join("clip.mp4"), dir.join("clip.mediaopti.w1.mp4"));
+        let name = |n: u32| crate::args::temp_name_with(&orig, n, "mp4");
+        std::fs::write(&tmp, b"new").unwrap();
+        assert_eq!(unclaimed_temp(name, 1), tmp, "free: its own name");
+        journal_start(&tmp, &orig, &orig).unwrap(); // its original was then set aside
+        assert!(kept_for_its_name(&tmp));
+        let other = unclaimed_temp(name, 1);
+        assert_eq!(other, dir.join("clip.mediaopti.w10001.mp4"));
+        assert!(is_orphan_temp(&other), "the cleanup still knows it");
+        journal_end(&tmp);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

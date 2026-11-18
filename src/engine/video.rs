@@ -138,6 +138,20 @@ impl Engine {
         let (source_state, links) = self
             .blocking(move || (file_state(&path), system::hard_link_count(&path).unwrap_or(1)))
             .await;
+        // Gone since the scan (moved, deleted, or set aside as the copy of a video with the
+        // same content): nothing to do, and nothing to remember.
+        if source_state.is_none() {
+            {
+                let mut inner = self.lock();
+                inner.in_progress.remove(&input);
+                inner.gone(&input);
+                inner.run.completed += 1;
+                inner.run.skipped += 1;
+            }
+            self.log(format!("[Worker {worker_id}] Skipped {display}: it is no longer there"));
+            self.send_state(false);
+            return Outcome::Skipped;
+        }
         // Like the CPU files' work folders: the new version (and the quality retry's second
         // one) is written next to the original, so its drive needs room for about twice it.
         // Held for the whole job, so videos encoding at once on one drive share its space.
@@ -238,7 +252,8 @@ impl Engine {
         if !dropped.is_empty() {
             self.log(format!("[Worker {worker_id}] {display}: its data tracks ({}) are left out (Advanced option)", dropped.join(", ")));
         }
-        let tmp = args::temp_name_with(&input, worker_id, &args::output_ext(&input, &streams));
+        let ext = args::output_ext(&input, &streams);
+        let tmp = super::replace::unclaimed_temp(|n| args::temp_name_with(&input, n, &ext), worker_id);
         self.lock().job_streams.insert(input.clone(), streams.clone());
         self.reset_worker(worker_id, &display, "encoding");
         self.log_remove(&tmp);
@@ -806,7 +821,10 @@ impl Engine {
                 Outcome::Processed
             }
             Err(err) => {
-                self.log_remove(tmp);
+                // Kept when the other copy was already set aside: the next scan names it.
+                if !super::replace::kept_for_its_name(tmp) {
+                    self.log_remove(tmp);
+                }
                 {
                     let mut inner = self.lock();
                     inner.failed.insert(input.to_path_buf());

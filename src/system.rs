@@ -121,6 +121,24 @@ pub fn probe_fails_in_tests(file: &Path) -> bool {
     }
 }
 
+/// Names a replacement can't rename a new version to, after its original was set aside
+/// (test builds only): like a target held open by another program until the retries end.
+#[cfg(test)]
+pub static RENAME_FAILS_ON: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn rename_fails_in_tests(target: &Path) -> bool {
+    #[cfg(test)]
+    {
+        let names = RENAME_FAILS_ON.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        target.file_name().is_some_and(|n| names.iter().any(|p| n == p.as_str()))
+    }
+    #[cfg(not(test))]
+    {
+        let _ = target;
+        false
+    }
+}
+
 /// Crash tests: MEDIAOPTI_DIE_AT=<point> ends the process at that point of a replacement,
 /// like a forced quit or a power cut would (test builds only).
 pub fn die_here_in_tests(point: &str) {
@@ -770,6 +788,9 @@ pub fn replace_file_with_retry(
             // Only ever a rename: a failed one (the target held open by another program) is
             // retried, never replaced by copying over the target, which would rewrite it in
             // place and could leave it half-written with the temp already gone.
+            if rename_fails_in_tests(final_target) {
+                return Err(std::io::Error::other("test: the new version's name is held by another program"));
+            }
             fs::rename(tmp, final_target)?;
             if final_target != original && *disposal == Disposal::Delete {
                 let _ = remove_file_if_exists(original);

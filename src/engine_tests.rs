@@ -807,6 +807,52 @@ fn unfinished_probes_never_decide() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The same video under the new name, ours smaller: if the rename fails after that copy was
+/// set aside, the new version stays (as its temp, named at the next scan), never deleted.
+#[test]
+fn a_new_version_kept_after_a_failed_rename_survives() {
+    let Some(ff) = ffmpeg() else {
+        skip_test!("bundled ffmpeg not found");
+        return;
+    };
+    let root = test_dir("kept-temp");
+    let media = root.join("media");
+    std::fs::create_dir_all(&media).unwrap();
+    // Unique names: the rename hook is shared by the tests running at once.
+    let (gif, mp4) = (media.join("kepttemp.gif"), media.join("kepttemp.mp4"));
+    make(&ff, &["-f", "lavfi", "-i", "testsrc=s=320x240:r=10:d=3", "-vf", "split[a][b];[a]palettegen[p];[b][p]paletteuse"], &gif);
+    make(&ff, &["-i", gif.to_str().unwrap(), "-fps_mode", "passthrough", "-c:v", "libx264", "-qp", "0", "-pix_fmt", "yuv444p"], &mp4);
+    crate::system::RENAME_FAILS_ON.lock().unwrap().push("kepttemp.mp4".to_string());
+
+    let rt = runtime();
+    let (engine, rec) = new_engine(&rt, &root, ff.clone());
+    let raw = || RawOptions { originals: Some(2), ..opts("av1_nvenc", 1.0) };
+    rt.block_on(async {
+        engine.apply_options(raw());
+        engine.load_dir(media.clone()).await;
+        engine.clone().run_batch(raw()).await;
+    });
+    crate::system::RENAME_FAILS_ON.lock().unwrap().retain(|n| n != "kepttemp.mp4");
+    let logs = rec.logs.lock().unwrap().join("\n");
+    println!("{logs}");
+    assert_eq!(engine.snapshot().failed_this_run, 1, "{logs}");
+    assert!(root.join("media (originals)").join("kepttemp.mp4").exists(), "the bigger copy was set aside: {logs}");
+    assert!(gif.exists(), "the GIF stays until its video has the name: {logs}");
+    let kept: Vec<_> = std::fs::read_dir(&media).unwrap().filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().contains(".mediaopti.")).collect();
+    assert_eq!(kept.len(), 1, "the new version is kept as its temp: {logs}");
+    assert!(logs.contains("Skipped kepttemp.mp4: it is no longer there"), "{logs}");
+    assert_eq!(engine.snapshot().pending_files, 0, "{:?}", engine.queue_preview(5));
+
+    // The next scan gives it the name.
+    let (engine2, rec2) = new_engine(&rt, &root, ff);
+    engine2.apply_options(raw());
+    rt.block_on(engine2.load_dir(media));
+    let logs2 = rec2.logs.lock().unwrap().join("\n");
+    assert!(mp4.exists(), "{logs2}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A phone video's tags survive: recording date, place, make and model in the MP4, and the
 /// date in an MKV (a QuickTime date listed twice used to be dropped there).
 #[test]

@@ -208,6 +208,14 @@ impl Inner {
     /// (`size`: its size, None when unchanged) when the scan would have listed it and it isn't
     /// listed yet, else it is marked gone (an empty path, dropped by `rebuild_queue`). A GIF
     /// never takes an entry: only the scan reads whether it is animated (`static_gifs`).
+    /// `file` is no longer on the disk (gone since the scan): its entry is marked gone.
+    pub(super) fn gone(&mut self, file: &Path) {
+        if let Some(i) = self.index_of(file) {
+            self.files[i as usize] = PathBuf::new();
+            self.queue_revision += 1;
+        }
+    }
+
     pub(super) fn moved(&mut self, old: &Path, new: &Path, size: Option<u64>) {
         let (mut at, mut listed) = (None, false);
         for (i, f) in self.files.iter().enumerate() {
