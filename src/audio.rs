@@ -154,11 +154,14 @@ pub(crate) fn audio_hash(ctx: &Ctx, path: &Path) -> Result<Option<[u8; 32]>, Run
 }
 
 /// Whether two audio files carry the same tags and as many cover pictures (their bytes may
-/// differ: an optimized cover is the same cover). A file that isn't a native FLAC counts as
-/// having none.
+/// differ: an optimized cover is the same cover). A native FLAC's covers are its picture
+/// blocks; any other file's, its attached pictures as ffmpeg lists them.
 pub(crate) fn same_tags_and_art(ctx: &Ctx, a: &Path, b: &Path) -> Result<bool, RunError> {
-    let pictures = |p: &Path| flac_read(p).ok().flatten().map_or(0, |f| f.blocks.iter().filter(|(t, _)| *t == 6).count());
-    if pictures(a) != pictures(b) {
+    let pictures = |p: &Path| match flac_read(p).ok().flatten() {
+        Some(f) => Ok(f.blocks.iter().filter(|(t, _)| *t == 6).count()),
+        None => stream_info(ctx, p).map(|i| i.pictures),
+    };
+    if pictures(a)? != pictures(b)? {
         return Ok(false);
     }
     let theirs = tags(ctx, b)?;
@@ -1016,6 +1019,30 @@ mod tests {
             let (si, so) = (stream_info(&c, &src).unwrap(), stream_info(&c, &out).unwrap());
             assert_eq!((si.bits, si.pictures, &si.rate_layout), (so.bits, so.pictures, &so.rate_layout), "{name}: format and art");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Same tags, but only one has a cover: not the same content, also when the one with the
+    /// cover isn't a FLAC (an ALAC .m4a whose FLAC already exists without it). Whichever stays
+    /// must keep the cover.
+    #[test]
+    fn covers_count_in_any_format() {
+        let Some(c) = ctx() else {
+            skip_test!("tools not found");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("mo-covers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = |n: &str| dir.join(n).to_string_lossy().into_owned();
+        ff(&c, &["-f", "lavfi", "-i", "testsrc=s=300x300", "-frames:v", "1", "-q:v", "2", &p("cover.jpg")]);
+        let tone = ["-f", "lavfi", "-i", "sine=f=440:d=2"];
+        let tags = ["-metadata", "title=Song", "-metadata", "artist=Band"];
+        ff(&c, &[&tone[..], &["-i", &p("cover.jpg"), "-map", "0:a", "-map", "1:v", "-c:a", "alac", "-c:v", "copy", "-disposition:v", "attached_pic"], &tags[..], &[&p("with.m4a")]].concat());
+        ff(&c, &[&tone[..], &["-c:a", "flac"], &tags[..], &[&p("without.flac")]].concat());
+        ff(&c, &[&tone[..], &["-c:a", "alac"], &tags[..], &[&p("plain.m4a")]].concat());
+        assert!(!same_tags_and_art(&c, &dir.join("with.m4a"), &dir.join("without.flac")).unwrap(), "the .m4a has a cover the FLAC lacks");
+        assert!(same_tags_and_art(&c, &dir.join("plain.m4a"), &dir.join("without.flac")).unwrap(), "no cover either way");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
