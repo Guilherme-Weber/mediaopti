@@ -347,8 +347,9 @@ impl Engine {
             inner.in_progress.remove(path);
             inner.cpu_started.remove(path);
             let display = inner.display_name(path);
+            let kind = image::kind_of(path).unwrap_or(image::Kind::Png);
             if !matches!(result, ImageResult::Stopped | ImageResult::ToolUnavailable(_)) {
-                inner.run.tools_failing = 0;
+                inner.run.tools_failing[kind as usize] = 0;
             }
             if !matches!(result, ImageResult::Stopped) {
                 inner.run.completed += 1;
@@ -426,21 +427,34 @@ impl Engine {
                 ImageResult::ToolUnavailable(err) => {
                     inner.run.failed += 1;
                     inner.failed.insert(path.to_path_buf());
-                    inner.run.tools_failing += 1;
+                    inner.run.tools_failing[kind as usize] += 1;
                     log = Some(format!("{tag} Failed on {display}: {err} (a tool problem, not the file's: tried again next run)"));
-                    if inner.run.tools_failing == TOOL_FAILURES_TO_STOP {
-                        let mut left = 0;
-                        for s in 0..3 {
-                            let n = inner.cpu_queues[s].len() - inner.cpu_cursors[s];
-                            inner.cpu_cursors[s] = inner.cpu_queues[s].len();
-                            inner.run.stage_total[s] = inner.run.stage_total[s].saturating_sub(n);
-                            left += n;
-                        }
+                    if inner.run.tools_failing[kind as usize] == TOOL_FAILURES_TO_STOP {
+                        // Only this kind's files not started yet leave the queue: the others'
+                        // tools may work.
+                        let s = kind.stage();
+                        let rest = {
+                            let cursor = inner.cpu_cursors[s];
+                            inner.cpu_queues[s].split_off(cursor)
+                        };
+                        let (dropped, kept): (Vec<u32>, Vec<u32>) =
+                            rest.into_iter().partition(|&i| image::kind_of(&inner.files[i as usize]) == Some(kind));
+                        inner.cpu_queues[s].extend(kept);
+                        let bytes: u64 = dropped.iter().map(|&i| inner.file_sizes.get(i as usize).copied().unwrap_or(0)).sum();
+                        inner.queue_bytes[s + 1] = inner.queue_bytes[s + 1].saturating_sub(bytes);
+                        inner.queue_revision += 1;
+                        let left = dropped.len();
+                        inner.run.stage_total[s] = inner.run.stage_total[s].saturating_sub(left);
                         inner.run.total = inner.run.total.saturating_sub(left);
                         inner.run.images_total = inner.run.images_total.saturating_sub(left);
+                        let what = match kind {
+                            image::Kind::LosslessAudio => "ALAC/AIFF/APE/WavPack/TTA".to_string(),
+                            image::Kind::Doc => "Office/EPUB".to_string(),
+                            other => format!("{other:?}").to_uppercase(),
+                        };
                         extra = Some(format!(
-                            "Tools kept failing to start or finish ({TOOL_FAILURES_TO_STOP} files in a row); \
-                             the {left} image, audio and document file(s) not started are left for the next run"
+                            "Tools kept failing to start or finish ({TOOL_FAILURES_TO_STOP} {what} files in a row); \
+                             the {left} {what} file(s) not started are left for the next run"
                         ));
                     }
                 }

@@ -1548,12 +1548,18 @@ fn tools_that_cannot_start_do_not_mark_files_broken() {
     for i in 0..FILES {
         make(&ff, &["-f", "lavfi", "-i", &format!("color=c=0x{:02x}6040:s=64x48", i * 4), "-frames:v", "1", "-compression_level", "0"], &media.join(format!("p{i:02}.png")));
     }
-    // Every PNG optimizer is "installed" but is not a program.
+    // JPEGs, whose tools work, queued after them in the same stage (smaller files go later).
+    const JPEGS: usize = 4;
+    for i in 0..JPEGS {
+        make(&ff, &["-f", "lavfi", "-i", &format!("color=c=0x40{:02x}60:s=32x24", i * 8), "-frames:v", "1", "-q:v", "2"], &media.join(format!("j{i}.jpg")));
+    }
+    // The PNG-only optimizer is "installed" but is not a program (pingo and ECT, which JPEGs
+    // use too, work).
     let data = root.join("appdata");
     std::fs::create_dir_all(&data).unwrap();
     let bad = data.join("broken.exe");
     std::fs::write(&bad, b"not a program").unwrap();
-    let tools: std::collections::HashMap<&str, &Path> = ["pingo", "beeim", "oxipng", "ect"].iter().map(|t| (*t, bad.as_path())).collect();
+    let tools: std::collections::HashMap<&str, &Path> = [("oxipng", bad.as_path())].into_iter().collect();
     std::fs::write(data.join("tools.json"), serde_json::to_string(&tools).unwrap()).unwrap();
 
     let rt = runtime();
@@ -1570,7 +1576,8 @@ fn tools_that_cannot_start_do_not_mark_files_broken() {
     assert!(logs.contains("kept failing to start"), "{logs}");
     let failed = engine.snapshot().failed_this_run;
     assert!((20..FILES).contains(&failed), "the rest is left for the next run: {failed} failed\n{logs}");
-    // Nothing was remembered: all of them are still to do.
+    // No PNG was remembered: all of them are still to do. Only the PNGs were left: the
+    // JPEGs, whose tools work, were done (and remembered).
     rt.block_on(engine.load_dir(media));
     assert_eq!(engine.snapshot().pending_files, FILES, "{logs}");
     let _ = std::fs::remove_dir_all(&root);
