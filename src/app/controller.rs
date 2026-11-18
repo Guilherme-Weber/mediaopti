@@ -101,7 +101,7 @@ impl RunClock {
     }
 
     pub(super) fn elapsed(&self) -> std::time::Duration {
-        self.banked + self.running_since.map(|t| t.elapsed()).unwrap_or_default()
+        self.banked + self.running_since.map_or_default(|t| t.elapsed())
     }
 }
 
@@ -301,7 +301,7 @@ impl Controller {
                 group_thousands(s.completed_this_run),
                 group_thousands(s.run_total)
             );
-            let left = format_eta(self.clock.elapsed(), fraction).map(|eta| format!(" · {eta} left")).unwrap_or_default();
+            let left = format_eta(self.clock.elapsed(), fraction).map_or_default(|eta| format!(" · {eta} left"));
             match s.status {
                 Status::Paused => format!("Paused · {files} · {elapsed} elapsed{left}"),
                 Status::Stopping => "Stopping…".to_string(),

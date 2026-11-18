@@ -795,7 +795,7 @@ pub(crate) fn search_methods(ctx: &Ctx, reference: &Path, methods: Vec<(&str, u3
         let cap = best.as_ref().map_or(limit, |b| b.2);
         if let Some(c) = quality_search(ctx, reference, lo, hi, &mut enc, cap)? {
             let s = size(&c).unwrap_or(u64::MAX);
-            let q: String = c.file_stem().map(|f| f.to_string_lossy().chars().filter(char::is_ascii_digit).collect()).unwrap_or_default();
+            let q: String = c.file_stem().map_or_default(|f| f.to_string_lossy().chars().filter(char::is_ascii_digit).collect());
             best = Some((c, format!("{name}={q}"), s));
         }
     }

@@ -608,12 +608,10 @@ impl Engine {
         } else {
             let stem = input
                 .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default();
+                .map_or_default(|s| s.to_string_lossy().into_owned());
             let ext = tmp
                 .extension()
-                .map(|e| format!(".{}", e.to_string_lossy()))
-                .unwrap_or_default();
+                .map_or_default(|e| format!(".{}", e.to_string_lossy()));
             input.with_file_name(format!("{stem}{ext}"))
         };
 
@@ -896,7 +894,7 @@ impl Engine {
             if !announced {
                 announced = true;
                 let free_gb = memory.map_or(0.0, |m| m.available_commit as f64 / 1_073_741_824.0);
-                let gpu = vram.map(|v| format!(", {:.1} GB on the GPU", v as f64 / 1024.0)).unwrap_or_default();
+                let gpu = vram.map_or_default(|v| format!(", {:.1} GB on the GPU", v as f64 / 1024.0));
                 self.log(format!(
                     "[Worker {worker_id}] Waiting for free memory before starting {display} ({free_gb:.1} GB available{gpu})"
                 ));

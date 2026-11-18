@@ -126,8 +126,7 @@ impl History {
         // not text; only those lines are lost, never the whole history.
         let read = |p: &Path| std::fs::read(p).map(|b| String::from_utf8_lossy(&b).into_owned());
         let hashes = read(&path)
-            .map(|data| data.split('\n').filter_map(|l| parse_hex::<32>(l.trim())).collect())
-            .unwrap_or_default();
+            .map_or_default(|data| data.split('\n').filter_map(|l| parse_hex::<32>(l.trim())).collect());
         let content_path = path.with_file_name("processed-content.tsv");
         let (mut content, mut sizes) = (HashMap::new(), HashSet::new());
         if let Ok(data) = read(&content_path) {

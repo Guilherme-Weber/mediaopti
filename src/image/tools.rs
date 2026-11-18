@@ -52,8 +52,7 @@ impl Tools {
             // The release zip keeps each tool in its own folder (with its DLLs and licence).
             let tools = d.join("tools");
             let mut sub: Vec<PathBuf> = std::fs::read_dir(&tools)
-                .map(|r| r.filter_map(Result::ok).map(|e| e.path()).filter(|p| p.is_dir()).collect())
-                .unwrap_or_default();
+                .map_or_default(|r| r.filter_map(Result::ok).map(|e| e.path()).filter(|p| p.is_dir()).collect());
             sub.sort();
             dirs.push(tools);
             dirs.extend(sub);

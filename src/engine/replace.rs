@@ -6,8 +6,7 @@ use std::collections::HashMap;
 pub(super) fn is_generated_name(path: &Path) -> bool {
     let name = path
         .file_name()
-        .map(|n| n.to_string_lossy().to_lowercase())
-        .unwrap_or_default();
+        .map_or_default(|n| n.to_string_lossy().to_lowercase());
     is_orphan_temp(path) || name.contains(".tmp.") || name.contains("-h264.")
 }
 
@@ -49,7 +48,7 @@ pub(super) fn settle_orphan_temp(temp: &Path, complete: &dyn Fn(&Path) -> Option
         journal_end(temp);
         return Ok(Settled::Recovered(target));
     }
-    let name = temp.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let name = temp.file_name().map_or_default(|n| n.to_string_lossy().into_owned());
     // ASCII lowercase keeps the byte offsets, so the cut always lands on a character boundary.
     let lower = name.to_ascii_lowercase();
     let cut = lower.find(".mediaopti.").or_else(|| lower.find(".batchviproc.")).unwrap_or(0);
@@ -87,7 +86,7 @@ pub(super) fn settle_orphan_temp(temp: &Path, complete: &dyn Fn(&Path) -> Option
             return Ok(Settled::Removed);
         }
     }
-    let ext = temp.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default();
+    let ext = temp.extension().map_or_default(|e| e.to_string_lossy().into_owned());
     let target = free_target(&dir.join(format!("{stem}.{ext}")))?;
     std::fs::rename(temp, &target)?;
     Ok(Settled::Recovered(target))
@@ -202,7 +201,7 @@ pub(super) fn init_pending_journal(path: &Path) {
         return;
     }
     j.path = Some(path.to_path_buf());
-    let text = std::fs::read(path).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
+    let text = std::fs::read(path).map_or_default(|b| String::from_utf8_lossy(&b).into_owned());
     j.live = parse_journal(&text);
     j.live.retain(|_, p| p.temp.is_file());
     if !text.is_empty() {

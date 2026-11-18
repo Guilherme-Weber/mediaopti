@@ -12,7 +12,7 @@ pub(super) fn common_root(paths: &[PathBuf]) -> PathBuf {
         while !p.starts_with(&root) {
             match root.parent() {
                 Some(up) => root = up.to_path_buf(),
-                None => return paths.first().map(folder).unwrap_or_default(),
+                None => return paths.first().map_or_default(folder),
             }
         }
     }

@@ -910,7 +910,7 @@ pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, dispo
         };
     };
     // The new version goes next to the original first (same volume), then replaces it.
-    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let stem = path.file_stem().map_or_default(|s| s.to_string_lossy().into_owned());
     let out_ext = args::ext_lower(&target);
     let sibling = super::replace::unclaimed_temp(|n| path.with_file_name(format!("{stem}.mediaopti.i{n}.{out_ext}")), worker_id);
     let attrs = match std::fs::metadata(path) {
@@ -948,7 +948,7 @@ fn keep_smaller_copy(path: &Path, existing: &Path, smaller: Option<&(PathBuf, u6
     match smaller {
         Some((best, after)) if *after < theirs => {
             // Ours is smaller: it replaces the existing copy, then the original goes.
-            let stem = existing.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            let stem = existing.file_stem().map_or_default(|s| s.to_string_lossy().into_owned());
             let ext = args::ext_lower(existing);
             let sibling = super::replace::unclaimed_temp(|n| existing.with_file_name(format!("{stem}.mediaopti.i{n}.{ext}")), worker_id);
             let attrs = std::fs::metadata(path).map(|m| system::OriginalAttributes::from_metadata(&m));

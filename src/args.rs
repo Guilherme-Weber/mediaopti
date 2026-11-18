@@ -493,8 +493,7 @@ pub enum Mode {
 
 pub fn ext_lower(path: &Path) -> String {
     path.extension()
-        .map(|e| e.to_string_lossy().to_lowercase())
-        .unwrap_or_default()
+        .map_or_default(|e| e.to_string_lossy().to_lowercase())
 }
 
 pub fn is_gif(path: &Path) -> bool {
@@ -512,14 +511,14 @@ pub fn temp_name(input: &Path, worker_id: u32) -> std::path::PathBuf {
     let out_ext = if REMUX_TO_MP4_EXTS.contains(&ext_lower(input).as_str()) {
         "mp4".to_string()
     } else {
-        input.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default()
+        input.extension().map_or_default(|e| e.to_string_lossy().into_owned())
     };
     temp_name_with(input, worker_id, &out_ext)
 }
 
 /// `<dir>/<stem>.mediaopti.w<id>.<ext>` (see [`output_ext`]).
 pub fn temp_name_with(input: &Path, worker_id: u32, ext: &str) -> std::path::PathBuf {
-    let stem = input.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let stem = input.file_stem().map_or_default(|s| s.to_string_lossy().into_owned());
     let dot = if ext.is_empty() { "" } else { "." };
     input.with_file_name(format!("{stem}.mediaopti.w{worker_id}{dot}{ext}"))
 }

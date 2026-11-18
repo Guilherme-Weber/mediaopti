@@ -270,17 +270,17 @@ fn repack(ctx: &Ctx, kind: Kind, src: &Path, work: &Path) -> Result<Optimized, E
             }
             let mut crc = f.crc32();
             if f.is_dir() {
-                zout.add_directory(name.clone(), options)?;
+                zout.add_directory(name, options)?;
             } else if let Some((data, s)) = done.remove(&i) {
                 if !s.is_empty() {
                     crc = crc32(&data);
                     n_img += 1;
                     steps.extend(s);
                 }
-                zout.start_file(name.clone(), options)?;
+                zout.start_file(name, options)?;
                 zout.write_all(&data)?;
             } else {
-                zout.start_file(name.clone(), options)?;
+                zout.start_file(name, options)?;
                 io::copy(&mut f, &mut zout)?;
             }
             expected.push(Expected { name: f.name_raw().to_vec(), crc, stored, dir: f.is_dir() });
