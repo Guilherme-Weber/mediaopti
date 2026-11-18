@@ -22,8 +22,9 @@ A release focused on safety and robustness, after an audit of the whole program.
 
 - A program error while processing one file fails only that file; the batch goes on.
 - A tool that cannot start or times out no longer marks the file as broken: the file is tried
-  again in the next run. After 20 such failures in a row, the remaining images, audio and
-  documents wait for the next run.
+  again in the next run. After 20 such failures in a row for one kind of file (PDFs when qpdf
+  is missing, for example), the remaining files of that kind wait for the next run; the
+  others go on.
 - The lossy search of a very large picture runs only when its memory is free; otherwise the
   picture gets the lossless pass only.
 - Videos reserve twice their size on their drive, shared with the other jobs.
@@ -44,7 +45,9 @@ A release focused on safety and robustness, after an audit of the whole program.
   by keeping either one.
 - A numbered name (`clip (2).mp4`) keeps every character of the original name.
 - A failure to start ffmpeg for lack of memory is waited out instead of failing the file.
-- ffmpeg probes end on Stop, Pause and after a time limit.
+- ffmpeg probes end on Stop, Pause and after a time limit. A probe that doesn't finish never
+  decides anything: the video is left as it was and tried again in the next run.
+- A video deleted or moved after the scan is skipped instead of being remembered as broken.
 - PDF: re-encoded JPEGs are checked to be sequential, and a damaged PDF is rewritten only when
   its pages render the same.
 - A JPEG with a header segment shorter than its declared length no longer stops the program.
