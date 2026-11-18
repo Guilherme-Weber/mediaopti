@@ -38,21 +38,25 @@ impl Engine {
     /// [`Self::apply_options`] off the calling thread (the window's): with a million files,
     /// rebuilding the queue takes a moment. The newest settings always win.
     pub fn apply_options_in_background(self: &Arc<Self>, raw: RawOptions) {
-        static LATEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let generation = LATEST.fetch_add(1, Ordering::SeqCst) + 1;
+        let generation = self.options_generation.fetch_add(1, Ordering::SeqCst) + 1;
         let engine = Arc::clone(self);
-        self.rt.spawn_blocking(move || {
-            if LATEST.load(Ordering::SeqCst) == generation {
-                engine.apply_options(raw);
-            }
-        });
+        self.rt.spawn_blocking(move || engine.apply_options_of(raw, Some(generation)));
     }
 
     /// Applies settings outside a run, so the queue shown before Start already reflects
     /// them (e.g. which GIFs are queued).
     pub fn apply_options(self: &Arc<Self>, raw: RawOptions) {
+        self.apply_options_of(raw, None);
+    }
+
+    /// [`Self::apply_options`]; with `generation`, only if no newer settings were sent
+    /// since, checked under the lock: two changes waiting for it may get it in any order.
+    fn apply_options_of(self: &Arc<Self>, raw: RawOptions, generation: Option<u64>) {
         {
             let mut inner = self.lock();
+            if generation.is_some_and(|g| self.options_generation.load(Ordering::SeqCst) != g) {
+                return;
+            }
             if inner.working {
                 return;
             }
@@ -500,6 +504,30 @@ mod tests {
     use super::*;
 
     const GB: u64 = 1024 * 1024 * 1024;
+
+    /// Two settings changes sent in a row both wait for the engine (a long queue rebuild
+    /// holds it) and may get it in any order: the older one, arriving last, is dropped.
+    #[test]
+    fn late_settings_never_replace_newer_ones() {
+        struct Quiet;
+        impl Ui for Quiet {
+            fn log(&self, _: String) {}
+            fn state(&self, _: &StateDto) {}
+        }
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let data = std::env::temp_dir().join(format!("mo-settings-order-{}", std::process::id()));
+        let engine = Engine::new(Box::new(Quiet), &data, PathBuf::from("ffmpeg.exe"), rt.handle().clone());
+        let jobs = |n: f64| RawOptions { concurrency: Some(n), ..RawOptions::default() };
+        // Sent: 1 then 3. Applied: 3 first, then the older 1.
+        engine.options_generation.store(2, Ordering::SeqCst);
+        engine.apply_options_of(jobs(3.0), Some(2));
+        engine.apply_options_of(jobs(1.0), Some(1));
+        assert_eq!(engine.lock().options.concurrency, 3);
+        // Straight calls (tests, the start of a batch) always apply.
+        engine.apply_options(jobs(2.0));
+        assert_eq!(engine.lock().options.concurrency, 2);
+        let _ = std::fs::remove_dir_all(&data);
+    }
 
     fn mem(commit_gb: u64, phys_gb: u64) -> Option<system::MemoryStatus> {
         Some(system::MemoryStatus {

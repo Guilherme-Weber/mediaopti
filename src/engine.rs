@@ -251,6 +251,9 @@ pub struct Engine {
     emit: Mutex<EmitThrottle>,
     /// Serializes encoder start-up so memory checks see the previous encoder's usage.
     admission: Arc<tokio::sync::Mutex<()>>,
+    /// The newest settings sent by `apply_options_in_background` (older ones still waiting
+    /// for the lock are dropped).
+    options_generation: std::sync::atomic::AtomicU64,
     /// True while the batch is paused: running ffmpeg processes are suspended and no
     /// new file is started.
     paused: tokio::sync::watch::Sender<bool>,
@@ -341,6 +344,7 @@ impl Engine {
                 pending: false,
             }),
             admission: Arc::new(tokio::sync::Mutex::new(())),
+            options_generation: std::sync::atomic::AtomicU64::new(0),
             paused: tokio::sync::watch::Sender::new(false),
         })
     }
