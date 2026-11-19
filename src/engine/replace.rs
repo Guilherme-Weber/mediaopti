@@ -337,8 +337,11 @@ pub(super) fn replace_original(tmp: &Path, final_target: &Path, original: &Path,
 impl Engine {
     pub(super) fn log_remove(&self, path: &Path) {
         if let Err(err) = system::remove_file_if_exists(path) {
+            // Error 32: still open, mostly by an ffmpeg that is quitting after Stop. The next
+            // scan's cleanup (`settle_orphan_temp`) removes it.
+            let when = if err.raw_os_error() == Some(32) { "still open by another process" } else { "error" };
             self.log(format!(
-                "Could not remove temporary file {}: {err}",
+                "Could not remove temporary file {} ({when}: {err}); the next scan removes it",
                 path.display()
             ));
         }

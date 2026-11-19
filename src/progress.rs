@@ -33,6 +33,9 @@ static ERROR_LINE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)error|invalid|failed|corrupt|cannot|unable|could not write header").unwrap()
 });
 
+/// ffmpeg's ` @ 000001d9544f8a40` after a component name: different on every run.
+static ADDRESS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r" @ (0x)?[0-9a-fA-F]+\]").unwrap());
+
 #[derive(Debug, Default)]
 pub struct Diagnostics {
     pub no_video_stream: bool,
@@ -43,6 +46,9 @@ pub struct Diagnostics {
     /// The filters were rebuilt mid-stream (frame size changed).
     pub reconfigured: bool,
     pub error_lines: Vec<String>,
+    /// The same error lines in ffmpeg's own words, without the worker prefix and memory
+    /// addresses, each once (see [`Diagnostics::reason`]).
+    messages: Vec<String>,
     /// Input duration in seconds as reported by ffmpeg (0 if unknown).
     pub duration_sec: f64,
     /// Trailing partial line carried over to the next stderr chunk.
@@ -77,6 +83,16 @@ impl WorkerProgress {
             step: "encoding".to_string(),
             started: Instant::now(),
         }
+    }
+}
+
+impl Diagnostics {
+    /// What ffmpeg said went wrong, for a log line: its first two different error lines,
+    /// e.g. "[indeo5] Corrupted tile data encountered!; [indeo5] Error while decoding band:
+    /// 0, plane: 0". `None` when it printed none.
+    pub fn reason(&self) -> Option<String> {
+        let text = self.messages.iter().take(2).cloned().collect::<Vec<_>>().join("; ");
+        (!text.is_empty()).then(|| text.chars().take(300).collect())
     }
 }
 
@@ -161,6 +177,10 @@ pub fn parse_chunk(
                 diag.error_lines
                     .push(format!("[W{worker_id}: {display_name}] {trimmed}"));
             }
+            let message = ADDRESS.replace_all(trimmed, "]").into_owned();
+            if !message.is_empty() && diag.messages.len() < 5 && !diag.messages.contains(&message) {
+                diag.messages.push(message);
+            }
         }
     }
     saw_progress
@@ -205,6 +225,14 @@ mod tests {
         assert!(d.corrupt_input);
         assert_eq!(d.error_lines.len(), 1);
         assert!(d.error_lines[0].starts_with("[W2: a.mp4] Error opening"));
+
+        // The reason in ffmpeg's words, each line once, without addresses (Latest1.avi).
+        let mut d = Diagnostics::default();
+        let indeo = "[indeo5 @ 000001d9544f8a40] Corrupted tile data encountered!\n[indeo5 @ 000001d9544f8a40] Error while decoding band: 0, plane: 0\n";
+        parse_chunk(&mut p, &mut d, 1, "Latest1.avi", &format!("{indeo}{indeo}[vist#0:0/indeo5 @ 0x1] Error submitting packet to decoder: Invalid data found when processing input\n"));
+        assert!(d.corrupt_input);
+        assert_eq!(d.reason().as_deref(), Some("[indeo5] Corrupted tile data encountered!; [indeo5] Error while decoding band: 0, plane: 0"));
+        assert_eq!(Diagnostics::default().reason(), None);
 
         // Seen with 6-8 parallel 4K encodes: not a file the GPU can't encode.
         for text in [

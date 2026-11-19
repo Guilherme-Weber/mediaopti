@@ -21,6 +21,13 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Tests
         run: cargo test --locked
+      # Security: known vulnerabilities in the locked dependencies (RustSec advisory database).
+      # Fails on a vulnerability; "unmaintained" notices are only warnings.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: Dependency audit
+        run: cargo audit
       - name: No control characters in text files
         shell: bash
         run: |

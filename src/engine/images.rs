@@ -467,7 +467,7 @@ impl Engine {
                 ImageResult::OutOfMemory => {
                     inner.run.failed += 1;
                     inner.failed.insert(path.to_path_buf());
-                    log = Some(format!("{tag} Not enough memory for {display}; left as it was, tried again next run"));
+                    log = Some(format!("{tag} Failed on {display}: not enough memory; left as it was, tried again next run"));
                 }
                 // Stop, or a Pause that released the memory: back to the front of the queue
                 // (it starts over on Resume).

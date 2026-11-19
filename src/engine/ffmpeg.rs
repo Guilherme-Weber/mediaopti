@@ -474,14 +474,20 @@ impl Engine {
     }
 
     /// Frame count and length in seconds of the first video stream, read from its packets
-    /// (no decoding, so fast even for big files). `Ok(None)` when it can't be read,
-    /// `Unfinished` when the read didn't finish.
+    /// (no decoding, so fast even for big files). A GIF's frames are counted by decoding: its
+    /// demuxer hands extension blocks after the last picture (Photoshop's XMP) over as one
+    /// more packet, which counted as a frame the video "lost" (11 false failures on
+    /// 2026-11-19). `Ok(None)` when it can't be read, `Unfinished` when the read didn't finish.
     pub(super) async fn video_timing(&self, path: &Path) -> Result<Option<(u64, f64)>, Unfinished> {
         let mut cmd = tokio::process::Command::new(&self.ffmpeg_path);
-        cmd.args(["-hide_banner", "-v", "error", "-i"])
-            .arg(path)
-            .args(["-map", "0:v:0", "-c", "copy", "-f", "framemd5", "-"])
-            .stdin(Stdio::null())
+        cmd.args(["-hide_banner", "-v", "error", "-i"]).arg(path).args(["-map", "0:v:0"]);
+        if args::is_gif(path) {
+            // Each decoded frame keeps the GIF's own delay; wrapped_avframe skips any encoding.
+            cmd.args(["-fps_mode", "passthrough", "-enc_time_base", "demux", "-c:v", "wrapped_avframe", "-f", "framecrc", "-"]);
+        } else {
+            cmd.args(["-c", "copy", "-f", "framemd5", "-"]);
+        }
+        cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
@@ -554,14 +560,11 @@ pub(super) fn streams_lost(before: &args::Streams, after: &args::Streams) -> Opt
         .tags
         .iter()
         .filter(|(k, v)| {
-            let found = after.tags.iter().find(|(ak, _)| ak == k).map(|(_, av)| av.as_str());
-            if k == "creation_time" {
-                // MKV keeps it to the second, MP4 with fractions: compared to the second.
-                let day = |t: &str| t.split(';').next().unwrap_or_default().chars().take(19).collect::<String>();
-                found.is_none_or(|f| day(f) != day(v))
-            } else {
-                found != Some(v.as_str())
-            }
+            // MKV keeps the date to the second, MP4 with fractions: compared to the second.
+            let day = |t: &str| t.split(';').next().unwrap_or_default().chars().take(19).collect::<String>();
+            let same_value = |av: &str| if k == "creation_time" { day(av) == day(v) } else { av == v };
+            // Key and value together: "a b" and "a_b" may both be there with other values.
+            !after.tags.iter().any(|(ak, av)| same_tag_key(ak, k) && same_value(av))
         })
         .map(|(k, _)| k.as_str())
         .collect();
@@ -577,6 +580,12 @@ pub(super) fn streams_lost(before: &args::Streams, after: &args::Streams) -> Opt
         _ => {}
     }
     (!lost.is_empty()).then(|| lost.join(", "))
+}
+
+/// Tag keys as the same tag: the Matroska muxer writes a key's spaces as underscores (a WMV's
+/// "VBR Peak" comes back as `VBR_PEAK`; keys are already in lower case).
+fn same_tag_key(a: &str, b: &str) -> bool {
+    a.len() == b.len() && a.bytes().zip(b.bytes()).all(|(x, y)| x == y || matches!((x, y), (b' ', b'_') | (b'_', b' ')))
 }
 
 /// Why a GIF's video doesn't keep its animation, if it doesn't: another number of frames, or
@@ -752,6 +761,16 @@ mod tests {
         assert_eq!(super::streams_lost(&tagged, &mkv), None, "same tags, date to the second");
         let why = super::streams_lost(&tagged, &before).unwrap();
         assert!(why.contains("its tags (creation_time, com.apple.quicktime.make)"), "{why}");
+        // A WMV's "VBR Peak" comes back from the Matroska muxer as VBR_PEAK (PART3.wmv).
+        let wmv = Streams { tags: vec![("vbr peak".into(), "4871679".into()), ("toolname".into(), "WMEU".into())], ..before.clone() };
+        let mkv = Streams { tags: vec![("toolname".into(), "WMEU".into()), ("vbr_peak".into(), "4871679".into())], ..before.clone() };
+        assert_eq!(super::streams_lost(&wmv, &mkv), None, "space written as underscore");
+        let changed = Streams { tags: vec![("toolname".into(), "WMEU".into()), ("vbr_peak".into(), "1".into())], ..before.clone() };
+        assert!(super::streams_lost(&wmv, &changed).unwrap().contains("its tags (vbr peak)"));
+        assert!(!super::same_tag_key("vbr peak", "vbrpeak"));
+        // Both spellings present with different values: each finds its own.
+        let both = Streams { tags: vec![("foo bar".into(), "A".into()), ("foo_bar".into(), "B".into())], ..before };
+        assert_eq!(super::streams_lost(&both, &both), None);
     }
 
     #[test]

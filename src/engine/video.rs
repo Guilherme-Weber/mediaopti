@@ -104,7 +104,7 @@ impl Engine {
         }
         let what = what.unwrap_or("its tracks");
         self.log(format!(
-            "[Worker {worker_id}] {display}: {what} could not be checked (ffmpeg didn't finish in time or couldn't start); left as it was (tried again next run)"
+            "[Worker {worker_id}] Failed on {display}: {what} could not be checked (ffmpeg didn't finish in time or couldn't start); left as it was (tried again next run)"
         ));
         self.send_state(true);
         Outcome::Failed
@@ -330,8 +330,9 @@ impl Engine {
                 inner.run.completed += 1;
                 inner.run.failed += 1;
             }
+            let why = attempt.diag.reason().unwrap_or_else(|| "no details".into());
             self.log(format!(
-                "[Worker {worker_id}] Corrupt/unreadable file remembered in history (will not retry): {display}"
+                "[Worker {worker_id}] Failed on {display}: corrupt or unreadable, ffmpeg can't decode it ({why}); remembered in history (will not retry)"
             ));
             self.send_state(true);
             return Outcome::Failed;
@@ -411,7 +412,7 @@ impl Engine {
                 }
                 self.log_remove(&tmp);
                 self.log(format!(
-                    "[Worker {worker_id}] Could not start ffmpeg ({}): {err}",
+                    "[Worker {worker_id}] Failed on {display}: could not start ffmpeg ({}): {err}",
                     self.ffmpeg_path.display()
                 ));
                 self.send_state(true);
@@ -433,7 +434,7 @@ impl Engine {
             }
             self.log_remove(&tmp);
             self.log(format!(
-                "[Worker {worker_id}] Not enough memory to encode {display} (GPU or system); it will be tried again next run"
+                "[Worker {worker_id}] Failed on {display}: not enough memory to encode it (GPU or system); it will be tried again next run"
             ));
             self.send_state(true);
             return Outcome::Failed;
@@ -447,8 +448,9 @@ impl Engine {
             self.remember(&input, &input).await; // Remember unrecoverable files so future runs skip them
             self.remember_without_gif_pass(&input);
             self.lock().run.failed += 1;
+            let why = attempt.diag.reason().unwrap_or_else(|| "no error printed".into());
             self.log(format!(
-                "[Worker {worker_id}] ffmpeg exited with code {code} for {display} (remembered in history)"
+                "[Worker {worker_id}] Failed on {display}: ffmpeg exited with code {code} ({why}); remembered in history"
             ));
             self.send_state(true);
             return Outcome::Failed;
@@ -475,7 +477,7 @@ impl Engine {
                 }
                 self.log_remove(&tmp);
                 self.log(format!(
-                    "Could not inspect processed output for {display}: {err}"
+                    "[Worker {worker_id}] Failed on {display}: could not read the size of the original or the new version: {err}"
                 ));
                 self.send_state(true);
                 return Outcome::Failed;
@@ -573,7 +575,7 @@ impl Engine {
                 self.remember(&input, &input).await;
                 self.remember_without_gif_pass(&input);
                 self.lock().run.failed += 1;
-                self.log(format!("[Worker {worker_id}] The new version of {display} {why}; kept the original (remembered in history)"));
+                self.log(format!("[Worker {worker_id}] Failed on {display}: the new version {why}; kept the original (remembered in history)"));
                 self.send_state(true);
                 return Outcome::Failed;
             }
@@ -695,7 +697,7 @@ impl Engine {
                 inner.failed.insert(input.clone());
                 inner.run.failed += 1;
             }
-            self.log(format!("[Worker {worker_id}] {display}: {err}"));
+            self.log(format!("[Worker {worker_id}] Failed on {display}: {err}"));
             self.send_state(true);
             return Outcome::Failed;
         }
@@ -828,7 +830,7 @@ impl Engine {
                     inner.failed.insert(input.to_path_buf());
                     inner.run.failed += 1;
                 }
-                self.log(format!("[Worker {worker_id}] {display}: {err}"));
+                self.log(format!("[Worker {worker_id}] Failed on {display}: {err}"));
                 self.send_state(true);
                 Outcome::Failed
             }

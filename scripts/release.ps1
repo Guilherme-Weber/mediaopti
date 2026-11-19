@@ -3,7 +3,8 @@
 #   2. no control characters in tracked text files (broken backslashes);
 #   3. tools: scripts/check-tools.ps1 (stops if a packaged tool has a newer version, unless
 #      -SkipToolCheck);
-#   4. version set in Cargo.toml; clippy (lint policy) and the tests;
+#   4. version set in Cargo.toml; clippy (lint policy), the tests and the dependency audit
+#      (cargo audit: known vulnerabilities; install with `cargo install cargo-audit --locked`);
 #   5. scripts/package.ps1;
 #   6. commit "Release <version>" (no AI attribution), push, GitHub release with the zip and
 #      the notes, and the published SHA-256 compared with the local zip.
@@ -68,6 +69,9 @@ try {
     # Every test must really run here: one that would skip (a missing tool) fails instead.
     $env:MEDIAOPTI_REQUIRE_TOOLS = '1'
     try { Run { cargo test } 'tests' } finally { Remove-Item Env:MEDIAOPTI_REQUIRE_TOOLS }
+    Step 'Dependency audit'
+    if (-not (Get-Command cargo-audit -ErrorAction SilentlyContinue)) { throw 'cargo-audit not found: cargo install cargo-audit --locked' }
+    Run { cargo audit } 'cargo audit'
     Step 'Package'
     Run { & (Join-Path $PSScriptRoot 'package.ps1') } 'package'
     $zip = Join-Path $root "dist\mediaopti-$Version-win64.zip"

@@ -3,6 +3,30 @@
 Notable changes to mediaopti. Earlier versions are described in their
 [GitHub releases](https://github.com/Guilherme-Weber/mediaopti/releases).
 
+## Unreleased
+
+### Fixed
+
+- Animated GIFs exported with XMP data after their last frame (Photoshop, After Effects) are
+  made into videos again: the check took that data for a frame the video had lost and kept
+  the GIF. Frames are now counted by decoding the GIF.
+- WMV files whose new version is MKV no longer fail with "lost its tags": Matroska writes a
+  tag name's spaces as underscores ("VBR Peak" as VBR_PEAK), and that counted as a lost tag.
+
+### Changed
+
+- Every failed file is logged as "Failed on <file>: <reason>" and shows in red in the
+  activity log (video failures had other wordings and weren't red). A file ffmpeg can't decode
+  says why, in ffmpeg's words (e.g. "[indeo5] Corrupted tile data encountered!"); a temporary
+  file still open when it was to be removed says that the next scan removes it.
+
+### Development
+
+- `scripts/log-summary.ps1`: the last run's outcome and its failures grouped by cause;
+  `docs/known-failures.md` lists the causes found so far.
+- The dependency audit (`cargo audit`) runs in CI and in `release.ps1`.
+- The engine's end-to-end tests are split by area in `src/engine_tests/`.
+
 ## 3.2.0
 
 A release of the window only: what is processed, how it is verified and the results are the
