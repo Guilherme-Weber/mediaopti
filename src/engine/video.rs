@@ -27,10 +27,13 @@ impl Engine {
             return None;
         }
         let outcome = self.gif_as_image(worker_id, input, display).await;
-        if !matches!(outcome, Outcome::Stopped) {
-            // Done as a video: later runs only retry the GIF optimizer if it didn't finish
-            // (see `Inner::place`), never the encode.
-            self.add_processed(input);
+        // Done as a video, even when the GIF pass was stopped: later runs only retry the GIF
+        // optimizer if it didn't finish (see `Inner::place`), never the encode.
+        self.add_processed(input);
+        if matches!(outcome, Outcome::Stopped) && !self.lock().stop_requested {
+            // A Pause ended the GIF pass: the file waits in the CPU queue (`finish_image`),
+            // and this video worker carries on after Resume.
+            return Some(Outcome::Released);
         }
         Some(outcome)
     }
@@ -656,7 +659,19 @@ impl Engine {
                             self.send_state(false);
                             return Outcome::Skipped;
                         }
-                        Ok(true) => return self.keep_smaller_video(worker_id, &input, &final_target, &tmp, &display, in_size).await,
+                        Ok(true) => {
+                            // As for any replacement: an original that changed while it was
+                            // encoded (or while the copies were compared) is left alone.
+                            let path = input.clone();
+                            if self.blocking(move || file_state(&path)).await != source_state {
+                                self.lock().run.skipped += 1;
+                                self.log_remove(&tmp);
+                                self.log(format!("[Worker {worker_id}] {display} changed while it was being encoded; left unchanged (it will be processed next time)"));
+                                self.send_state(false);
+                                return Outcome::Skipped;
+                            }
+                            return self.keep_smaller_video(worker_id, &input, &final_target, &tmp, &display, in_size).await;
+                        }
                         Ok(false) => {}
                     }
                 }
@@ -792,10 +807,13 @@ impl Engine {
         let (input_c, existing_c, tmp_c) = (input.to_path_buf(), existing.to_path_buf(), tmp.to_path_buf());
         let engine = Arc::clone(self);
         let result = self
-            .blocking(move || -> Result<(bool, f64, u64), String> {
+            .blocking(move || -> Result<(bool, bool, f64, u64), String> {
                 let theirs = std::fs::metadata(&existing_c).map_err(|e| e.to_string())?.len();
                 let ours = std::fs::metadata(&tmp_c).map_err(|e| e.to_string())?.len();
-                let replaced = ours < theirs;
+                // A hard-linked copy keeps its bytes (replacing it would break the link); the
+                // original goes either way: it is the same video.
+                let linked = ours < theirs && system::hard_link_count(&existing_c).unwrap_or(1) > 1;
+                let replaced = ours < theirs && !linked;
                 if replaced {
                     let attrs = std::fs::metadata(&input_c).map(|m| OriginalAttributes::from_metadata(&m));
                     replace_original(&tmp_c, &existing_c, &existing_c, &disposal.for_sibling(&existing_c), &|p| engine.note_content_now(p, history::VIDEO_MODE))?;
@@ -807,13 +825,16 @@ impl Engine {
                 }
                 system::dispose(&input_c, &disposal).map_err(|e| format!("could not remove the original: {e}"))?;
                 let freed = if replaced { (theirs - ours) as f64 } else { 0.0 };
-                Ok((replaced, freed, theirs.min(ours)))
+                Ok((replaced, linked, freed, if replaced { ours } else { theirs }))
             })
             .await;
         let name = existing.file_name().unwrap_or_default().to_string_lossy().into_owned();
         match result {
-            Ok((replaced, freed, size)) => {
-                self.remember(existing, existing).await;
+            Ok((replaced, linked, freed, size)) => {
+                // A hard-linked copy left bigger than it could be is not done: not remembered.
+                if !linked {
+                    self.remember(existing, existing).await;
+                }
                 {
                     let mut inner = self.lock();
                     inner.moved(input, existing, Some(size));
@@ -822,6 +843,8 @@ impl Engine {
                 }
                 self.log(if replaced {
                     format!("[Worker {worker_id}] {display}: {name} was the same video; it now holds the smaller new version and the original was removed")
+                } else if linked {
+                    format!("[Worker {worker_id}] {display}: {name} is the same video (a hard link, so left as it is); the original was removed")
                 } else {
                     format!("[Worker {worker_id}] {display}: {name} is the same video and smaller; the original was removed")
                 });

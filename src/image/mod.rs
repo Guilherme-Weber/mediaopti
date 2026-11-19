@@ -415,6 +415,51 @@ impl Optimized {
 
 /// Content-history mode for images, compatible with imageopti's history.
 /// The history mode of a pass (imageopti's names; `-strip` when metadata was removed).
+/// Memory a visually lossless search takes per pixel: measured on 2026-11-17 with a
+/// 164-megapixel JPEG (ssimulacra2 alone 15.6 GB; the job's processes 23.2 GB at once, about
+/// 141 bytes a pixel). The fixed 2 GB admission per file let such a job run out of memory.
+pub(crate) const LOSSY_BYTES_PER_PIXEL: u64 = 150;
+/// From this estimate on, a lossy search is a big job: one at a time, with its memory free.
+pub(crate) const BIG_LOSSY_JOB: u64 = 4 << 30;
+/// Commit memory left for everything else while a big lossy search runs.
+const BIG_LOSSY_RESERVE: u64 = 2 << 30;
+
+/// Whether a big lossy search needing `need` bytes fits in the commit memory `available`
+/// now (unknown counts as fitting).
+pub(crate) fn big_lossy_fits(need: u64, available: Option<u64>) -> bool {
+    // Saturating: a damaged header may declare billions of pixels.
+    available.is_none_or(|a| a >= need.saturating_add(BIG_LOSSY_RESERVE))
+}
+
+/// Waits for the other big lossy search to end (one at a time). `None` on Stop.
+pub(crate) fn one_big_lossy_job(gate: &tools::Gate) -> Option<std::sync::MutexGuard<'static, ()>> {
+    static BIG_LOSSY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    loop {
+        match BIG_LOSSY.try_lock() {
+            Ok(guard) => return Some(guard),
+            Err(std::sync::TryLockError::Poisoned(p)) => return Some(p.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
+        if !gate.wait_while_paused() {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// For a picture inside a document or comic (`pixels` of it): whether its visually lossless
+/// search may run now, holding the one-big-search turn when it is big (as for a picture on
+/// its own: a 150-megapixel comic page needs ~20 GB). `Ok((false, None))`: lossless only.
+pub(crate) fn lossy_turn(ctx: &Ctx, pixels: u64) -> Result<(bool, Option<std::sync::MutexGuard<'static, ()>>), RunError> {
+    let need = pixels.saturating_mul(LOSSY_BYTES_PER_PIXEL);
+    if !ctx.lossy || need < BIG_LOSSY_JOB {
+        return Ok((ctx.lossy, None));
+    }
+    let guard = one_big_lossy_job(&ctx.gate).ok_or(RunError::Cancelled)?;
+    let fits = big_lossy_fits(need, crate::system::memory_status().map(|m| m.available_commit));
+    Ok((fits, fits.then_some(guard)))
+}
+
 /// The tool a kind can't do without, if it is missing. Without it the chain skips its steps
 /// silently (`run` gives `Ok(false)`), and the file would be remembered as done: it is a
 /// tool problem instead (`ImageResult::ToolUnavailable`, tried again next run).

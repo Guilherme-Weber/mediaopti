@@ -17,6 +17,28 @@ use std::time::Duration;
 /// Free commit (RAM + page file) an image worker needs before starting another file. When the
 /// machine runs out of commit, allocations fail and processes (this app included) abort.
 const IMAGE_MIN_FREE_COMMIT: u64 = 2 * 1024 * 1024 * 1024;
+/// How long a CPU job just let in counts as about to take memory that doesn't show yet.
+const ADMISSION_WARMUP: Duration = Duration::from_secs(1);
+/// What each of those counts for. Small on purpose: 2 GB each for 5 s held a run of small
+/// files (~1 s each, 14 slots) to a few files a second on 8 GB of free commit; this spreads
+/// a burst (14 workers waking together at a stage change) without slowing a steady run.
+const ADMISSION_RESERVE: u64 = 512 * 1024 * 1024;
+
+/// Free commit memory needed to let one more CPU job in, with `recent` let in within the
+/// last `ADMISSION_WARMUP`.
+fn image_admission_need(recent: usize) -> u64 {
+    IMAGE_MIN_FREE_COMMIT + ADMISSION_RESERVE * recent as u64
+}
+
+/// Whether one more CPU job may start now. One always may when nothing else runs (a
+/// low-memory machine still makes progress); jobs let in a moment ago count as running
+/// (`images_active` grows only once their file is claimed) and raise what the next needs.
+fn may_admit(inner: &mut Inner, memory: Option<&system::MemoryStatus>) -> bool {
+    let now = std::time::Instant::now();
+    inner.cpu_admitted.retain(|t| now.duration_since(*t) < ADMISSION_WARMUP);
+    let busy = inner.images_active + inner.running_processes + inner.cpu_admitted.len();
+    busy == 0 || memory.is_none_or(|m| m.available_commit >= image_admission_need(inner.cpu_admitted.len()))
+}
 
 
 
@@ -182,18 +204,31 @@ impl Engine {
     /// A big GIF whose video wasn't smaller: optimize it as a GIF instead (from a video
     /// worker, so it counts as that worker's file).
     pub(super) async fn gif_as_image(self: &Arc<Self>, worker_id: u32, input: &Path, display: &str) -> super::Outcome {
-        let (ctx, disposal, lossy, opts) = {
+        // The job's release token: a Pause ends the optimizer (and frees its memory) like any
+        // CPU job, instead of leaving it suspended.
+        let release = self.release_token();
+        let (ctx, disposal, lossy, strip, mut opts) = {
             let inner = self.lock();
             (
-                Arc::new(self.image_ctx(&inner.options, 2, inner.cancel.clone())),
+                Arc::new(self.image_ctx(&inner.options, 2, release)),
                 inner.disposal_for(input),
                 inner.images_lossy(),
+                inner.options.strip,
                 inner.job_opts(),
             )
         };
+        // As in `run_image_worker`: the new version's content is noted durably before the
+        // original is set aside, and a file another job holds is left alone.
+        let engine = Arc::clone(self);
+        opts.busy = Some(Arc::new(move |p: &Path| engine.lock().in_progress.contains(p)));
+        let (engine, refused) = (Arc::clone(self), Arc::clone(&opts.lossless_only));
+        opts.note = Some(Arc::new(move |p: &Path| engine.note_content_now(p, image::mode(lossy && !refused.load(Ordering::Relaxed), strip))));
+        let engine = Arc::clone(self);
+        opts.warn = Some(Arc::new(move |line: String| engine.log(line)));
         self.reset_worker(worker_id, display, "optimizing as GIF");
         self.send_state(false);
         let p = input.to_path_buf();
+        let lossless_only = Arc::clone(&opts.lossless_only);
         // Video worker ids are 1-4; image-temp names use a separate range.
         let result = self.blocking(move || process_image(&ctx, &p, worker_id + 100, &disposal, &opts)).await;
         self.lock().workers.remove(&worker_id);
@@ -223,7 +258,9 @@ impl Engine {
             ImageResult::Smaller { content, .. } | ImageResult::Kept { content, .. } => *content,
             _ => None,
         };
-        self.finish_image(input, lossy, result);
+        // Stopped by a Pause: `finish_image` puts it back in the CPU queue, so the GIF pass
+        // runs again on Resume (the video attempt is not redone: see `gif_fallback`).
+        self.finish_image(input, lossy && !lossless_only.load(Ordering::Relaxed), result);
         if let Some((hash, size)) = tried_as_video {
             self.lock().history.add_content(hash, size, crate::history::VIDEO_MODE);
             self.schedule_history_save();
@@ -231,18 +268,19 @@ impl Engine {
         outcome
     }
 
-    /// Waits until starting another image is safe for memory. One image worker always may
-    /// run (so a low-memory machine still makes progress). Returns false on Stop.
+    /// Waits until starting another image looks safe for memory (`may_admit`; the claim
+    /// checks again under its lock and records the admission). Only a real shortage (less
+    /// than 2 GB free) is shown and logged, not the spacing of a burst. Returns false on Stop.
     async fn wait_for_image_memory(&self, cancel: &tokio_util::sync::CancellationToken) -> bool {
         loop {
-            let busy = self.lock().images_active;
             let memory = system::memory_status();
-            if busy == 0 || memory.is_none_or(|m| m.available_commit >= IMAGE_MIN_FREE_COMMIT) {
+            if may_admit(&mut self.lock(), memory.as_ref()) {
                 self.lock().cpu_waiting_memory = false;
                 return true;
             }
+            let short = memory.is_some_and(|m| m.available_commit < IMAGE_MIN_FREE_COMMIT);
             // Shown like a video waiting for memory: once in the log, and on its progress row.
-            let first = !std::mem::replace(&mut self.lock().cpu_waiting_memory, true);
+            let first = short && !std::mem::replace(&mut self.lock().cpu_waiting_memory, true);
             if first {
                 let free = memory.map_or(0.0, |m| m.available_commit as f64 / 1_073_741_824.0);
                 self.log(format!("[Memory] CPU work waits for free memory ({free:.1} GB available, 2 GB needed per new file)"));
@@ -261,14 +299,19 @@ impl Engine {
                 self.lock().cpu_ids.remove(&worker_id);
                 break;
             }
+            let memory = system::memory_status();
             let claimed = {
                 let mut inner = self.lock();
                 if !inner.working || inner.stop_requested {
                     inner.cpu_ids.remove(&worker_id);
                     break;
                 }
-                match inner.claim_cpu() {
+                // Checked again in the claim's own lock: another worker may have been let in
+                // since. A worker that only waits for its stage takes nothing.
+                let claim = if may_admit(&mut inner, memory.as_ref()) { inner.claim_cpu() } else { CpuClaim::Wait };
+                match claim {
                     CpuClaim::File(path, stage, announce) => {
+                        inner.cpu_admitted.push(std::time::Instant::now());
                         inner.images_active += 1;
                         let disposal = inner.disposal_for(&path);
                         Some((path.clone(), stage, announce, inner.lossy_for(&path), disposal, inner.job_opts()))
@@ -490,6 +533,9 @@ impl Engine {
                 ImageResult::Stopped => {
                     if inner.working && !inner.stop_requested {
                         inner.requeue_cpu(path);
+                        // A big GIF's GIF pass may come back here in a batch with no CPU
+                        // worker (only videos, or theirs gone): one is started to take it.
+                        self.spawn_workers(&mut inner);
                     }
                 }
             }
@@ -507,36 +553,7 @@ impl Engine {
     }
 }
 
-/// Memory a visually lossless search takes per pixel: measured on 2026-11-17 with a
-/// 164-megapixel JPEG (ssimulacra2 alone 15.6 GB; the job's processes 23.2 GB at once, about
-/// 141 bytes a pixel). The fixed 2 GB admission per file let such a job run out of memory.
-const LOSSY_BYTES_PER_PIXEL: u64 = 150;
-/// From this estimate on, a lossy search is a big job: one at a time, with its memory free.
-const BIG_LOSSY_JOB: u64 = 4 << 30;
-/// Commit memory left for everything else while a big lossy search runs.
-const BIG_LOSSY_RESERVE: u64 = 2 << 30;
-
-/// Whether a big lossy search needing `need` bytes fits in the commit memory `available`
-/// now (unknown counts as fitting).
-fn big_lossy_fits(need: u64, available: Option<u64>) -> bool {
-    available.is_none_or(|a| a >= need + BIG_LOSSY_RESERVE)
-}
-
-/// Waits for the other big lossy search to end (one at a time). `None` on Stop.
-fn one_big_lossy_job(gate: &image::tools::Gate) -> Option<std::sync::MutexGuard<'static, ()>> {
-    static BIG_LOSSY: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    loop {
-        match BIG_LOSSY.try_lock() {
-            Ok(guard) => return Some(guard),
-            Err(std::sync::TryLockError::Poisoned(p)) => return Some(p.into_inner()),
-            Err(std::sync::TryLockError::WouldBlock) => {}
-        }
-        if !gate.wait_while_paused() {
-            return None;
-        }
-        std::thread::sleep(Duration::from_millis(500));
-    }
-}
+use image::{big_lossy_fits, one_big_lossy_job, BIG_LOSSY_JOB, LOSSY_BYTES_PER_PIXEL};
 
 /// Runs one CPU job so that a panic in it (a bug, a malformed file nobody foresaw) fails that
 /// file only, not remembered: the worker, its CPU slot and the counters carry on as for any
@@ -967,8 +984,10 @@ fn note(opts: &JobOpts, file: &Path) -> std::io::Result<()> {
 #[allow(clippy::too_many_arguments)]
 fn keep_smaller_copy(path: &Path, existing: &Path, smaller: Option<&(PathBuf, u64)>, before: u64, disposal: &system::Disposal, worker_id: u32, opts: &JobOpts) -> ImageResult {
     let theirs = std::fs::metadata(existing).map_or(u64::MAX, |m| m.len());
+    // A hard-linked copy is never replaced (that would break the link): both are kept then.
+    let replaceable = system::hard_link_count(existing).unwrap_or(1) <= 1;
     match smaller {
-        Some((best, after)) if *after < theirs => {
+        Some((best, after)) if *after < theirs && replaceable => {
             // Ours is smaller: it replaces the existing copy, then the original goes.
             let stem = existing.file_stem().map_or_default(|s| s.to_string_lossy().into_owned());
             let ext = args::ext_lower(existing);
@@ -1002,6 +1021,16 @@ fn keep_smaller_copy(path: &Path, existing: &Path, smaller: Option<&(PathBuf, u6
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Workers waking together used to see the same free memory and all start: each one let
+    /// in a moment ago now raises what the next needs, a little.
+    #[test]
+    fn a_burst_of_cpu_jobs_is_spread() {
+        assert_eq!(image_admission_need(0), IMAGE_MIN_FREE_COMMIT);
+        assert_eq!(image_admission_need(4), IMAGE_MIN_FREE_COMMIT + 4 * ADMISSION_RESERVE);
+        // A steady run of ~1 s files on 14 slots needs ~9 GB, not 30.
+        assert!(image_admission_need(14) < 10 << 30);
+    }
 
     /// Jobs on one drive share its free space: a second reservation of most of it waits,
     /// and a reservation's space comes back when it ends.

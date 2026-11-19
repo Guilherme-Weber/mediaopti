@@ -70,9 +70,44 @@ pub(super) fn media_readable(ffmpeg: &Path, path: &Path) -> Option<bool> {
     }
 }
 
+/// Backup folders used so far, one per line in `<data dir>/backup-folders.txt`: never
+/// scanned, even after the option is switched back to the Recycle Bin.
+pub(super) const BACKUP_FOLDERS: &str = "backup-folders.txt";
+
+pub(super) fn known_backup_folders(data_dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_to_string(data_dir.join(BACKUP_FOLDERS))
+        .map_or_default(|t| t.lines().map(str::trim).filter(|l| !l.is_empty()).map(PathBuf::from).collect())
+}
+
+/// Adds `folder` to the backup folders used so far (once).
+pub(super) fn note_backup_folder(data_dir: &Path, folder: &Path) {
+    if known_backup_folders(data_dir).iter().any(|k| same_path(k, folder)) {
+        return;
+    }
+    let _ = crate::history::append_lines(&data_dir.join(BACKUP_FOLDERS), &format!("{}\n", folder.display()), false);
+}
+
+/// A path as Windows compares it: case-insensitive, either slash, no trailing one.
+fn path_key(p: &Path) -> String {
+    p.to_string_lossy().replace('/', "\\").trim_end_matches('\\').to_lowercase()
+}
+
+/// The same path as Windows sees it.
+pub(super) fn same_path(a: &Path, b: &Path) -> bool {
+    path_key(a) == path_key(b)
+}
+
+/// A folder Windows keeps for itself (hidden and system: `$RECYCLE.BIN`, `System Volume
+/// Information`): what is inside belongs to the system, not to the library.
+fn is_system_folder(e: &walkdir::DirEntry) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const HIDDEN_AND_SYSTEM: u32 = 0x2 | 0x4;
+    e.file_type().is_dir() && e.metadata().is_ok_and(|m| m.file_attributes() & HIDDEN_AND_SYSTEM == HIDDEN_AND_SYSTEM)
+}
+
 /// `settle_temps`: leftover temp files are settled (`settle_orphan_temp`); off while a batch
-/// runs, whose workers' temps are not leftovers.
-pub(super) fn scan_folder(roots: &[PathBuf], exclude: Option<&Path>, temp: Option<&Path>, found: &std::sync::atomic::AtomicUsize, ffmpeg: &Path, settle_temps: bool) -> ScanResult {
+/// runs, whose workers' temps are not leftovers. `exclude`: backup folders (never scanned).
+pub(super) fn scan_folder(roots: &[PathBuf], exclude: &[PathBuf], temp: Option<&Path>, found: &std::sync::atomic::AtomicUsize, ffmpeg: &Path, settle_temps: bool) -> ScanResult {
     let mut messages = Vec::new();
     let mut cleaned_orphans = 0;
     // Work folders of runs that were killed or crashed.
@@ -92,12 +127,18 @@ pub(super) fn scan_folder(roots: &[PathBuf], exclude: Option<&Path>, temp: Optio
     let mut with_sizes = Vec::new();
     let mut static_gifs = HashSet::new();
 
+    // Compared once per folder (not per file), against keys made once.
+    let excluded: HashSet<String> = exclude.iter().map(|p| path_key(p)).collect();
     // Folders are walked; a file given directly is its own one-entry walk.
     let walker = roots.iter().flat_map(|root| {
         walkdir::WalkDir::new(root)
             .follow_links(false)
             .into_iter()
-            .filter_entry(|e| e.depth() == 0 || (!e.file_name().to_string_lossy().starts_with('.') && Some(e.path()) != exclude))
+            .filter_entry(|e| {
+                e.depth() == 0
+                    || (!e.file_name().to_string_lossy().starts_with('.')
+                        && !(e.file_type().is_dir() && (excluded.contains(&path_key(e.path())) || is_system_folder(e))))
+            })
     });
     let mut seen = HashSet::new();
 
@@ -251,10 +292,13 @@ impl Engine {
         self.log(format!("Scanning {what}"));
         self.send_state(true);
 
-        // A backup folder inside the scanned folder must not be scanned (or optimized again).
+        // A backup folder inside the scanned folder must not be scanned (or optimized again):
+        // the current one and every one used before.
         let (exclude, temp) = {
             let inner = self.lock();
-            (inner.backup_root(), inner.options.temp_dir.clone())
+            let mut exclude = known_backup_folders(&self.data_dir);
+            exclude.extend(inner.backup_root());
+            (exclude, inner.options.temp_dir.clone())
         };
         let roots = items.clone();
         // The window shows the count as it grows (nothing else updates it during a scan).
@@ -270,7 +314,7 @@ impl Engine {
             })
         };
         let ffmpeg = self.ffmpeg_path.clone();
-        let scan = self.rt.spawn_blocking(move || scan_folder(&roots, exclude.as_deref(), temp.as_deref(), &found, &ffmpeg, !working)).await;
+        let scan = self.rt.spawn_blocking(move || scan_folder(&roots, &exclude, temp.as_deref(), &found, &ffmpeg, !working)).await;
         ticker.abort();
         let result = match scan {
             Ok(r) => r,

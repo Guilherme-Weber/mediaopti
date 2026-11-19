@@ -47,13 +47,28 @@ fn originals_go_to_a_mirrored_backup_folder() {
     let inside = media.join("old versions");
     std::fs::create_dir_all(&inside).unwrap();
     std::fs::copy(&png_backup, inside.join("x.png")).unwrap();
-    let (engine2, _) = new_engine(&rt, &root, ff);
+    let (engine2, _) = new_engine(&rt, &root, ff.clone());
     engine2.apply_options(RawOptions {
         backup_dir: Some(inside.to_string_lossy().into_owned()),
         ..raw()
     });
-    rt.block_on(engine2.load_dir(media));
+    rt.block_on(engine2.load_dir(media.clone()));
     assert_eq!(engine2.snapshot().total_files, 2, "the backup folder must be excluded");
+
+    // The option back to its default, the parent folder scanned: the backup folder used by
+    // the first run is still left out, and so is a system folder (the Recycle Bin of a drive
+    // root, hidden + system: its items keep their extensions).
+    std::fs::remove_dir_all(&inside).unwrap();
+    let bin = media.join("$RECYCLE.BIN");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::copy(&png_backup, bin.join("$R1A2B3C.png")).unwrap();
+    assert!(Command::new("attrib").args(["+h", "+s"]).arg(&bin).status().unwrap().success());
+    let (engine3, _) = new_engine(&rt, &root, ff);
+    engine3.apply_options(opts("av1_nvenc", 1.0));
+    rt.block_on(engine3.load_dir(root.clone()));
+    let total = engine3.snapshot().total_files;
+    let _ = Command::new("attrib").args(["-h", "-s"]).arg(&bin).status();
+    assert_eq!(total, 2, "only media's own files: no backups, nothing from the system folder");
     let _ = std::fs::remove_dir_all(&root);
 }
 

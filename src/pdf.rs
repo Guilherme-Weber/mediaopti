@@ -322,7 +322,13 @@ fn optimize_images(ctx: &Ctx, src: &Path, work: &Path, lossy: bool) -> Result<Op
             let quality_ok = ctx.max.pdf_any_q || jpeg::quality(&file).is_none_or(|q| q >= MIN_LOSSY_QUALITY);
             // CMYK/YCCK (common in print PDFs) would be re-encoded as RGB under /DeviceCMYK.
             let reencodable = || jpeg::head(&file).is_some_and(|d| jpeg::reencodable(&d));
-            if lossy && file_size >= MIN_LOSSY_JPEG && quality_ok && reencodable() && std::fs::copy(&file, &ref_jpg).is_ok() {
+            // A huge picture searches alone and only with its memory free (`image::lossy_turn`).
+            let turn = if lossy && file_size >= MIN_LOSSY_JPEG && quality_ok && reencodable() {
+                image::lossy_turn(ctx, image::pixel_count(&file).unwrap_or(0))?
+            } else {
+                (false, None)
+            };
+            if turn.0 && std::fs::copy(&file, &ref_jpg).is_ok() {
                 let pnm = lw.join("dec.pnm");
                 if image::run(ctx, "djpeg", crate::os_args!["-outfile", &pnm, &ref_jpg], &lw)? {
                     let keep: jpeg::Segments = jpeg::segments(&ref_jpg)
@@ -353,6 +359,11 @@ fn optimize_images(ctx: &Ctx, src: &Path, work: &Path, lossy: bool) -> Result<Op
             if masked || w * h < 64 * 64 || file_size != w * h * comps {
                 continue;
             }
+            // Its turn first: a huge picture waits without its pixels held in memory.
+            let (may, _turn) = image::lossy_turn(ctx, w.saturating_mul(h))?;
+            if !may {
+                continue;
+            }
             let Ok(data) = std::fs::read(&file) else { continue };
             let pnm = lw.join("img.pnm");
             let mut f = Vec::with_capacity(data.len() + 32);
@@ -368,6 +379,7 @@ fn optimize_images(ctx: &Ctx, src: &Path, work: &Path, lossy: bool) -> Result<Op
                 z.finish().map_or(u64::MAX, |v| v.len() as u64)
             });
             let limit = (encoded as f64 * keep_ratio) as u64;
+            drop((data, f)); // the search reads img.pnm
             let Some((cand, _)) = image::search_methods(ctx, &pnm, reencoders(ctx, &lw, &pnm, &Vec::new()), limit)? else { continue };
             best = Some(cand);
             lossy_hit = true;

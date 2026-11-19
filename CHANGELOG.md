@@ -38,6 +38,20 @@ Notable changes to mediaopti. Earlier versions are described in their
   that went through the video attempt and the GIF optimizer, then moved or renamed, is
   recognised for both and not optimized again.
 - A stripped pass on content already known from a plain pass is noted durably at once.
+- Scans skip the folders Windows keeps for itself (hidden and system: `$RECYCLE.BIN`,
+  `System Volume Information`) and every backup folder used before, even once the option is
+  back to the Recycle Bin.
+- A huge picture inside a comic or PDF searches lossily alone and only with its memory free,
+  like a picture on its own.
+- CPU jobs waking together no longer all start on the same free memory: each one let in a
+  moment ago raises what the next one needs.
+- A big GIF's GIF pass stops on Pause like other CPU work (it waits in the queue, its video
+  is not redone) and notes its content before the original is set aside.
+- A copy of the same video or picture is never replaced when it is a hard link, and a video
+  that changed while it was encoded is never dropped as a duplicate.
+- Switching to visually lossless (or redoing stripped files) no longer reads the whole
+  library by content during the scan: only files whose size had the wanted pass are hashed,
+  and types switched off are not.
 
 ### Changed
 

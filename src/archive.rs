@@ -104,6 +104,15 @@ fn optimize_entry(ictx: &Ctx, kind: Kind, data: &[u8], work: &Path) -> Result<Op
     if std::fs::create_dir_all(work).and_then(|()| std::fs::write(&file, data)).is_err() {
         return Ok(None);
     }
+    // A huge page searches lossily alone and only with its memory free, as a picture does.
+    let (lossy, _turn) = image::lossy_turn(ictx, image::pixel_count(&file).unwrap_or(0))?;
+    let lossless;
+    let ictx = if ictx.lossy && !lossy {
+        lossless = Ctx { lossy: false, ..ictx.clone() };
+        &lossless
+    } else {
+        ictx
+    };
     let r = image::optimize(ictx, kind, &file, work)?;
     let result = r.best.and_then(|b| std::fs::read(b).ok()).filter(|b| b.len() < data.len()).map(|b| (b, r.steps));
     let _ = std::fs::remove_dir_all(work);

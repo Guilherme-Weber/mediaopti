@@ -118,6 +118,10 @@ impl Engine {
             }
             (inner.run.total, inner.options.clone())
         };
+        // Its originals land there: later scans leave it out whatever the option says then.
+        if let Some(folder) = self.lock().backup_root().filter(|_| total > 0) {
+            super::scan::note_backup_folder(&self.data_dir, &folder);
+        }
 
         if total == 0 {
             self.log("No new files to process");

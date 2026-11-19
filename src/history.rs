@@ -74,7 +74,10 @@ pub struct History {
     unsaved: Vec<Hash>,
     content_path: PathBuf,
     content: HashMap<ContentHash, u8>,
-    sizes: HashSet<u64>,
+    /// Sizes of processed content, each with the passes made on content of that size: a
+    /// file is hashed only when its size had the pass it wants (switching to lossy, with ~1M
+    /// pictures done lossless, hashed every one of them for nothing).
+    sizes: HashMap<u64, u8>,
     unsaved_content: Vec<(ContentHash, u64, &'static str)>,
     /// The files no longer match memory (after clear) and must be rewritten.
     needs_rewrite: bool,
@@ -130,11 +133,11 @@ impl History {
         let hashes = read(&path)
             .map_or_default(|data| data.split('\n').filter_map(|l| parse_hex::<32>(l.trim())).collect());
         let content_path = path.with_file_name("processed-content.tsv");
-        let (mut content, mut sizes) = (HashMap::new(), HashSet::new());
+        let (mut content, mut sizes) = (HashMap::new(), HashMap::new());
         if let Ok(data) = read(&content_path) {
             for (hash, size, flag) in data.lines().filter_map(parse_content_line) {
                 *content.entry(hash).or_insert(0) |= flag;
-                sizes.insert(size);
+                *sizes.entry(size).or_insert(0) |= flag;
             }
         }
         Self {
@@ -178,9 +181,10 @@ impl History {
         })
     }
 
-    /// Whether some processed file had exactly this size (only those are worth hashing).
-    pub fn has_size(&self, size: u64) -> bool {
-        self.sizes.contains(&size)
+    /// Whether content of exactly this size had the pass `want` asks for (only such files are
+    /// worth hashing: a hash can't match otherwise).
+    pub fn has_size(&self, size: u64, want: Want) -> bool {
+        self.sizes.get(&size).is_some_and(|&f| want.covered_by(f))
     }
 
     pub fn contains_content(&self, hash: &ContentHash, want: Want) -> bool {
@@ -210,7 +214,7 @@ impl History {
         let flags = self.content.entry(hash).or_insert(0);
         if *flags & flag != flag {
             *flags |= flag;
-            self.sizes.insert(size);
+            *self.sizes.entry(size).or_insert(0) |= flag;
             self.unsaved_content.push((hash, size, mode));
         }
     }
@@ -219,7 +223,7 @@ impl History {
         self.hashes = HashSet::new();
         self.unsaved = Vec::new();
         self.content = HashMap::new();
-        self.sizes = HashSet::new();
+        self.sizes = HashMap::new();
         self.unsaved_content = Vec::new();
         self.needs_rewrite = true;
     }
@@ -317,7 +321,7 @@ impl History {
             return None;
         }
         *flags |= flag;
-        self.sizes.insert(size);
+        *self.sizes.entry(size).or_insert(0) |= flag;
         Some((self.content_path.clone(), content_line(&hash, size, mode)))
     }
 }
@@ -550,7 +554,9 @@ mod tests {
         assert!(!h.contains_content(&img, Want::ImageLossless { strip: true }), "not stripped");
         // A big GIF imageopti optimized as an image is still to be made a video.
         assert!(!h.contains_content(&img, Want::Video), "an image pass is not a video pass");
-        assert!(h.has_size(336_517));
+        assert!(h.has_size(336_517, Want::ImageLossless { strip: false }));
+        // Its size was only ever done lossless: a lossy request doesn't hash files of it.
+        assert!(!h.has_size(336_517, Want::ImageLossy { strip: false }) && !h.has_size(336_517, Want::Video));
 
         let vid = [7u8; 16];
         h.add_content(vid, 1234, VIDEO_MODE);
@@ -565,7 +571,8 @@ mod tests {
         assert!(r.contains_content(&vid, Want::Video));
         assert!(r.contains_content(&img, Want::ImageLossy { strip: false }), "lossy pass survives reload");
         assert!(r.contains_content(&img, Want::ImageLossy { strip: true }), "stripped pass survives reload");
-        assert!(r.has_size(1234) && !r.has_size(1235));
+        assert!(r.has_size(1234, Want::Video) && !r.has_size(1235, Want::Video));
+        assert!(r.has_size(336_517, Want::ImageLossy { strip: true }), "the stripped lossy pass reached its size");
 
         // Image location keys are per mode and don't collide with video keys.
         let f = Path::new(r"C:\p\a.png");

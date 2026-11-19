@@ -191,6 +191,9 @@ struct Inner {
     /// The progress of the CPU files that report it (comics, PDFs).
     cpu_progress: std::collections::HashMap<PathBuf, Arc<image::tools::Progress>>,
     cpu_waiting_memory: bool,
+    /// When CPU jobs were let in lately (`wait_for_image_memory`): each counts as using its
+    /// share of memory until it has had time to take it.
+    cpu_admitted: Vec<std::time::Instant>,
     skipped_known: usize,
     skipped_generated: usize,
     skipped_small_gifs: usize,
@@ -310,6 +313,7 @@ impl Engine {
                 cpu_started: std::collections::HashMap::new(),
                 cpu_progress: std::collections::HashMap::new(),
                 cpu_waiting_memory: false,
+                cpu_admitted: Vec::new(),
                 skipped_known: 0,
                 skipped_generated: 0,
                 skipped_small_gifs: 0,

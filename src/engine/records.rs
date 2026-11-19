@@ -109,12 +109,25 @@ impl Engine {
             files
                 .iter()
                 .zip(sizes)
-                .filter(|(f, s)| inner.history.has_size(**s) && !is_generated_name(f))
-                .map(|(f, s)| (f, inner.want(f, *s)))
+                .filter(|(f, _)| !is_generated_name(f))
+                .map(|(f, s)| {
+                    let want = match inner.want(f, *s) {
+                        // A big GIF known here as a video lacks only its GIF pass (`place` sends
+                        // it to the optimizer): that is what its content may already have.
+                        history::Want::Video if args::is_gif(f) && inner.history.contains(f) => {
+                            let strip = inner.redo_stripped();
+                            if inner.lossy_for(f) { history::Want::ImageLossy { strip } } else { history::Want::ImageLossless { strip } }
+                        }
+                        w => w,
+                    };
+                    (f, *s, want)
+                })
+                // Only a size that had the wanted pass can match. Types switched off are
+                // checked too: switched on before Start, their moved files are known.
+                .filter(|(_, s, want)| inner.history.has_size(*s, *want))
+                .map(|(f, _, want)| (f, want))
                 .filter(|(f, want)| match want {
-                    // A big GIF known as a video but not yet as an image may have its GIF pass
-                    // in the content history too (`place` would send it to the optimizer).
-                    history::Want::Video => !inner.history.contains(f) || (args::is_gif(f) && !inner.history.contains_image(f, inner.lossy_for(f), inner.redo_stripped())),
+                    history::Want::Video => !inner.history.contains(f),
                     _ => !inner.history.contains_image(f, inner.lossy_for(f), inner.redo_stripped()),
                 })
                 .map(|(f, want)| (f.clone(), want))

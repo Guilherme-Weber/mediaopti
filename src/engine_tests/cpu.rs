@@ -405,6 +405,13 @@ fn same_names_and_wrong_extensions() {
     make(&ff, &["-i", media.join("anim.gif").to_str().unwrap(), "-fps_mode", "passthrough", "-c:v", "libx264", "-qp", "0", "-pix_fmt", "yuv444p"], &media.join("anim.mp4"));
     // wave.gif: nothing has its new name -> wave.mp4.
     make(&ff, &["-f", "lavfi", "-i", "testsrc2=s=320x240:r=10:d=3"], &media.join("wave.gif"));
+    // linked: same picture, but the existing PNG has a second name elsewhere (a hard link):
+    // it is never replaced (the link would break), so both stay.
+    pic("testsrc=s=320x240", &[], "linked.bmp");
+    pic("testsrc=s=320x240", &["-compression_level", "0"], "linked.png");
+    let elsewhere = root.join("elsewhere.png");
+    std::fs::hard_link(media.join("linked.png"), &elsewhere).unwrap();
+    let linked_before = std::fs::read(&elsewhere).unwrap();
 
     let rt = runtime();
     let (engine, rec) = new_engine(&rt, &root, ff.clone());
@@ -418,15 +425,18 @@ fn same_names_and_wrong_extensions() {
     let names: std::collections::BTreeSet<String> =
         std::fs::read_dir(&media).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
     println!("{logs}");
-    let want = ["anim.mp4", "other (2).png", "other.png", "photo.jpg", "sky.png", "wave.mp4", "web.webp"];
+    let want = ["anim.mp4", "linked.bmp", "linked.png", "other (2).png", "other.png", "photo.jpg", "sky.png", "wave.mp4", "web.webp"];
     assert_eq!(names, want.iter().map(ToString::to_string).collect(), "{logs}");
+    assert_eq!(std::fs::read(media.join("linked.png")).unwrap(), linked_before, "the hard-linked copy keeps its bytes");
+    assert_eq!(crate::system::hard_link_count(&elsewhere).ok(), Some(2), "the link is intact");
     let backup = root.join("media (originals)");
     assert!(backup.join("sky.bmp").exists() && backup.join("other.bmp").exists() && backup.join("anim.gif").exists(), "{logs}");
     // The queue rebuilt after the batch lists what is on the disk now: nothing converted,
     // renamed or removed as a duplicate comes back as waiting (a GIF made into a video used
     // to show as "1 ready"). web.webp is not a type the scan takes.
     let s = engine.snapshot();
-    assert_eq!(s.pending_files, 0, "{:?}", engine.queue_preview(10));
+    // linked.png itself is a hard link: skipped, so still waiting.
+    assert_eq!(s.pending_files, 1, "{:?}", engine.queue_preview(10));
     assert_eq!(s.total_files, want.len() - 1, "{logs}");
     let _ = std::fs::remove_dir_all(&root);
 }
