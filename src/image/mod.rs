@@ -851,6 +851,11 @@ fn lossy_png(ctx: &Ctx, work: &Path, src: &Path, chain: &mut Chain, ver: &Verifi
 
 fn lossy_jpeg(ctx: &Ctx, work: &Path, src: &Path, chain: &mut Chain, ver: &Verifier) -> Result<(), RunError> {
     let Some(segs) = ver.segs.as_ref() else { return Ok(()) };
+    // CMYK/YCCK would come back as RGB carrying the CMYK profile (wrong colours, and both
+    // sides of the check decode it the same wrong way): lossless only.
+    if !jpeg::head(src).is_some_and(|d| jpeg::reencodable(&d)) {
+        return Ok(());
+    }
     // Only JPEGs saved at high quality get smaller at >= 93: on a 200-JPEG sample, q >= 90
     // kept 24 of 25 wins and skipped a third of the files.
     if !ctx.max.jpg_low_q && jpeg::quality(src).is_some_and(|q| q < 90.0) {

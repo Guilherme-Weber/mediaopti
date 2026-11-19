@@ -157,6 +157,24 @@ pub fn dimensions(data: &[u8]) -> Option<(u32, u32)> {
     Some((u32::from(w), u32::from(h)))
 }
 
+/// Colour components in a JPEG's frame header: 1 grey, 3 YCbCr/RGB, 4 CMYK/YCCK.
+pub fn components(data: &[u8]) -> Option<u8> {
+    let (_, at) = frame(data)?;
+    // Length (2), precision (1), height (2), width (2), components (1).
+    data.get(at + 9).copied()
+}
+
+/// Whether a re-encode keeps the picture: the decoders turn CMYK/YCCK into RGB (without its
+/// profile) and the encoders write YCbCr, so only grey and 3-component JPEGs are re-encoded.
+pub fn reencodable(data: &[u8]) -> bool {
+    matches!(components(data), Some(1 | 3))
+}
+
+/// The start of a JPEG file, enough to reach its frame header past big metadata segments.
+pub fn head(path: &Path) -> Option<Vec<u8>> {
+    read_head(path, 1 << 22)
+}
+
 /// The frame marker and where its segment starts (at its 0xFF).
 fn frame(data: &[u8]) -> Option<(u8, usize)> {
     if !data.starts_with(&[0xFF, 0xD8]) {
@@ -343,6 +361,26 @@ mod tests {
 
     /// A damaged header whose APPn/COM length is below 2 (the length counts its own 2 bytes)
     /// is not a JPEG we can read, and must not panic (a panic aborts the app in release).
+    /// CMYK/YCCK JPEGs came back from a re-encode as RGB with the CMYK profile still on.
+    #[test]
+    fn only_grey_and_three_component_jpegs_are_reencoded() {
+        let with_frame = |nf: u8| {
+            let mut sof = vec![8, 0, 16, 0, 16, nf];
+            for c in 1..=nf {
+                sof.extend([c, 0x11, 0]);
+            }
+            let mut j = vec![0xFF, 0xD8];
+            j.extend(seg(0xEE, b"Adobe\0\x64\0\0\0\0\x02"));
+            j.extend(seg(0xC0, &sof));
+            j.extend([0xFF, 0xDA, 0, 2, 1, 2, 3, 0xFF, 0xD9]);
+            j
+        };
+        assert_eq!(components(&with_frame(4)), Some(4));
+        assert!(!reencodable(&with_frame(4)), "CMYK/YCCK");
+        assert!(reencodable(&with_frame(3)) && reencodable(&with_frame(1)));
+        assert!(!reencodable(b"not a jpeg"));
+    }
+
     #[test]
     fn segment_length_below_two_is_rejected() {
         for len in [0u8, 1] {

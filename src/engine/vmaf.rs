@@ -60,6 +60,23 @@ impl VideoResume {
     }
 }
 
+/// Two names to park a job's outputs under while paused (`<stem>.mediaopti.w<7000..9999>`):
+/// different for every job of this run, since two files of one stem in one folder
+/// (`clip.avi`, `clip.mkv`) may be parked at once and one would overwrite the other, and
+/// never a file that exists (a leftover of an interrupted run).
+pub(super) fn park_names(input: &Path, ext: &str) -> (PathBuf, PathBuf) {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let mut names = (PathBuf::new(), PathBuf::new());
+    for _ in 0..1500 {
+        let n = 7000 + (NEXT.fetch_add(1, Ordering::Relaxed) % 1500) * 2;
+        names = (args::temp_name_with(input, n, ext), args::temp_name_with(input, n + 1, ext));
+        if !names.0.exists() && !names.1.exists() {
+            break;
+        }
+    }
+    names
+}
+
 /// The settings a video's result depends on.
 pub(super) fn resume_key(o: &Options) -> String {
     format!("{}|{}|{}|{:?}", o.encoder, o.crf, o.preset, o.vmaf_floor)
@@ -127,8 +144,8 @@ impl Engine {
         let ext = args::ext_lower(tmp);
         let keep = args::temp_name_with(input, worker_id + 1000, &ext);
         // Parked outputs while paused: named after the file, not the worker (another worker
-        // may resume it).
-        let (park_keep, park_encoded) = (args::temp_name_with(input, 7000, &ext), args::temp_name_with(input, 7001, &ext));
+        // may resume it); the paths are kept in `memo`.
+        let (park_keep, park_encoded) = park_names(input, &ext);
         let parked_keep = memo.keep.take();
         let mut best: Option<(u32, f64, f64)> = None;
         let mut tried = [false; STEPS.len()];
@@ -387,8 +404,10 @@ impl Engine {
                 }
                 text
             });
-            // Pause suspends the measurement like an encode; returning on Stop drops the
-            // child, which kills it (kill_on_drop).
+            // Pause suspends the measurement like an encode. On Stop (or a Pause that ends the
+            // processes) it is killed and waited for: a process killed but not yet gone keeps
+            // the encode open, and parking or removing it then failed with "os error 32".
+            // (Measurements are CPU-only: killing them can't upset the GPU driver.)
             let mut pause_rx = self.paused.subscribe();
             let mut suspended = false;
             let status = loop {
@@ -404,7 +423,7 @@ impl Engine {
                         }
                     }
                     _ = cancel.cancelled() => {
-                        drop(child);
+                        let _ = child.kill().await;
                         let _ = system::remove_file_if_exists(&log_dir.join(&log_name));
                         return Err(Stopped);
                     }
@@ -469,6 +488,25 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// clip.avi and clip.mkv paused in one folder were both parked as clip.mediaopti.w7000.mp4:
+    /// the second rename overwrote the first, and Resume put one video in the other's place.
+    #[test]
+    fn parked_names_never_collide() {
+        let dir = std::env::temp_dir().join(format!("mo-park-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (park_names(&dir.join("clip.avi"), "mp4"), park_names(&dir.join("clip.mkv"), "mp4"));
+        let all = [&a.0, &a.1, &b.0, &b.1];
+        for (i, x) in all.iter().enumerate() {
+            assert!(crate::engine::replace::is_orphan_temp(x), "{}", x.display());
+            assert!(all[i + 1..].iter().all(|y| y != x), "{all:?}");
+        }
+        // An existing name (a leftover) is never taken.
+        std::fs::write(&a.0, b"leftover").unwrap();
+        let c = park_names(&dir.join("clip.avi"), "mp4");
+        assert!(c.0 != a.0 && c.1 != a.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn vmaf_log_parsing_and_summary() {

@@ -242,6 +242,36 @@ fn a_new_version_kept_after_a_failed_rename_survives() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A file with two cameras (dashcam front + rear) is left as it is: only the first video
+/// track was encoded, and the second was lost without the check noticing.
+#[test]
+fn a_second_video_track_is_never_dropped() {
+    let Some(ff) = ffmpeg() else {
+        skip_test!("bundled ffmpeg not found");
+        return;
+    };
+    let root = test_dir("two-cameras");
+    let media = root.join("media");
+    std::fs::create_dir_all(&media).unwrap();
+    let file = media.join("dashcam.mkv");
+    make(&ff, &["-f", "lavfi", "-i", "testsrc2=s=640x360:d=2", "-f", "lavfi", "-i", "testsrc=s=320x240:d=2",
+        "-map", "0", "-map", "1", "-c:v", "libx264", "-qp", "0"], &file);
+    let before = std::fs::read(&file).unwrap();
+    let rt = runtime();
+    let (engine, rec) = new_engine(&rt, &root, ff);
+    rt.block_on(async {
+        engine.apply_options(opts("av1_nvenc", 1.0));
+        engine.load_dir(media.clone()).await;
+        engine.clone().run_batch(opts("av1_nvenc", 1.0)).await;
+    });
+    let logs = rec.logs.lock().unwrap().join("\n");
+    println!("{logs}");
+    assert!(logs.contains("Kept dashcam.mkv: it holds more than one video track"), "{logs}");
+    assert!(!logs.contains("Processing: dashcam.mkv"), "never encoded: {logs}");
+    assert_eq!(std::fs::read(&file).unwrap(), before);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A phone video's tags survive: recording date, place, make and model in the MP4, and the
 /// date in an MKV (a QuickTime date listed twice used to be dropped there).
 #[test]
@@ -393,6 +423,8 @@ fn pause_during_quality_retry_resumes_from_the_last_step() {
     assert!(logs.contains("continues from its last finished step"), "{logs}");
     assert!(logs.contains("the preset encode was done before the pause"), "{logs}");
     assert!(logs.contains("was done before the pause; measuring it"), "{logs}");
+    // The measurement Pause ended was waited for: its encode could be parked and removed.
+    assert!(!logs.contains("Could not remove temporary file"), "{logs}");
     assert!(plain == paused, "the paused run's result differs from the plain run's");
     let leftovers: Vec<_> = walkdir::WalkDir::new(&root).into_iter().filter_map(Result::ok)
         .filter(|e| e.file_name().to_string_lossy().contains(".mediaopti.")).collect();

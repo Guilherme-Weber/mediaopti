@@ -364,11 +364,19 @@ impl Engine {
             used_mode = Mode::CpuFallback;
         }
 
-        // Audio stream copy rejected by the muxer -> transcode audio to AAC.
+        // Audio stream copy rejected by the muxer -> transcode audio to AAC. Never lossless
+        // audio: the check only counts tracks, so FLAC/TrueHD/PCM would silently become AAC
+        // (and the failure is rarely the audio's; the CPU fallback below copies it).
+        if can_retry(self, &attempt) && !tried_cpu && initial_mode == Mode::Primary && !args::is_gif(&input) && streams.lossless_audio {
+            self.log(format!(
+                "[Worker {worker_id}] The first encode failed on {display}; its audio is lossless, so it is not re-encoded to AAC"
+            ));
+        }
         if can_retry(self, &attempt)
             && !tried_cpu
             && initial_mode == Mode::Primary
             && !args::is_gif(&input)
+            && !streams.lossless_audio
         {
             self.log_remove(&tmp);
             self.log(format!(

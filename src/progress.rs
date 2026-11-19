@@ -86,6 +86,11 @@ impl WorkerProgress {
     }
 }
 
+/// Whether ffmpeg's output says the input is damaged (not a media file it can read).
+pub fn says_corrupt(text: &str) -> bool {
+    CORRUPT.is_match(text)
+}
+
 impl Diagnostics {
     /// What ffmpeg said went wrong, for a log line: its first two different error lines,
     /// e.g. "[indeo5] Corrupted tile data encountered!; [indeo5] Error while decoding band:

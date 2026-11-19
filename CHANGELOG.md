@@ -12,6 +12,20 @@ Notable changes to mediaopti. Earlier versions are described in their
   the GIF. Frames are now counted by decoding the GIF.
 - WMV files whose new version is MKV no longer fail with "lost its tags": Matroska writes a
   tag name's spaces as underscores ("VBR Peak" as VBR_PEAK), and that counted as a lost tag.
+- Pausing while two videos of the same name in one folder (`clip.avi`, `clip.mkv`) were in
+  the quality retry could put one video in the other's place on Resume: their parked files
+  shared a name. Each job now parks under its own names.
+- A video with a second video track (a dashcam's rear camera, a screen recording's webcam)
+  is left as it is: only the first track was re-encoded and the others were lost.
+- Lossless audio (FLAC, ALAC, TrueHD, DTS-HD MA, PCM) is never re-encoded to AAC when the
+  first encode fails; the CPU fallback copies it.
+- CMYK/YCCK JPEGs, alone or inside PDFs, get the lossless pass only: re-encoded, they came
+  back as RGB with the CMYK colour profile still attached.
+- A video another program had open while it was looked at is tried again next run instead
+  of being encoded as if it had no other tracks; the same when an HDR video's first frame
+  can't be read.
+- Pause or Stop during a quality measurement waits for the measuring ffmpeg to end, so its
+  encode can be parked or removed ("os error 32" left temporary files behind).
 
 ### Changed
 

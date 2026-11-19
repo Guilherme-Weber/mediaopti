@@ -428,7 +428,13 @@ impl Engine {
             return Err(Unfinished);
         }
         let out = probe_output(&mut cmd, self.job_token(), PROBE_LIMIT).await.ok_or(Unfinished)?;
-        let mut streams = args::Streams::parse(&String::from_utf8_lossy(&out.stderr));
+        let listing = String::from_utf8_lossy(&out.stderr);
+        if !listing_opened(&listing) {
+            // Busy (another program had it open), no access, gone: an empty listing would
+            // read as "no tracks" and the encode would drop them.
+            return Err(Unfinished);
+        }
+        let mut streams = args::Streams::parse(&listing);
         if streams.hdr {
             // HDR10's static metadata travels with the frames: read from the first one.
             let mut cmd = tokio::process::Command::new(&self.ffmpeg_path);
@@ -442,6 +448,11 @@ impl Engine {
             system::configure_background_command(&mut cmd, true);
             let out = probe_output(&mut cmd, self.job_token(), PROBE_LIMIT).await.ok_or(Unfinished)?;
             let text = String::from_utf8_lossy(&out.stderr).to_ascii_lowercase();
+            if !first_frame_read(out.status.success(), &text) {
+                // The first frame wasn't decoded: "no HDR10+" would let its dynamic metadata
+                // be lost, "no mastering data" would let that be lost unchecked.
+                return Err(Unfinished);
+            }
             streams.mastering = text.contains("mastering display");
             streams.light_level = text.contains("content light level");
             streams.hdr10_plus = text.contains("hdr10+") || text.contains("2094-40");
@@ -500,6 +511,18 @@ impl Engine {
     }
 }
 
+/// Whether `ffmpeg -i` opened the input: its listing has "Input #0". A file it says is
+/// damaged counts as opened (the encode then reports it as corrupt, as before).
+pub(super) fn listing_opened(listing: &str) -> bool {
+    listing.contains("Input #0") || crate::progress::says_corrupt(listing)
+}
+
+/// Whether the showinfo probe decoded the first frame (`text` in lower case): a frame's
+/// line (`n: 0 pts: ... pts_time:`), not only the filter's "config in" line.
+pub(super) fn first_frame_read(exited_ok: bool, text: &str) -> bool {
+    exited_ok && text.lines().any(|l| l.contains("parsed_showinfo") && l.contains("pts_time:"))
+}
+
 /// Frame count and length from ffmpeg's framemd5 listing of packets: `#tb 0: 1/100`, then
 /// `stream, dts, pts, duration, size, hash` per packet.
 pub(super) fn packet_timing(listing: &str) -> Option<(u64, f64)> {
@@ -534,6 +557,7 @@ pub(super) fn streams_lost(before: &args::Streams, after: &args::Streams) -> Opt
     let mut lost = Vec::new();
     for (what, b, a) in [
         ("audio tracks", before.audio, after.audio),
+        ("extra video tracks", before.extra_videos, after.extra_videos),
         ("subtitles", before.subtitles.len(), after.subtitles.len()),
         ("attachments", before.attachments, after.attachments),
         ("cover pictures", before.covers.len(), after.covers.len()),
@@ -771,6 +795,23 @@ mod tests {
         // Both spellings present with different values: each finds its own.
         let both = Streams { tags: vec![("foo bar".into(), "A".into()), ("foo_bar".into(), "B".into())], ..before };
         assert_eq!(super::streams_lost(&both, &both), None);
+    }
+
+    /// A probe that couldn't open the file (another program held it) read as "no tracks":
+    /// the encode would have dropped covers and tracks unchecked.
+    #[test]
+    fn probes_that_did_not_read_the_file_say_nothing() {
+        let locked = "[in#0 @ 000002bba4911b40] Error opening input: Permission denied\nError opening input file C:\\v\\a.mp4.\nError opening input files: Permission denied\n";
+        assert!(!super::listing_opened(locked));
+        assert!(!super::listing_opened(""));
+        assert!(super::listing_opened("Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'a.mp4':\n  Duration: 00:00:01.00\n"));
+        // Damaged files go on to the encode, which reports them as corrupt.
+        assert!(super::listing_opened("[mov,mp4,m4a,3gp,3g2,mj2 @ 0] moov atom not found\nError opening input files: Invalid data found when processing input\n"));
+        let config = "[parsed_showinfo_0 @ 0] config in time_base: 1/12800, frame_rate: 25/1\n";
+        let frame = "[parsed_showinfo_0 @ 0] n:   0 pts:      0 pts_time:0       duration:    512\n";
+        assert!(super::first_frame_read(true, &format!("{config}{frame}")));
+        assert!(!super::first_frame_read(true, config), "no frame decoded");
+        assert!(!super::first_frame_read(false, &format!("{config}{frame}")));
     }
 
     #[test]

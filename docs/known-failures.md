@@ -39,8 +39,10 @@ be removed from the history for them to be redone.
 ## Not failures
 
 - `Could not remove temporary file ... (still open by another process: os error 32)`: an
-  ffmpeg that was still quitting (Stop, or the end of a quality retry). The next scan's
-  cleanup removes it (`settle_orphan_temp`).
+  ffmpeg that was still quitting. Found by the 2026-11-19 review: on Stop/Pause the VMAF
+  measurement was killed but not waited for (fixed in 3.2.1: `child.kill().await`). If it
+  still shows, look for another process that isn't waited for. The next scan's cleanup
+  removes the file (`settle_orphan_temp`).
 - `Kept ...: it holds a QuickTime VR panorama`: left alone on purpose (re-encoding destroys
   the panorama).
 - `Video was not smaller ... VMAF NN is below 93`: the quality floor did its job.

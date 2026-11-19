@@ -86,6 +86,12 @@ pub struct Streams {
     pub attachments: usize,
     /// Input indexes of cover pictures (`attached pic` video streams).
     pub covers: Vec<usize>,
+    /// Video tracks besides the main one (not covers): a dashcam's rear camera, a screen
+    /// recording's webcam. Only the main one is encoded, so such a file is left alone.
+    pub extra_videos: usize,
+    /// An audio track is lossless (FLAC, ALAC, TrueHD, DTS-HD MA, PCM...): never re-encoded
+    /// to AAC by the retry for audio the muxer refused.
+    pub lossless_audio: bool,
     pub chapters: usize,
     /// Container duration in seconds.
     pub duration: Option<f64>,
@@ -127,6 +133,9 @@ impl Streams {
         self.tags.iter().find(|(k, _)| k == "creation_time").map(|(_, v)| v.split(';').next().unwrap_or_default().trim())
     }
 }
+
+/// Lossless audio codecs as `ffmpeg -i` names them (PCM is `pcm_*`, DTS-HD MA a `dts` profile).
+const LOSSLESS_AUDIO: &[&str] = &["flac", "alac", "truehd", "mlp", "wavpack", "tta", "ape", "shorten", "wmalossless", "tak", "mp4als", "dst", "ralf"];
 
 /// Audio codecs an MP4 holds as they are (copied, never re-encoded).
 const MP4_AUDIO: &[&str] = &["aac", "mp3", "mp2", "opus", "ac3", "eac3", "alac"];
@@ -201,7 +210,13 @@ impl Streams {
                 let index = rest.split(|c: char| !c.is_ascii_digit()).next().and_then(|n| n.parse::<usize>().ok());
                 if let Some((_, a)) = rest.split_once(": Audio: ") {
                     s.audio += 1;
-                    s.audio_codecs.push(a.split([' ', ',', '(']).next().unwrap_or_default().to_string());
+                    let codec = a.split([' ', ',', '(']).next().unwrap_or_default();
+                    s.lossless_audio |= LOSSLESS_AUDIO.contains(&codec)
+                        || codec.starts_with("pcm_")
+                        || codec.starts_with("dsd_")
+                        // "(DTS-HD MA)", "(DTS-HD MA + DTS:X)", "(DTS-HD MA + DTS:X IMAX)"
+                        || (codec == "dts" && a.contains("(DTS-HD MA"));
+                    s.audio_codecs.push(codec.to_string());
                     let layout = a.split_once(" Hz, ").map_or("", |(_, r)| r.split(',').next().unwrap_or_default());
                     s.audio_channels.push(channel_count(layout));
                 } else if let Some((_, d)) = rest.split_once(": Data: ") {
@@ -222,6 +237,8 @@ impl Streams {
                         let (w, h) = t.split_once('x')?;
                         Some((w.parse().ok()?, h.parse().ok()?))
                     });
+                } else if rest.contains(": Video:") {
+                    s.extra_videos += 1;
                 }
             }
         }
@@ -246,6 +263,10 @@ impl Streams {
         }
         if self.hdr10_plus {
             return Some(Blocked { why: "HDR10+ (its dynamic metadata can't be re-encoded)".into(), permanent: true });
+        }
+        if self.extra_videos > 0 {
+            // Only the main picture is encoded: the other cameras would be lost.
+            return Some(Blocked { why: "more than one video track (only the first could be re-encoded)".into(), permanent: true });
         }
         if self.data.iter().any(|t| t == "qtvr") {
             // The picture is the panorama's tiles: re-encoded, it is no longer a panorama.
@@ -890,6 +911,36 @@ mod tests {
         assert!(!s.fits_mp4());
         let mp4 = Streams { subtitles: vec!["mov_text".into()], audio: 3, ..Streams::default() };
         assert!(mp4.fits_mp4());
+        assert_eq!(s.extra_videos, 0, "a cover is not an extra video");
+    }
+
+    /// A dashcam's two cameras: only the first was encoded and the second was lost, unchecked.
+    #[test]
+    fn a_second_video_track_leaves_the_file_alone() {
+        let listing = "Input #0, matroska,webm, from 'dashcam.mkv':\n  Duration: 00:01:00.00, start: 0.000000\n\
+            \x20 Stream #0:0: Video: h264 (High), yuv420p, 1920x1080, 30 fps\n\
+            \x20 Stream #0:1: Video: h264 (High), yuv420p, 1280x720, 30 fps\n\
+            \x20 Stream #0:2: Audio: aac (LC), 48000 Hz, stereo, fltp\n\
+            \x20 Stream #0:3: Video: mjpeg (Baseline), yuvj420p, 320x240 (attached pic)\n";
+        let s = Streams::parse(listing);
+        assert_eq!((s.extra_videos, s.covers.clone(), s.size), (1, vec![3], Some((1920, 1080))));
+        let blocked = s.blocker(false).expect("left alone");
+        assert!(blocked.permanent && blocked.why.contains("more than one video track"), "{blocked:?}");
+        assert!(s.blocker(true).is_some(), "Remove data tracks doesn't change it");
+    }
+
+    /// Lossless audio is never turned into AAC by the audio retry.
+    #[test]
+    fn lossless_audio_is_recognised() {
+        let track = |a: &str| Streams::parse(&format!("Input #0, matroska,webm, from 'a.mkv':\n  Duration: 00:00:01.00\n  Stream #0:1: Audio: {a}\n"));
+        for a in ["flac, 48000 Hz, stereo, s16", "truehd, 48000 Hz, 7.1, s32 (24 bit)", "pcm_s24le, 48000 Hz, stereo, s32",
+                  "dts (DTS-HD MA), 48000 Hz, 5.1(side), s32p (24 bit)", "alac (alac / 0x63616C61), 44100 Hz, stereo, s16p",
+                  "dts (DTS-HD MA + DTS:X), 48000 Hz, 7.1, s32p (24 bit)", "wmalossless (0x0163), 44100 Hz, stereo, s16p"] {
+            assert!(track(a).lossless_audio, "{a}");
+        }
+        for a in ["aac (LC), 48000 Hz, stereo, fltp", "dts (DTS), 48000 Hz, 5.1(side), fltp", "opus, 48000 Hz, stereo, fltp", "ac3, 48000 Hz, 5.1(side), fltp"] {
+            assert!(!track(a).lossless_audio, "{a}");
+        }
     }
 
     #[test]
