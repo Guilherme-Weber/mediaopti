@@ -276,8 +276,20 @@ pub fn bytes_read(child: &std::process::Child) -> Option<u64> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test builds: the free space a test pretends a volume has, by its root (`C:\`), for the
+    /// calling thread only (tests run in parallel; the others see the real figure). A test
+    /// that needs a short temp drive can't rely on the machine's drives being so.
+    pub static FREE_SPACE_ON: std::cell::RefCell<Vec<(std::path::PathBuf, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Free space (for this user) on the drive holding `path`.
 pub fn free_space(path: &Path) -> Option<u64> {
+    #[cfg(test)]
+    if let Some(free) = FREE_SPACE_ON.with_borrow(|fake| fake.iter().find(|(root, _)| root == path).map(|(_, free)| *free)) {
+        return Some(free);
+    }
     #[cfg(windows)]
     {
         use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;

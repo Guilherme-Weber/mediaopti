@@ -1013,7 +1013,14 @@ mod tests {
     #[test]
     fn work_folder_moves_to_the_files_drive_when_temp_is_short() {
         let file = Path::new(r"D:\mediaopti-test\some file.wav");
-        let (Some(temp_free), Some(d_free)) = (system::free_space(&std::env::temp_dir()), system::free_space(Path::new(r"D:\"))) else {
+        // The temp drive is made short for this thread (2 GB), whatever the machine has:
+        // the test used to skip once C: had room (2026-11-18).
+        let Some(temp_root) = volume_root(&std::env::temp_dir()) else {
+            skip_test!("the temp folder has no drive root");
+            return;
+        };
+        system::FREE_SPACE_ON.with_borrow_mut(|fake| fake.push((temp_root.clone(), 2 << 30)));
+        let (Some(temp_free), Some(d_free)) = (system::free_space(&temp_root), system::free_space(Path::new(r"D:\"))) else {
             skip_test!("no D: drive");
             return;
         };
