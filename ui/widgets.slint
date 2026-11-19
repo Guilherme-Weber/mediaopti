@@ -1,12 +1,23 @@
 // Shared pieces of the mediaopti window: data structs, the theme and small components.
 
-import { Button, ComboBox, ListView, ScrollView, Switch } from "std-widgets.slint";
+import { Button as StdButton, ComboBox, ListView, ScrollView } from "std-widgets.slint";
 
-// A file being processed on the CPU; `progress` < 0 when its share done isn't known.
+// A file being worked on: its name, the folder it is in (shortened), its step, its time so
+// far; `progress` < 0 when its share done isn't known.
 export struct FileRow {
     name: string,
-    meta: string,
+    folder: string,
+    step: string,
+    time: string,
     progress: float,
+}
+
+// One activity line: the time ("19:49:19"), the message, and its tone: "saved" (stands out),
+// "kept" (the bulk: dimmed), "failed", or "" (anything else).
+export struct LogLine {
+    time: string,
+    text: string,
+    tone: string,
 }
 
 // One external tool on the About page.
@@ -30,10 +41,14 @@ export struct WorkerRow {
     progress: float,
 }
 
+// A figure of the running batch; `detail` is a smaller note after the value ("of 1,181,903");
+// `alert` draws it in the critical colour (failed files).
 export struct Metric {
     label: string,
     value: string,
+    detail: string,
     glyph: string,
+    alert: bool,
 }
 
 // Design tokens (Windows 11 dark theme values).
@@ -177,6 +192,154 @@ export component LinkText inherits Rectangle {
     }
 }
 
+// The Fluent style takes its accent from Windows (any colour the user picked), while the rest
+// of the window uses Theme.accent: the accent-coloured controls are drawn here instead, with
+// the Fluent dark metrics (32px buttons, 40x20 switch), so the app keeps one accent.
+
+// Primary (accent) button. Secondary buttons stay the style's own.
+component AccentButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> enabled: true;
+    callback clicked();
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if (root.enabled) { root.clicked(); } }
+    min-height: 32px;
+    min-width: label.preferred-width + 24px;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    border-radius: Theme.radius-small;
+    background: !root.enabled ? #FFFFFF29
+        : touch.pressed ? Theme.accent.with-alpha(0.8)
+        : touch.has-hover ? Theme.accent.with-alpha(0.9)
+        : Theme.accent;
+    label := Text {
+        text: root.text;
+        font-size: 14px;
+        color: root.enabled ? #000000 : #FFFFFF87;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        accessible-role: none;
+    }
+    focus := FocusScope {
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == " ") {
+                root.clicked();
+                return accept;
+            }
+            return reject;
+        }
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+    // Keyboard focus ring, outside the button as in Fluent.
+    Rectangle {
+        x: -3px;
+        y: -3px;
+        width: parent.width + 6px;
+        height: parent.height + 6px;
+        border-radius: Theme.radius-small + 3px;
+        border-width: focus.has-focus ? 2px : 0px;
+        border-color: Theme.text;
+    }
+}
+
+// Same interface as the style's Button; `primary` draws it in Theme.accent.
+export component Button inherits HorizontalLayout {
+    in property <string> text;
+    in property <bool> primary;
+    in property <bool> enabled: true;
+    callback clicked();
+    horizontal-stretch: 0;
+    if !root.primary: StdButton { text: root.text; enabled: root.enabled; clicked => { root.clicked(); } }
+    if root.primary: AccentButton { text: root.text; enabled: root.enabled; clicked => { root.clicked(); } }
+}
+
+// Same interface as the style's Switch, drawn in Theme.accent.
+export component Switch inherits Rectangle {
+    in property <string> text;
+    in-out property <bool> checked;
+    in property <bool> enabled: true;
+    callback toggled();
+    accessible-role: switch;
+    accessible-label: root.text;
+    accessible-checkable: true;
+    accessible-checked: root.checked;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { root.flip(); }
+    function flip() {
+        if (root.enabled) {
+            root.checked = !root.checked;
+            root.toggled();
+        }
+    }
+    min-height: 32px;
+    // Its own width only, like the style's Switch (a Rectangle would stretch).
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    HorizontalLayout {
+        spacing: 12px;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 40px;
+                height: 20px;
+                border-radius: 10px;
+                border-width: root.checked ? 0px : 1px;
+                border-color: root.enabled ? #FFFFFF9E : #FFFFFF5D;
+                background: root.checked
+                    ? (!root.enabled ? #FFFFFF29 : touch.pressed ? Theme.accent.with-alpha(0.8) : touch.has-hover ? Theme.accent.with-alpha(0.9) : Theme.accent)
+                    : (root.enabled && touch.has-hover ? #FFFFFF0F : #0000001A);
+                thumb := Rectangle {
+                    property <length> size: root.enabled && (touch.has-hover || touch.pressed) ? 14px : 12px;
+                    width: self.size;
+                    height: self.size;
+                    border-radius: self.size / 2;
+                    x: root.checked ? parent.width - self.size - 4px : 4px;
+                    y: (parent.height - self.size) / 2;
+                    background: root.checked ? (root.enabled ? #000000 : #FFFFFF87) : (root.enabled ? #FFFFFFC9 : #FFFFFF5D);
+                    animate x, width, height { duration: 120ms; easing: ease-out; }
+                }
+                // Keyboard focus ring.
+                Rectangle {
+                    x: -3px;
+                    y: -3px;
+                    width: parent.width + 6px;
+                    height: parent.height + 6px;
+                    border-radius: 13px;
+                    border-width: focus.has-focus ? 2px : 0px;
+                    border-color: Theme.text;
+                }
+            }
+        }
+        Text {
+            text: root.text;
+            font-size: 14px;
+            color: root.enabled ? Theme.text : Theme.text-tertiary;
+            vertical-alignment: center;
+            accessible-role: none;
+        }
+    }
+    focus := FocusScope {
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if (event.text == " ") {
+                root.flip();
+                return accept;
+            }
+            return reject;
+        }
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.flip(); }
+    }
+}
+
 export component SettingField inherits VerticalLayout {
     in property <string> glyph;
     in property <string> label;
@@ -213,20 +376,40 @@ export component EmptyField inherits Rectangle {
     horizontal-stretch: 1;
 }
 
-// One figure inside the metrics card: icon + label, value underneath.
-export component MetricCell inherits VerticalLayout {
+// One figure of the running batch as a tile, the same shape as `CountTile` (icon, value with
+// its note, label underneath), so the page reads as one set of tiles.
+export component MetricTile inherits Rectangle {
     in property <Metric> metric;
-    spacing: 4px;
-    // Same preferred width and stretch for every cell, so each row splits evenly.
-    preferred-width: 100px;
-    min-width: 0px;
+    // Same preferred width and stretch for every tile, so each row splits evenly.
     horizontal-stretch: 1;
+    min-width: 0px;
+    preferred-width: 100px;
+    background: Theme.card-background;
+    border-radius: Theme.radius;
+    border-width: 1px;
+    border-color: Theme.card-stroke;
     HorizontalLayout {
-        spacing: 6px;
-        Glyph { glyph: root.metric.glyph; font-size: 12px; color: Theme.text-tertiary; width: 14px; }
-        Text { text: root.metric.label; font-size: 12px; color: Theme.text-secondary; vertical-alignment: center; overflow: elide; }
+        padding: 14px;
+        spacing: 12px;
+        Glyph { glyph: root.metric.glyph; font-size: 20px; color: root.metric.alert ? Theme.critical : Theme.accent; width: 22px; }
+        VerticalLayout {
+            alignment: center;
+            min-width: 0px;
+            HorizontalLayout {
+                spacing: 6px;
+                Text { text: root.metric.value; font-size: 18px; font-weight: 600; color: root.metric.alert ? Theme.critical : Theme.text; overflow: elide; min-width: 0px; horizontal-stretch: 0; }
+                // Bottom-aligned with a small lift, so it sits on the value's baseline.
+                VerticalLayout {
+                    alignment: end;
+                    padding-bottom: 3px;
+                    horizontal-stretch: 1;
+                    min-width: 0px;
+                    Text { text: root.metric.detail; font-size: 12px; color: Theme.text-tertiary; overflow: elide; }
+                }
+            }
+            Text { text: root.metric.label; font-size: 12px; color: Theme.text-secondary; overflow: elide; }
+        }
     }
-    Text { text: root.metric.value; font-size: 18px; font-weight: 600; color: Theme.text; overflow: elide; }
 }
 
 export component ThinBar inherits Rectangle {
@@ -245,15 +428,49 @@ export component ThinBar inherits Rectangle {
     }
 }
 
-// One line per file: name, what it is doing, and a short bar when its share done is known.
+// One line per file: the file name, its folder (dimmed, cut first), then fixed columns for
+// its step, its time and a short bar when its share done is known. The fixed columns keep
+// every line's columns aligned and stop the names from moving as the time ticks.
 export component FileLine inherits HorizontalLayout {
     in property <FileRow> file;
-    spacing: 8px;
-    min-height: 20px;
-    Text { text: root.file.name; font-size: 12px; color: Theme.text; overflow: elide; horizontal-stretch: 1; vertical-alignment: center; }
-    Text { text: root.file.meta; font-size: 11px; color: Theme.text-tertiary; horizontal-stretch: 0; vertical-alignment: center; }
+    property <length> step-width: 132px;
+    property <length> time-width: 48px;
+    property <length> bar-width: 44px;
+    spacing: 10px;
+    min-height: 22px;
+    // Placed by hand (a layout here would loop on its own width): the folder keeps up to a
+    // quarter of the space, the name takes the rest; a short name leaves the folder more.
     Rectangle {
-        width: 48px;
+        horizontal-stretch: 1;
+        min-width: 0px;
+        preferred-width: 100px;
+        property <length> gap: 6px;
+        property <length> folder-room: root.file.folder == "" ? 0px : min(folder.preferred-width + self.gap, self.width * 0.25);
+        name := Text {
+            x: 0px;
+            width: min(self.preferred-width, max(0px, parent.width - parent.folder-room));
+            height: parent.height;
+            text: root.file.name;
+            font-size: 12px;
+            color: Theme.text;
+            overflow: elide;
+            vertical-alignment: center;
+        }
+        folder := Text {
+            x: name.width + parent.gap;
+            width: max(0px, parent.width - self.x);
+            height: parent.height;
+            text: root.file.folder;
+            font-size: 11px;
+            color: Theme.text-tertiary;
+            overflow: elide;
+            vertical-alignment: center;
+        }
+    }
+    Text { text: root.file.step; width: root.step-width; font-size: 11px; color: Theme.text-tertiary; overflow: elide; vertical-alignment: center; }
+    Text { text: root.file.time; width: root.time-width; font-size: 11px; color: Theme.text-tertiary; horizontal-alignment: right; vertical-alignment: center; }
+    Rectangle {
+        width: root.bar-width;
         if root.file.progress >= 0: ThinBar { y: (parent.height - self.height) / 2; width: parent.width; progress: root.file.progress; }
     }
 }
@@ -346,6 +563,15 @@ export component GroupHeader inherits HorizontalLayout {
     }
 }
 
+// One tool on the About page: name, version, where it comes from.
+export component ToolLine inherits HorizontalLayout {
+    in property <ToolRow> tool;
+    spacing: 12px;
+    Text { text: root.tool.name; font-size: 13px; color: Theme.text; width: 88px; overflow: elide; }
+    Text { text: root.tool.version; font-size: 13px; color: Theme.text-secondary; horizontal-stretch: 1; min-width: 0px; overflow: elide; }
+    Text { text: root.tool.source; font-size: 12px; color: Theme.text-tertiary; horizontal-stretch: 0; vertical-alignment: center; }
+}
+
 // A checkbox drawn from its state only (no internal state), so "All" can follow the others.
 export component Check inherits Rectangle {
     in property <string> text;
@@ -366,10 +592,11 @@ export component Check inherits Rectangle {
                 width: 20px;
                 height: 20px;
                 border-radius: Theme.radius-small;
-                border-width: root.checked ? 0px : 1px;
-                border-color: #FFFFFF8A;
-                background: !root.enabled ? #FFFFFF14 : root.checked ? Theme.accent : #00000033;
-                if root.checked: Glyph { glyph: "\u{E73E}"; font-size: 12px; color: #000000; }
+                // Disabled: dimmer than an enabled empty box (Fluent), never lighter.
+                border-width: root.checked && root.enabled ? 0px : 1px;
+                border-color: root.enabled ? #FFFFFF8A : #FFFFFF33;
+                background: !root.enabled ? (root.checked ? #FFFFFF29 : transparent) : root.checked ? Theme.accent : #00000033;
+                if root.checked: Glyph { glyph: "\u{E73E}"; font-size: 12px; color: root.enabled ? #000000 : #FFFFFF87; }
             }
         }
         Text {

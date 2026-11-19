@@ -32,6 +32,7 @@ use replace::*;
 use scan::*;
 use vmaf::*;
 
+pub use batch::cpu_slot_count;
 pub use ffmpeg::locate_ffmpeg;
 
 const STATE_THROTTLE: Duration = Duration::from_millis(250);

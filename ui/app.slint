@@ -1,7 +1,7 @@
 // mediaopti interface: Windows 11 Fluent design (dark), rendered by Slint's software renderer.
 
-import { Button, ComboBox, ListView, ScrollView, Switch } from "std-widgets.slint";
-import { FileRow, ToolRow, AdvPart, WorkerRow, Metric, QueueItem, QueueCount, Theme, Glyph, Card, SectionTitle, StatusPill, IconTile, LinkText, SettingField, EmptyField, MetricCell, ThinBar, FileLine, NavItem, GroupHeader, Check, CountTile, BusyBar, PageTitle } from "widgets.slint";
+import { ComboBox, ListView, ScrollView } from "std-widgets.slint";
+import { Button, Switch, FileRow, LogLine, ToolRow, AdvPart, WorkerRow, Metric, QueueItem, QueueCount, Theme, Glyph, Card, SectionTitle, StatusPill, IconTile, LinkText, SettingField, EmptyField, MetricTile, ThinBar, FileLine, ToolLine, NavItem, GroupHeader, Check, CountTile, BusyBar, PageTitle } from "widgets.slint";
 // What the Rust side uses: the structs it fills in, and the theme.
 export { FileRow, ToolRow, AdvPart, WorkerRow, Metric, QueueItem, QueueCount, Theme } from "widgets.slint";
 
@@ -23,7 +23,7 @@ export component AppWindow inherits Window {
     in property <bool> empty-folder;
     in property <string> folder-title: "No folder selected";
     in property <string> folder-path;
-    in property <string> folder-summary: "Choose one or more folders, or drop files and folders on this window.";
+    in property <string> folder-summary: "Choose the folders to optimize.";
     in property <bool> busy;
     in property <bool> scanning;
     in property <bool> processing;
@@ -47,7 +47,7 @@ export component AppWindow inherits Window {
     // Files running on the CPU, in two columns (read across: left, right, left...).
     in property <[FileRow]> files-left;
     in property <[FileRow]> files-right;
-    in property <[string]> log-lines;
+    in property <[LogLine]> log-lines;
     in property <[QueueCount]> queue-counts;
     in property <[QueueItem]> queue-items;
     in property <string> queue-more;
@@ -123,7 +123,9 @@ export component AppWindow inherits Window {
     callback install-update();
     callback check-tools();
     callback install-tools();
+    // The tools in two columns: the first half, then the rest.
     in property <[ToolRow]> tool-rows;
+    in property <[ToolRow]> tool-rows-right;
     // New pingo/beeim versions: a line, whether they can be installed, a check running.
     in property <string> tools-new-text;
     in property <bool> tools-new;
@@ -219,9 +221,11 @@ export component AppWindow inherits Window {
                                 horizontal-stretch: 1;
                                 Text { text: root.folder-title; font-size: 14px; font-weight: 600; color: Theme.text; overflow: elide; }
                                 if root.has-folder: Text { text: root.folder-path; font-size: 12px; color: Theme.text-tertiary; overflow: elide; }
-                                Text { text: root.folder-summary; font-size: 12px; color: Theme.text-secondary; overflow: elide; }
+                                // With a folder, the counts move to the footer below.
+                                if !root.has-folder: Text { text: root.folder-summary; font-size: 12px; color: Theme.text-secondary; overflow: elide; }
                             }
-                            VerticalLayout {
+                            // Hidden while a batch runs (it couldn't be used), like Clear queue.
+                            if !root.processing: VerticalLayout {
                                 alignment: center;
                                 Button {
                                     text: root.has-folder ? "Change folders" : "Choose folders";
@@ -253,10 +257,28 @@ export component AppWindow inherits Window {
                             }
                         }
                         if root.scanning: BusyBar { }
-                        if root.show-history: HorizontalLayout {
-                            spacing: 12px;
-                            Glyph { glyph: "\u{E81C}"; font-size: 13px; color: Theme.text-tertiary; width: 14px; }
-                            Text { text: root.history-text; font-size: 13px; color: Theme.text-tertiary; vertical-alignment: center; }
+                        // Footer: what the folders hold on the left, what is remembered on the
+                        // right, under a hairline, so both lines of the card use its width.
+                        if root.has-folder || root.show-history: Rectangle {
+                            height: 1px;
+                            background: Theme.subtle-fill;
+                        }
+                        if root.has-folder || root.show-history: HorizontalLayout {
+                            spacing: 16px;
+                            if root.has-folder: HorizontalLayout {
+                                spacing: 8px;
+                                horizontal-stretch: 1;
+                                min-width: 0px;
+                                Glyph { glyph: "\u{E8FD}"; font-size: 13px; color: Theme.text-tertiary; width: 16px; }
+                                Text { text: root.folder-summary; font-size: 13px; color: Theme.text-secondary; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+                            }
+                            if !root.has-folder: Rectangle { horizontal-stretch: 1; }
+                            if root.show-history: HorizontalLayout {
+                                spacing: 8px;
+                                horizontal-stretch: 0;
+                                Glyph { glyph: "\u{E81C}"; font-size: 13px; color: Theme.text-tertiary; width: 16px; }
+                                Text { text: root.history-text; font-size: 13px; color: Theme.text-tertiary; vertical-alignment: center; }
+                            }
                         }
                     }
 
@@ -292,7 +314,8 @@ export component AppWindow inherits Window {
                                     padding-top: 4px;
                                     padding-bottom: 4px;
                                     spacing: 12px;
-                                    Text { text: item.kind; width: 72px; font-size: 12px; color: Theme.accent; vertical-alignment: center; }
+                                    // Grey: the accent marks things that can be clicked.
+                                    Text { text: item.kind; width: 72px; font-size: 12px; color: Theme.text-tertiary; vertical-alignment: center; }
                                     Text { text: item.name; font-size: 13px; color: Theme.text; overflow: elide; horizontal-stretch: 1; vertical-alignment: center; }
                                     Text { text: item.size; font-size: 12px; color: Theme.text-tertiary; horizontal-alignment: right; width: 80px; vertical-alignment: center; }
                                 }
@@ -301,25 +324,19 @@ export component AppWindow inherits Window {
                     }
 
                     // Running (or just finished): figures, progress, active files.
-                    if root.show-stats: Card {
-                        pad: 14px;
-                        gap: 14px;
-                        if root.width >= 1220px: HorizontalLayout {
-                            spacing: 16px;
-                            for metric in root.metrics: MetricCell { metric: metric; }
-                        }
-                        if root.width < 1220px: HorizontalLayout {
-                            spacing: 16px;
-                            MetricCell { metric: root.metrics[0]; }
-                            MetricCell { metric: root.metrics[1]; }
-                            MetricCell { metric: root.metrics[2]; }
-                        }
-                        if root.width < 1220px: HorizontalLayout {
-                            spacing: 16px;
-                            MetricCell { metric: root.metrics[3]; }
-                            MetricCell { metric: root.metrics[4]; }
-                            MetricCell { metric: root.metrics[5]; }
-                        }
+                    // One tile per figure, like the waiting-files tiles: two rows of three
+                    // (six in a row would cut "12,343 of 1,181,903" at the page's width).
+                    if root.show-stats: HorizontalLayout {
+                        spacing: 12px;
+                        MetricTile { metric: root.metrics[0]; }
+                        MetricTile { metric: root.metrics[1]; }
+                        MetricTile { metric: root.metrics[2]; }
+                    }
+                    if root.show-stats: HorizontalLayout {
+                        spacing: 12px;
+                        MetricTile { metric: root.metrics[3]; }
+                        MetricTile { metric: root.metrics[4]; }
+                        MetricTile { metric: root.metrics[5]; }
                     }
                     if root.show-stats: Card {
                         HorizontalLayout {
@@ -327,21 +344,30 @@ export component AppWindow inherits Window {
                             Rectangle { horizontal-stretch: 1; }
                             Text { text: root.overall-percent; font-size: 15px; font-weight: 600; color: Theme.text; vertical-alignment: center; }
                         }
-                        Text { text: root.current-file; font-size: 13px; color: Theme.text-secondary; overflow: elide; }
-                        ThinBar { progress: root.overall-progress; height: 6px; border-radius: 3px; }
+                        // The line and its bar together, as in the rows below (6px).
+                        VerticalLayout {
+                            spacing: 6px;
+                            Text { text: root.current-file; font-size: 13px; color: Theme.text-secondary; overflow: elide; }
+                            ThinBar { progress: root.overall-progress; height: 6px; border-radius: 3px; }
+                        }
                         for worker in root.workers: VerticalLayout {
                             spacing: 6px;
                             padding-top: 4px;
                             HorizontalLayout {
                                 spacing: 12px;
                                 Text { text: worker.title; font-size: 13px; color: Theme.text; overflow: elide; horizontal-stretch: 1; }
-                                Text { text: worker.meta; font-size: 12px; color: Theme.text-tertiary; horizontal-stretch: 0; }
+                                Text { text: worker.meta; font-size: 12px; color: worker.progress >= 1 ? Theme.success : Theme.text-tertiary; horizontal-stretch: 0; }
                             }
-                            ThinBar { progress: worker.progress; }
+                            // A finished type turns green.
+                            ThinBar { progress: worker.progress; fill: worker.progress >= 1 ? Theme.success : Theme.accent; }
                         }
-                        if root.files-left.length > 0: HorizontalLayout {
-                            spacing: 24px;
-                            padding-top: 4px;
+                        // A hairline, so the files don't read as part of the last type above.
+                        if root.files-left.length > 0: Rectangle { height: 1px; background: Theme.subtle-fill; }
+                        // The files being worked on: the first half on the left, the rest on the
+                        // right (each column reads top to bottom); one column when the window is
+                        // too narrow for two to show the names.
+                        if root.files-left.length > 0 && root.width >= 1220px: HorizontalLayout {
+                            spacing: 32px;
                             VerticalLayout {
                                 horizontal-stretch: 1;
                                 alignment: LayoutAlignment.start;
@@ -352,6 +378,10 @@ export component AppWindow inherits Window {
                                 alignment: LayoutAlignment.start;
                                 for f in root.files-right: FileLine { file: f; }
                             }
+                        }
+                        if root.files-left.length > 0 && root.width < 1220px: VerticalLayout {
+                            for f in root.files-left: FileLine { file: f; }
+                            for f in root.files-right: FileLine { file: f; }
                         }
                     }
 
@@ -389,35 +419,61 @@ export component AppWindow inherits Window {
                                 scrolled => {
                                     self.follow = self.content-y <= self.visible-height - self.content-height + 4px;
                                 }
+                                // The time in its own column, so a wrapped message continues
+                                // under the message, not under the time.
                                 for line in root.log-lines: HorizontalLayout {
                                     padding-left: 10px;
                                     padding-right: 10px;
-                                    padding-top: 1px;
-                                    padding-bottom: 1px;
+                                    padding-top: 2px;
+                                    padding-bottom: 2px;
+                                    spacing: 10px;
                                     Text {
-                                        text: line;
+                                        text: line.time;
                                         font-family: "Consolas";
                                         font-size: 12px;
-                                        color: Theme.text-secondary;
+                                        color: Theme.text-tertiary;
+                                        horizontal-stretch: 0;
+                                        vertical-alignment: top;
+                                    }
+                                    // Savings stand out; the many "kept" lines step back.
+                                    Text {
+                                        text: line.text;
+                                        font-family: "Consolas";
+                                        font-size: 12px;
+                                        color: line.tone == "saved" ? Theme.text
+                                            : line.tone == "kept" ? Theme.text-tertiary
+                                            : line.tone == "failed" ? Theme.critical
+                                            : Theme.text-secondary;
                                         wrap: word-wrap;
+                                        horizontal-stretch: 1;
                                     }
                                 }
                             }
                         }
                     }
 
+                    // The drop zone; a click opens the folder picker too.
                     if !root.has-folder && !root.show-log: Rectangle {
                         vertical-stretch: 1;
                         min-height: 200px;
                         border-radius: Theme.radius;
                         border-width: 1px;
-                        border-color: #FFFFFF1F;
+                        border-color: drop-touch.has-hover && !root.busy ? Theme.accent.with-alpha(0.6) : #FFFFFF2E;
+                        background: drop-touch.has-hover && !root.busy ? Theme.accent.with-alpha(0.04) : #FFFFFF05;
+                        accessible-role: button;
+                        accessible-label: "Choose folders";
+                        accessible-action-default => { if (!root.busy) { root.choose-folder(); } }
                         VerticalLayout {
                             alignment: center;
                             spacing: 8px;
-                            Glyph { glyph: "\u{E896}"; font-size: 32px; color: Theme.text-tertiary; }
-                            Text { text: "Drop files or folders here"; font-size: 16px; color: Theme.text-secondary; horizontal-alignment: center; }
+                            Glyph { glyph: "\u{E896}"; font-size: 32px; color: drop-touch.has-hover && !root.busy ? Theme.accent : Theme.text-tertiary; }
+                            Text { text: "Drop files or folders here, or click to choose"; font-size: 16px; color: Theme.text-secondary; horizontal-alignment: center; }
                             Text { text: "Videos, images, audio and documents. Folders include their subfolders."; font-size: 12px; color: Theme.text-tertiary; horizontal-alignment: center; }
+                        }
+                        drop-touch := TouchArea {
+                            enabled: !root.busy;
+                            mouse-cursor: pointer;
+                            clicked => { root.choose-folder(); }
                         }
                     }
                     if root.has-folder && root.processing && !root.show-log: Rectangle { vertical-stretch: 1; }
@@ -451,7 +507,10 @@ export component AppWindow inherits Window {
                             color: Theme.text-tertiary;
                             vertical-alignment: center;
                         }
-                        Button { text: "Restore defaults"; enabled: !root.locked; clicked => { root.restore-defaults(); } }
+                        VerticalLayout {
+                            alignment: center;
+                            Button { text: "Restore defaults"; enabled: !root.locked; clicked => { root.restore-defaults(); } }
+                        }
                     }
 
                     // Why nothing below can be changed now (a run's results depend on its settings).
@@ -461,9 +520,13 @@ export component AppWindow inherits Window {
                         border-width: 1px;
                         border-color: #FCE10059;
                         HorizontalLayout {
-                            padding: 12px;
-                            spacing: 10px;
-                            Glyph { glyph: "\u{E72E}"; font-size: 16px; color: Theme.caution; width: 18px; }
+                            padding: 16px;
+                            spacing: 12px;
+                            VerticalLayout {
+                                alignment: LayoutAlignment.start;
+                                padding-top: 2px;
+                                Glyph { glyph: "\u{E72E}"; font-size: 16px; color: Theme.caution; width: 20px; }
+                            }
                             VerticalLayout {
                                 spacing: 2px;
                                 Text {
@@ -849,11 +912,27 @@ export component AppWindow inherits Window {
                     Card {
                         SectionTitle { glyph: "\u{E90F}"; text: "Tools"; }
                         if root.tool-rows.length == 0: Text { text: "Found: " + root.tools-found; font-size: 13px; color: Theme.text-secondary; wrap: word-wrap; }
-                        for row in root.tool-rows: HorizontalLayout {
-                            spacing: 12px;
-                            Text { text: row.name; font-size: 13px; color: Theme.text; width: 96px; }
-                            Text { text: row.version; font-size: 13px; color: Theme.text-secondary; width: 160px; overflow: elide; }
-                            Text { text: row.source; font-size: 12px; color: Theme.text-tertiary; horizontal-stretch: 1; overflow: elide; vertical-alignment: center; }
+                        // Two compact columns in a well (16 rows in one column left the right
+                        // half empty and pushed Data off the page); a hairline before the footer.
+                        if root.tool-rows.length > 0: Rectangle {
+                            background: Theme.well-background;
+                            border-radius: Theme.radius-small;
+                            HorizontalLayout {
+                                padding: 12px;
+                                spacing: 32px;
+                                VerticalLayout {
+                                    spacing: 6px;
+                                    horizontal-stretch: 1;
+                                    alignment: LayoutAlignment.start;
+                                    for row in root.tool-rows: ToolLine { tool: row; }
+                                }
+                                VerticalLayout {
+                                    spacing: 6px;
+                                    horizontal-stretch: 1;
+                                    alignment: LayoutAlignment.start;
+                                    for row in root.tool-rows-right: ToolLine { tool: row; }
+                                }
+                            }
                         }
                         HorizontalLayout {
                             spacing: 12px;
@@ -942,24 +1021,33 @@ export component AppWindow inherits Window {
                         spacing: 12px;
                         Text { text: "Advanced options"; font-size: 26px; font-weight: 600; color: Theme.text; vertical-alignment: center; }
                         Rectangle { horizontal-stretch: 1; }
+                        // Same wording as Settings; "Changed" marks values off the defaults.
                         Text {
-                            text: root.locked ? "Locked" : root.adv-default ? "Defaults" : "Changed";
+                            text: root.locked ? "Locked" : root.adv-default ? "Saved automatically" : "Changed · saved automatically";
                             font-size: 12px;
-                            color: root.adv-default ? Theme.text-tertiary : Theme.caution;
+                            color: root.adv-default || root.locked ? Theme.text-tertiary : Theme.caution;
                             vertical-alignment: center;
                         }
-                        Button { text: "Restore defaults"; enabled: !root.locked && !root.adv-default; clicked => { root.restore-advanced(); } }
+                        VerticalLayout {
+                            alignment: center;
+                            Button { text: "Restore defaults"; enabled: !root.locked && !root.adv-default; clicked => { root.restore-advanced(); } }
+                        }
                     }
 
+                    // Same padding as the cards below, the icon on the title's line.
                     Rectangle {
                         background: #FCE10014;
                         border-radius: Theme.radius;
                         border-width: 1px;
                         border-color: #FCE10059;
                         HorizontalLayout {
-                            padding: 12px;
-                            spacing: 10px;
-                            Glyph { glyph: "\u{E7BA}"; font-size: 16px; color: Theme.caution; width: 18px; }
+                            padding: 16px;
+                            spacing: 12px;
+                            VerticalLayout {
+                                alignment: LayoutAlignment.start;
+                                padding-top: 2px;
+                                Glyph { glyph: "\u{E7BA}"; font-size: 16px; color: Theme.caution; width: 20px; }
+                            }
                             VerticalLayout {
                                 spacing: 2px;
                                 Text {
@@ -978,66 +1066,37 @@ export component AppWindow inherits Window {
                         }
                     }
 
+                    // The same card header as Settings: icon, title, description, switch.
                     Card {
-                        SectionTitle { glyph: "\u{E950}"; text: "GPU decoding"; }
-                        HorizontalLayout {
-                            spacing: 12px;
-                            Text {
-                                text: "Decode H.264, HEVC, AV1 and VP9 on the GPU when encoding to AV1 or HEVC (NVENC). The output is identical to CPU decoding; turn it off if the graphics driver misbehaves.";
-                                font-size: 13px;
-                                color: Theme.text-secondary;
-                                wrap: word-wrap;
-                                horizontal-stretch: 1;
-                                vertical-alignment: center;
-                            }
-                            Switch {
-                                text: root.gpu-decoding ? "On" : "Off";
-                                enabled: !root.locked;
-                                checked <=> root.gpu-decoding;
-                                toggled => { root.advanced-changed(); }
-                            }
+                        GroupHeader {
+                            glyph: "\u{E950}";
+                            title: "GPU decoding";
+                            formats: "Decode H.264, HEVC, AV1 and VP9 on the GPU when encoding to AV1 or HEVC (NVENC). The output is identical to CPU decoding; turn it off if the graphics driver misbehaves.";
+                            enabled: !root.locked;
+                            on <=> root.gpu-decoding;
+                            toggled => { root.advanced-changed(); }
                         }
                     }
 
                     Card {
-                        SectionTitle { glyph: "\u{E74D}"; text: "Remove data tracks"; }
-                        HorizontalLayout {
-                            spacing: 12px;
-                            Text {
-                                text: "Videos with a data track no container can carry over (GoPro telemetry, iPhone metadata) are left as they are. On, they are optimized and lose that track: GPS, sensor and camera data in it is gone. QuickTime VR panoramas and Dolby Vision are always left alone.";
-                                font-size: 13px;
-                                color: Theme.text-secondary;
-                                wrap: word-wrap;
-                                horizontal-stretch: 1;
-                                vertical-alignment: center;
-                            }
-                            Switch {
-                                text: root.drop-data ? "On" : "Off";
-                                enabled: !root.locked;
-                                checked <=> root.drop-data;
-                                toggled => { root.advanced-changed(); }
-                            }
+                        GroupHeader {
+                            glyph: "\u{E74D}";
+                            title: "Remove data tracks";
+                            formats: "Videos with a data track no container can carry over (GoPro telemetry, iPhone metadata) are left as they are. On, they are optimized and lose that track: GPS, sensor and camera data in it is gone. QuickTime VR panoramas and Dolby Vision are always left alone.";
+                            enabled: !root.locked;
+                            on <=> root.drop-data;
+                            toggled => { root.advanced-changed(); }
                         }
                     }
 
                     Card {
-                        SectionTitle { glyph: "\u{E8EC}"; text: "Remove metadata"; }
-                        HorizontalLayout {
-                            spacing: 12px;
-                            Text {
-                                text: "Removes EXIF (camera, date, GPS), comments and text from PNG, JPEG and GIF (also inside comics, Office and EPUB files) and the empty padding in FLAC and MP3 tags. Colour profiles and rotation are always kept, and so are audio tags.";
-                                font-size: 13px;
-                                color: Theme.text-secondary;
-                                wrap: word-wrap;
-                                horizontal-stretch: 1;
-                                vertical-alignment: center;
-                            }
-                            Switch {
-                                text: root.strip ? "On" : "Off";
-                                enabled: !root.locked;
-                                checked <=> root.strip;
-                                toggled => { root.advanced-changed(); }
-                            }
+                        GroupHeader {
+                            glyph: "\u{E8EC}";
+                            title: "Remove metadata";
+                            formats: "Removes EXIF (camera, date, GPS), comments and text from PNG, JPEG and GIF (also inside comics, Office and EPUB files) and the empty padding in FLAC and MP3 tags. Colour profiles and rotation are always kept, and so are audio tags.";
+                            enabled: !root.locked;
+                            on <=> root.strip;
+                            toggled => { root.advanced-changed(); }
                         }
                         Check {
                             text: "Also redo files already processed without it (they are read and optimized again)";
@@ -1048,12 +1107,11 @@ export component AppWindow inherits Window {
                     }
 
                     Card {
-                        SectionTitle { glyph: "\u{E9E9}"; text: "Maximum-effort parts"; }
-                        Text {
-                            text: "Extra optimizer steps for images, audio and PDFs. Each was measured alone; only the default one paid off. Files already in the processed history are not redone when these change.";
-                            font-size: 12px;
-                            color: Theme.text-tertiary;
-                            wrap: word-wrap;
+                        GroupHeader {
+                            glyph: "\u{E9E9}";
+                            title: "Maximum-effort parts";
+                            formats: "Extra optimizer steps for images, audio and PDFs. Each was measured alone; only the default one paid off. Files already in the processed history are not redone when these change.";
+                            has-switch: false;
                         }
                         for part[i] in root.adv-parts: VerticalLayout {
                             spacing: 0px;

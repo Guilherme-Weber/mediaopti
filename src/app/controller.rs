@@ -60,7 +60,7 @@ pub(super) struct Controller {
     pub(super) window: slint::Weak<AppWindow>,
     pub(super) inbox: Arc<Inbox>,
     pub(super) state: StateDto,
-    pub(super) log_model: Rc<VecModel<SharedString>>,
+    pub(super) log_model: Rc<VecModel<LogLine>>,
     pub(super) worker_model: Rc<VecModel<WorkerRow>>,
     pub(super) files_left: Rc<VecModel<FileRow>>,
     pub(super) files_right: Rc<VecModel<FileRow>>,
@@ -231,7 +231,8 @@ impl Controller {
         w.set_folder_summary(if has_folder || s.status == Status::Scanning {
             file_count_text(s).into()
         } else {
-            "Choose one or more folders, or drop files and folders on this window. Subfolders are included.".into()
+            // The drop zone below says how (drop or click) and that subfolders count.
+            "Choose the folders to optimize.".into()
         });
         w.set_busy(busy);
         w.set_scanning(s.status == Status::Scanning);
@@ -249,35 +250,47 @@ impl Controller {
 
         // Metrics
         let t = &s.telemetry;
+        // Videos run first; once none is left, the GPU figures would sit at 0 for the rest of
+        // the run (hours of pictures), so those two cells describe the CPU stages instead.
+        let video_stage = processing && (!t.workers.is_empty() || s.type_progress[0].0 < s.type_progress[0].1);
+        let none = || (String::from("—"), String::new());
         let speed = if paused {
-            "Paused".into()
-        } else if processing && t.total_fps > 0 {
-            format!("{} fps ({}x)", t.total_fps, t.total_speed)
-        } else if processing && s.type_progress[0].0 < s.type_progress[0].1 {
-            "Starting…".into()
+            ("Paused".into(), String::new())
+        } else if video_stage && t.total_fps > 0 {
+            (format!("{} fps", t.total_fps), format!("{}x", t.total_speed))
+        } else if video_stage {
+            ("Starting…".into(), String::new())
+        } else if processing {
+            files_per_minute(s.completed_this_run, self.clock.elapsed()).map_or_else(none, |rate| (rate, "files/min".into()))
         } else {
-            "—".into()
+            none()
         };
-        let gpu = if processing {
-            format!("{}% · {} GB", t.nvenc_util, t.vram_gb)
+        let (gpu_label, gpu) = if video_stage {
+            ("NVENC / VRAM", (format!("{}%", t.nvenc_util), format!("{} GB VRAM", t.vram_gb)))
+        } else if processing {
+            let slots = crate::engine::cpu_slot_count();
+            ("CPU jobs", (group_thousands(s.cpu_jobs.len()), format!("of {slots} slots")))
         } else {
-            "—".into()
+            ("NVENC / VRAM", none())
         };
         let metrics = [
-            ("Queued", s.pending_files.to_string(), "\u{E8FD}"),
-            ("Completed", format!("{}/{}", s.completed_this_run, s.run_total), "\u{E73E}"),
-            ("Space saved", format_saved(s.space_saved_mb), "\u{E74E}"),
+            ("Queued", (group_thousands(s.pending_files), String::new()), "\u{E8FD}"),
+            ("Completed", (group_thousands(s.completed_this_run), format!("of {}", group_thousands(s.run_total))), "\u{E73E}"),
+            ("Space saved", (format_saved(s.space_saved_mb), String::new()), "\u{E74E}"),
             ("Speed", speed, "\u{EC4A}"),
-            ("NVENC / VRAM", gpu, "\u{E950}"),
-            ("Failed", s.failed_this_run.to_string(), "\u{E783}"),
+            (gpu_label, gpu, "\u{E950}"),
+            ("Failed", (group_thousands(s.failed_this_run), String::new()), "\u{E783}"),
         ];
         sync_model(
             &self.metric_model,
             metrics
                 .into_iter()
-                .map(|(label, value, glyph)| Metric {
+                .map(|(label, (value, detail), glyph)| Metric {
+                    // Failed files are the one figure that wants attention.
+                    alert: label == "Failed" && s.failed_this_run > 0,
                     label: label.into(),
                     value: value.into(),
+                    detail: detail.into(),
                     glyph: glyph.into(),
                 })
                 .collect(),
@@ -367,10 +380,10 @@ impl Controller {
                 files.push(file_row(&job.name, &step, share, None, job.secs));
             }
         }
-        let (mut left, mut right) = (Vec::new(), Vec::new());
-        for (i, row) in files.into_iter().enumerate() {
-            if i % 2 == 0 { left.push(row) } else { right.push(row) }
-        }
+        // The first half on the left, the rest on the right: each column reads top to bottom,
+        // and one column (left, then right) keeps the order.
+        let mut left = files;
+        let right = left.split_off(left.len().div_ceil(2));
         sync_model(&self.files_left, left);
         sync_model(&self.files_right, right);
 
@@ -401,24 +414,59 @@ impl Controller {
     }
 }
 
-/// Updates rows in place when the length is unchanged (avoids rebuilding list items).
-/// One file's line: "verifying 45% · 120 fps · 0:12"; the bar only when the share is known
-/// (a step with parts already says "12 of 150", so no percentage is added).
-pub(super) fn file_row(name: &str, step: &str, share: Option<f32>, extra: Option<String>, secs: u64) -> FileRow {
-    let mut meta = step.to_string();
+/// One file's line: its name, its folder shortened, its step ("verifying 45% · 120 fps") and
+/// its time so far; the bar only when the share is known (a step with parts already says
+/// "12 of 150", so no percentage is added).
+pub(super) fn file_row(path: &str, step: &str, share: Option<f32>, extra: Option<String>, secs: u64) -> FileRow {
+    let mut step = step.to_string();
     if let Some(f) = share.filter(|_| !step.contains(" of ")) {
-        meta += &format!(" {:.0}%", f * 100.0);
+        step += &format!(" {:.0}%", f * 100.0);
     }
-    for part in extra.into_iter().chain(std::iter::once(format_duration(std::time::Duration::from_secs(secs)))) {
-        meta += " · ";
-        meta += &part;
+    if let Some(part) = extra {
+        step += " · ";
+        step += &part;
     }
-    FileRow { name: name.into(), meta: meta.into(), progress: share.unwrap_or(-1.0) }
+    let (folder, name) = split_display_path(path);
+    FileRow {
+        name: name.into(),
+        folder: folder.into(),
+        step: step.into(),
+        time: format_duration(std::time::Duration::from_secs(secs)).into(),
+        progress: share.unwrap_or(-1.0),
+    }
+}
+
+/// Splits a shown path into its last two folders ("…\" in front when there are more) and the
+/// file name: the name is what tells files apart, and a long common start ("Pictures\Jogos\")
+/// would push it out of a short line.
+pub(super) fn split_display_path(path: &str) -> (String, &str) {
+    let Some(cut) = path.rfind(['\\', '/']) else {
+        return (String::new(), path);
+    };
+    let (dir, name) = (&path[..cut], &path[cut + 1..]);
+    let parts: Vec<&str> = dir.split(['\\', '/']).filter(|p| !p.is_empty()).collect();
+    let sep = if path.contains('\\') { "\\" } else { "/" };
+    let folder = if parts.len() > 2 {
+        format!("…{sep}{}", parts[parts.len() - 2..].join(sep))
+    } else {
+        parts.join(sep)
+    };
+    (folder, name)
+}
+
+/// Files finished per minute this run ("91", "2.5"); `None` in the first minute (too few to say).
+pub(super) fn files_per_minute(done: usize, elapsed: std::time::Duration) -> Option<String> {
+    let minutes = elapsed.as_secs_f64() / 60.0;
+    if minutes < 1.0 || done == 0 {
+        return None;
+    }
+    let rate = done as f64 / minutes;
+    Some(if rate >= 10.0 { group_thousands(rate.round() as usize) } else { format!("{rate:.1}") })
 }
 
 /// Adds log lines, keeping the last `MAX_LOG_LINES`: past the limit, in one change (removing
 /// the oldest one by one shifted the whole list for each).
-pub(super) fn append_log(model: &VecModel<SharedString>, logs: Vec<String>) {
+pub(super) fn append_log<T: Clone + 'static>(model: &VecModel<T>, logs: Vec<impl Into<T>>) {
     if model.row_count() + logs.len() <= MAX_LOG_LINES {
         for line in logs {
             model.push(line.into());
@@ -427,12 +475,46 @@ pub(super) fn append_log(model: &VecModel<SharedString>, logs: Vec<String>) {
     }
     let keep = MAX_LOG_LINES.saturating_sub(logs.len());
     let old = model.row_count();
-    let mut lines: Vec<SharedString> = (old.saturating_sub(keep)..old).filter_map(|i| model.row_data(i)).collect();
+    let mut lines: Vec<T> = (old.saturating_sub(keep)..old).filter_map(|i| model.row_data(i)).collect();
     lines.extend(logs.into_iter().map(Into::into));
     let from = lines.len().saturating_sub(MAX_LOG_LINES);
     model.set_vec(lines.split_off(from));
 }
 
+/// "[19:49:19] Saved..." (as `SlintUi::log` writes it) -> the time and the message; a line
+/// without that start keeps all of it as the message.
+impl From<String> for LogLine {
+    fn from(line: String) -> Self {
+        if let Some(rest) = line.strip_prefix('[') {
+            if let Some((time, text)) = rest.split_once("] ") {
+                if time.len() <= 8 && time.bytes().all(|b| b.is_ascii_digit() || b == b':') {
+                    return LogLine { time: time.into(), tone: log_tone(text).into(), text: text.into() };
+                }
+            }
+        }
+        LogLine { time: SharedString::new(), tone: log_tone(&line).into(), text: line.into() }
+    }
+}
+
+/// A file's result line, from how the engine words it after its "[Images]" / "[Worker 2]"
+/// tag: "saved" (a smaller file or a conversion), "kept" (nothing smaller), "failed", or "".
+pub(super) fn log_tone(message: &str) -> &'static str {
+    let body = match message.strip_prefix('[').and_then(|r| r.split_once("] ")) {
+        Some((_, body)) => body,
+        None => message,
+    };
+    if body.starts_with("Failed") {
+        "failed"
+    } else if body.starts_with("Saved ") || body.starts_with("Converted ") {
+        "saved"
+    } else if body.starts_with("Kept ") || body.starts_with("Video was not smaller") {
+        "kept"
+    } else {
+        ""
+    }
+}
+
+/// Updates rows in place when the length is unchanged (avoids rebuilding list items).
 pub(super) fn sync_model<T: Clone + PartialEq + 'static>(model: &VecModel<T>, rows: Vec<T>) {
     if model.row_count() == rows.len() {
         for (i, row) in rows.into_iter().enumerate() {

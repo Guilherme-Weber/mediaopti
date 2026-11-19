@@ -3,6 +3,27 @@
 Notable changes to mediaopti. Earlier versions are described in their
 [GitHub releases](https://github.com/Guilherme-Weber/mediaopti/releases).
 
+## Unreleased
+
+### Changed
+
+- The window uses one accent colour everywhere: primary buttons and switches are drawn in the
+  app's cyan instead of following the Windows accent colour.
+- Queue while running: the figures are tiles like the waiting-files tiles; thousands are
+  grouped; after the videos, Speed shows files per minute and the GPU tile becomes CPU jobs;
+  Failed turns red when a file fails.
+- The folder card puts the counts and the history in a footer under the folder and its
+  buttons; Change folders is hidden during a batch.
+- Files being worked on show the file name first, then its last two folders, with the step,
+  time and bar in fixed columns (the names no longer move as the time ticks); one column in a
+  narrow window, and each column reads top to bottom.
+- The activity log keeps the time in its own column (wrapped lines stay indented), shows
+  savings brighter, "kept" lines dimmer and failures in red.
+- Progress: a finished type turns green and a line separates the files from the types.
+- Advanced options use the same card headers as Settings; About lists the tools in two
+  columns; a disabled checkbox looks dimmer than an enabled one; the empty queue's drop zone
+  also opens the folder picker when clicked.
+
 ## 3.1.0
 
 A release focused on safety and robustness, after an audit of the whole program.

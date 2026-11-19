@@ -2,6 +2,14 @@
 
 use super::*;
 
+/// The CPU slots a batch's image, audio and document workers share: every core but two (left
+/// for the desktop). The stages run after the videos (rolling), so they get the cores; slots
+/// beyond the active workers stay idle for big jobs (comic pages) to borrow.
+pub fn cpu_slot_count() -> usize {
+    let cores = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+    cores.saturating_sub(2).max(1)
+}
+
 /// Whether another encoder may start now. The first encoder always may (otherwise a
 /// low-memory machine would wait forever).
 /// `free_vram_mb`: `None` when unknown (no NVIDIA GPU, or a CPU encoder).
@@ -252,11 +260,7 @@ impl Engine {
             Arc::clone(c)
         } else {
             {
-                // Leave some CPU for the desktop. The stages run after the videos (rolling), so
-                // they get every other core; slots beyond the active workers stay idle for big
-                // jobs (comic pages) to borrow.
-                let cores = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
-                let slots = cores.saturating_sub(2).max(1);
+                let slots = cpu_slot_count();
                 let c = Arc::new(images::CpuCtx::new(self.image_ctx(&inner.options, slots, inner.cancel.clone()), &inner.options, slots));
                 inner.cpu = Some(Arc::clone(&c));
                 c

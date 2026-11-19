@@ -113,7 +113,7 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
     engine.apply_options(prefs.to_raw());
 
     // Models
-    let log_model = Rc::new(VecModel::<SharedString>::default());
+    let log_model = Rc::new(VecModel::<LogLine>::default());
     let worker_model = Rc::new(VecModel::<WorkerRow>::default());
     let metric_model = Rc::new(VecModel::<Metric>::default());
     window.set_log_lines(log_model.clone().into());
@@ -581,11 +581,14 @@ fn tool_info(engine: &Arc<Engine>, weak: &slint::Weak<AppWindow>, force: bool) {
     let weak = weak.clone();
     let _ = slint::invoke_from_event_loop(move || {
         let Some(w) = weak.upgrade() else { return };
-        let model: Vec<ToolRow> = rows
+        let mut model: Vec<ToolRow> = rows
             .into_iter()
             .map(|(name, version, source)| ToolRow { name: name.into(), version: version.into(), source: source.into() })
             .collect();
+        // Two columns, each read top to bottom (the first half on the left).
+        let right = model.split_off(model.len().div_ceil(2));
         w.set_tool_rows(ModelRc::new(VecModel::from(model)));
+        w.set_tool_rows_right(ModelRc::new(VecModel::from(right)));
         w.set_tools_new_text(text.into());
         w.set_tools_new(available);
         w.set_tools_checking(false);
@@ -670,13 +673,75 @@ mod tests {
         let model = VecModel::<SharedString>::default();
         append_log(&model, (0..MAX_LOG_LINES - 2).map(|i| i.to_string()).collect());
         assert_eq!(model.row_count(), MAX_LOG_LINES - 2);
-        append_log(&model, vec!["a".into(), "b".into(), "c".into()]);
+        append_log(&model, vec!["a", "b", "c"]);
         assert_eq!(model.row_count(), MAX_LOG_LINES);
         assert_eq!(model.row_data(0).unwrap(), "1");
         assert_eq!(model.row_data(MAX_LOG_LINES - 1).unwrap(), "c");
         append_log(&model, (0..MAX_LOG_LINES + 7).map(|i| format!("n{i}")).collect());
         assert_eq!(model.row_count(), MAX_LOG_LINES);
         assert_eq!(model.row_data(0).unwrap(), "n7");
+    }
+
+    /// The window's log line splits its time off, so a wrapped message stays indented.
+    #[test]
+    fn log_lines_split_their_time() {
+        let line = LogLine::from("[19:49:19] [Documents] Kept a.pdf (already optimal)".to_string());
+        assert_eq!((line.time.as_str(), line.text.as_str()), ("19:49:19", "[Documents] Kept a.pdf (already optimal)"));
+        // Anything else stays whole, as the message.
+        for odd in ["[Documents] Kept a.pdf", "no time here", "[19:49] x", ""] {
+            let line = LogLine::from(odd.to_string());
+            let want = if odd == "[19:49] x" { ("19:49", "x") } else { ("", odd) };
+            assert_eq!((line.time.as_str(), line.text.as_str()), want, "{odd:?}");
+        }
+    }
+
+    /// The log's result lines get their tone from the engine's wording.
+    #[test]
+    fn log_lines_get_a_tone() {
+        let cases = [
+            ("[Images] Saved 22 KB (1%) from a.png", "saved"),
+            ("[Worker 1] Saved 1.4 MB (5%) from v.mp4", "saved"),
+            ("[Images] Converted x.bmp to x.png, saved 1 MB (6%)", "saved"),
+            ("[Documents] Kept a.pdf (already optimal)", "kept"),
+            ("[Worker 3] Video was not smaller for v.webm; kept the original file", "kept"),
+            ("[Images] Failed on a.png: could not read the file", "failed"),
+            ("[Worker 2] Processing: v.mp4", ""),
+            ("Found 39 files in D:/x", ""),
+            ("Saved by the user", "saved"),
+        ];
+        for (message, tone) in cases {
+            assert_eq!(log_tone(message), tone, "{message}");
+        }
+        assert_eq!(LogLine::from("[10:00:00] [Images] Kept a.png (already optimal)".to_string()).tone, "kept");
+    }
+
+    /// A running file shows its name first and only its last two folders.
+    #[test]
+    fn running_files_show_their_name_first() {
+        let cases = [
+            (r"Pictures\Jogos\S.T.A.L.K.E.R. 2\_AAA_\concept\Artbook (12).pdf", r"…\_AAA_\concept", "Artbook (12).pdf"),
+            (r"Jogos\Fallout 4\Art.pdf", r"Jogos\Fallout 4", "Art.pdf"),
+            (r"Skyrim\Guide.pdf", "Skyrim", "Guide.pdf"),
+            ("a/b/c/d.png", "…/b/c", "d.png"),
+            ("loose.png", "", "loose.png"),
+        ];
+        for (path, folder, name) in cases {
+            assert_eq!(split_display_path(path), (folder.to_string(), name), "{path}");
+        }
+        let row = file_row(r"Jogos\Doom\x.cbz", "pictures 3 of 9", Some(0.33), None, 75);
+        assert_eq!((row.name.as_str(), row.folder.as_str(), row.step.as_str(), row.time.as_str()), ("x.cbz", r"Jogos\Doom", "pictures 3 of 9", "1:15"));
+        let row = file_row("v.mp4", "encoding", Some(0.45), Some("120 fps (4.0x)".into()), 12);
+        assert_eq!((row.step.as_str(), row.time.as_str()), ("encoding 45% · 120 fps (4.0x)", "0:12"));
+    }
+
+    #[test]
+    fn files_per_minute_after_the_first_minute() {
+        use std::time::Duration;
+        assert_eq!(files_per_minute(50, Duration::from_secs(30)), None);
+        assert_eq!(files_per_minute(0, Duration::from_secs(600)), None);
+        assert_eq!(files_per_minute(12_343, Duration::from_secs(8_131)).as_deref(), Some("91"));
+        assert_eq!(files_per_minute(5, Duration::from_secs(120)).as_deref(), Some("2.5"));
+        assert_eq!(files_per_minute(120_000, Duration::from_secs(60)).as_deref(), Some("120,000"));
     }
 
     #[test]
