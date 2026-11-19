@@ -3,7 +3,11 @@
 Notable changes to mediaopti. Earlier versions are described in their
 [GitHub releases](https://github.com/Guilherme-Weber/mediaopti/releases).
 
-## Unreleased
+## 3.2.1
+
+Fixes from a long real run (14 failures, 13 of them false) and from a review of the whole
+program. Verification is unchanged; checked on 90 real files and the failed GIF and WMV of
+that run (0 failures, moved and renamed files recognised by content).
 
 ### Fixed
 
