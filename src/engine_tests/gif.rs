@@ -177,5 +177,10 @@ fn a_gif_remembered_as_video_gets_the_gif_optimizer_later() {
     // Done now.
     let (pending, logs) = run(1);
     assert_eq!(pending, 0, "{logs}");
+    // Renamed, it is known by its content for both passes: neither encoded nor optimized
+    // again (it was known only as a video, so it went back to the GIF optimizer).
+    std::fs::rename(&gif, media.join("renamed.gif")).unwrap();
+    let (pending, logs) = run(1);
+    assert_eq!(pending, 0, "{logs}");
     let _ = std::fs::remove_dir_all(&root);
 }

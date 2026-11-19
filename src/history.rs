@@ -58,7 +58,9 @@ impl Want {
     /// re-encoded lossily again, so loss doesn't stack); a lossless pass covers lossless.
     fn covered_by(self, flags: u8) -> bool {
         match self {
-            Want::Video => flags != 0,
+            // Only a video pass: a big GIF optimized as an image (imageopti's history) is
+            // still to be made a video. (`gif_as_image` marks its result as tried too.)
+            Want::Video => flags & F_VIDEO != 0,
             Want::ImageLossless { strip } => flags & (F_LOSSLESS | F_LOSSY) != 0 && (!strip || flags & F_STRIP != 0),
             Want::ImageLossy { strip } => flags & F_LOSSY != 0 && (!strip || flags & F_STRIP != 0),
         }
@@ -310,7 +312,8 @@ impl History {
     pub fn add_content_now(&mut self, hash: ContentHash, size: u64, mode: &'static str) -> Option<(PathBuf, String)> {
         let flag = mode_flag(mode);
         let flags = self.content.entry(hash).or_insert(0);
-        if *flags & flag != 0 {
+        // Every bit of `flag` (a stripped lossy pass is F_LOSSY | F_STRIP), as `add_content`.
+        if *flags & flag == flag {
             return None;
         }
         *flags |= flag;
@@ -470,7 +473,16 @@ mod tests {
         // The cut-off content line is ended before the next one is added.
         let (path3, line) = h.add_content_now([3u8; 16], 30, VIDEO_MODE).unwrap();
         append_lines(&path3, &line, true).unwrap();
-        assert!(History::load(path).contains_content(&[3u8; 16], Want::Video));
+        assert!(History::load(path.clone()).contains_content(&[3u8; 16], Want::Video));
+
+        // A stripped pass on content known from a plain lossy pass is noted durably too
+        // (the check took any shared bit as "already known").
+        let mut h = History::load(path.clone());
+        h.add_content([4u8; 16], 40, "lossy-normal-t93");
+        let (p, line) = h.add_content_now([4u8; 16], 40, "lossy-normal-t93-strip").expect("the strip bit is new");
+        append_lines(&p, &line, true).unwrap();
+        assert!(h.add_content_now([4u8; 16], 40, "lossy-normal-t93-strip").is_none(), "now known");
+        assert!(History::load(path).contains_content(&[4u8; 16], Want::ImageLossy { strip: true }));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -536,6 +548,8 @@ mod tests {
         assert!(h.contains_content(&img, Want::ImageLossless { strip: false }));
         assert!(!h.contains_content(&img, Want::ImageLossy { strip: false }), "lossless doesn't cover lossy");
         assert!(!h.contains_content(&img, Want::ImageLossless { strip: true }), "not stripped");
+        // A big GIF imageopti optimized as an image is still to be made a video.
+        assert!(!h.contains_content(&img, Want::Video), "an image pass is not a video pass");
         assert!(h.has_size(336_517));
 
         let vid = [7u8; 16];

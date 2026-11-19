@@ -26,6 +26,18 @@ Notable changes to mediaopti. Earlier versions are described in their
   can't be read.
 - Pause or Stop during a quality measurement waits for the measuring ffmpeg to end, so its
   encode can be parked or removed ("os error 32" left temporary files behind).
+- Camera MOVs with PCM audio and a timecode track no longer fail with "lost its timecode
+  track": their MKV keeps the timecode as a tag.
+- EPUB, CBZ and Office files whose folder entries were written compressed (Java, Python)
+  keep their optimized pictures: the check expected the folders compressed in the new file.
+- A missing tool (flac, OptiVorbis, qpdf, 7-Zip, gifsicle, oxipng, jpegtran) no longer marks
+  its files as done: they are left for the next run. Without pingo/beeim or ssimulacra2,
+  pictures get the lossless pass and are noted as lossless, so they are searched later.
+- "Remove metadata" removes the padding of FLAC files without cover art too.
+- Big GIFs optimized before as images (imageopti's history) are made into videos; a big GIF
+  that went through the video attempt and the GIF optimizer, then moved or renamed, is
+  recognised for both and not optimized again.
+- A stripped pass on content already known from a plain pass is noted durably at once.
 
 ### Changed
 

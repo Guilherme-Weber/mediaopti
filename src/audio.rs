@@ -327,6 +327,12 @@ pub fn worth_trying(ctx: &Ctx, kind: Kind, path: &Path) -> bool {
         Kind::Flac => flac_read(path).ok().flatten().is_some_and(|f| {
             ((ctx.max.flac_all || !is_modern(&f)) && ctx.tools.has("flac"))
                 || f.blocks.iter().any(|(t, b)| *t == PICTURE && picture_parse(b).is_some_and(|p| has_art(p.data)))
+                // "Remove metadata" drops the padding (`flac`'s no-padding step), when that
+                // alone is worth a new file (libFLAC's usual 8 KiB isn't, in music files).
+                || (ctx.strip && {
+                    let pad: u64 = f.blocks.iter().filter(|(t, _)| *t == PADDING).map(|(_, b)| 4 + b.len() as u64).sum();
+                    pad > 0 && std::fs::metadata(path).is_ok_and(|m| worth_keeping(m.len(), m.len().saturating_sub(pad)))
+                })
         }),
         Kind::Mp3 => mp3_tag(path).ok().flatten().is_some_and(|tag| {
             id3_frames(&tag.body, tag.ver).iter().any(|(id, b)| *id == b"APIC" && apic_data_start(b).is_some_and(|i| has_art(&b[i..])))
@@ -1158,6 +1164,10 @@ mod tests {
         std::fs::create_dir_all(&work).unwrap();
         let r = optimize(&c, Kind::Flac, &flac, &work).unwrap();
         assert!(r.best.is_none(), "nothing to do without strip: {:?}", r.steps);
+        // The engine's cheap look first: a modern FLAC without cover art was never tried,
+        // so its padding stayed even with "Remove metadata" on.
+        assert!(!worth_trying(&c, Kind::Flac, &flac), "nothing to try without strip");
+        assert!(worth_trying(&Ctx { strip: true, ..c.clone() }, Kind::Flac, &flac), "padding to remove");
 
         let c = Ctx { strip: true, ..c };
         let work = dir.join("strip");

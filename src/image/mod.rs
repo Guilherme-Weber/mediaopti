@@ -415,6 +415,56 @@ impl Optimized {
 
 /// Content-history mode for images, compatible with imageopti's history.
 /// The history mode of a pass (imageopti's names; `-strip` when metadata was removed).
+/// The tool a kind can't do without, if it is missing. Without it the chain skips its steps
+/// silently (`run` gives `Ok(false)`), and the file would be remembered as done: it is a
+/// tool problem instead (`ImageResult::ToolUnavailable`, tried again next run).
+pub fn missing_tool(ctx: &Ctx, kind: Kind) -> Option<&'static str> {
+    let need: &[&'static str] = match kind {
+        Kind::Png | Kind::Bmp | Kind::Tga => &["oxipng"],
+        Kind::Jpg => &["jpegtran"],
+        Kind::Gif => &["gifsicle"],
+        // Cover art goes through the picture chains.
+        Kind::Flac | Kind::LosslessAudio => &["flac", "oxipng", "jpegtran"],
+        Kind::Wav => &["flac"],
+        Kind::Ogg => &["optivorbis"],
+        Kind::Mp3 | Kind::Doc | Kind::Cbz => &["oxipng", "jpegtran"],
+        Kind::Cbr => &["7z", "oxipng", "jpegtran"],
+        // Its JPEGs are re-optimized through jpegtran and checked with djpeg.
+        Kind::Pdf => &["qpdf", "jpegtran", "djpeg"],
+    };
+    need.iter().copied().find(|t| !ctx.tools.has(t))
+}
+
+/// Whether the visually lossless search can run on a picture of this kind: the scorer and
+/// one lossy encoder (pingo and beeim are downloaded, not shipped). Without them it gets
+/// the lossless pass and is noted as lossless, so it is searched once they are there.
+pub fn lossy_tools_present(ctx: &Ctx, kind: Kind) -> bool {
+    let t = &ctx.tools;
+    let jpeg_encoder = t.has("djpeg") && (t.has("cjpegli") || t.has("cjpeg"));
+    let (png, jpg) = (t.has("beeim") || t.has("pingo"), jpeg_encoder || t.has("pingo"));
+    t.has("ssimulacra2")
+        && match kind {
+            Kind::Png | Kind::Bmp | Kind::Tga => png,
+            Kind::Jpg => jpg,
+            // Comic pages and cover art may be either.
+            Kind::Cbz | Kind::Cbr | Kind::Flac | Kind::Mp3 | Kind::LosslessAudio => png && jpg,
+            // Its pictures become JPEGs, and its pages are rendered to check them.
+            Kind::Pdf => t.has("mutool") && jpeg_encoder,
+            _ => true,
+        }
+}
+
+/// Whether a file of this kind has a visually lossless part under `ctx` (PDFs only with the
+/// PDF option).
+pub fn has_lossy_part(ctx: &Ctx, kind: Kind) -> bool {
+    ctx.lossy
+        && match kind {
+            Kind::Png | Kind::Jpg | Kind::Bmp | Kind::Tga | Kind::Cbz | Kind::Cbr | Kind::Flac | Kind::Mp3 | Kind::LosslessAudio => true,
+            Kind::Pdf => ctx.lossy_docs,
+            _ => false,
+        }
+}
+
 pub fn mode(lossy: bool, strip: bool) -> &'static str {
     match (lossy, strip) {
         (true, false) => "lossy-normal-t93",
@@ -951,6 +1001,50 @@ mod tests {
     fn make(ff: &Path, args: &[&str], out: &Path) {
         let ok = std::process::Command::new(ff).args(["-v", "error", "-y"]).args(args).arg(out).status().unwrap().success();
         assert!(ok, "could not make {}", out.display());
+    }
+
+    /// A missing tool used to make its files "kept" and remembered for good (WAV/OGG without
+    /// flac/optivorbis, PDFs without qpdf...); and pictures done without pingo/beeim were
+    /// remembered as searched lossily.
+    #[test]
+    fn missing_tools_are_a_tool_problem_not_a_result() {
+        let Some(t) = tools() else {
+            skip_test!("tools not found");
+            return;
+        };
+        let full = ctx(t.clone(), true);
+        assert_eq!(missing_tool(&full, Kind::Mp3), None);
+        let without = |names: &[&str]| ctx(t.clone().without(names), true);
+        for (tool, kinds) in [
+            ("flac", &[Kind::Wav, Kind::Flac, Kind::LosslessAudio][..]),
+            ("optivorbis", &[Kind::Ogg]),
+            ("qpdf", &[Kind::Pdf]),
+            ("7z", &[Kind::Cbr]),
+            ("gifsicle", &[Kind::Gif]),
+            ("jpegtran", &[Kind::Jpg, Kind::Doc, Kind::Cbz, Kind::Mp3]),
+            ("oxipng", &[Kind::Png, Kind::Bmp]),
+        ] {
+            let c = without(&[tool]);
+            for &k in kinds {
+                assert_eq!(missing_tool(&c, k), Some(tool), "{k:?}");
+            }
+        }
+        if full.tools.has("pingo") || full.tools.has("beeim") {
+            assert!(lossy_tools_present(&full, Kind::Png));
+        }
+        assert!(!lossy_tools_present(&without(&["pingo", "beeim"]), Kind::Png));
+        assert!(!lossy_tools_present(&without(&["ssimulacra2"]), Kind::Jpg));
+        assert!(lossy_tools_present(&without(&["pingo", "beeim"]), Kind::Gif), "no lossy search there anyway");
+        // Comics and cover art hold either kind of picture; PDF pages are rendered to check.
+        assert!(!lossy_tools_present(&without(&["pingo", "beeim"]), Kind::Cbz));
+        assert!(!lossy_tools_present(&without(&["pingo", "beeim"]), Kind::Mp3));
+        assert!(!lossy_tools_present(&without(&["mutool"]), Kind::Pdf));
+        assert!(has_lossy_part(&full, Kind::Cbz) && !has_lossy_part(&full, Kind::Pdf), "PDF only with its option");
+        assert!(!has_lossy_part(&ctx(t.clone(), false), Kind::Png));
+        let summary = t.clone().without(&["pingo", "beeim"]).summary();
+        assert!(summary.contains("unavailable for PNG"), "{summary}");
+        let summary = t.clone().without(&["ssimulacra2"]).summary();
+        assert!(summary.contains("unavailable for pictures"), "{summary}");
     }
 
     #[test]

@@ -112,7 +112,9 @@ impl Engine {
                 .filter(|(f, s)| inner.history.has_size(**s) && !is_generated_name(f))
                 .map(|(f, s)| (f, inner.want(f, *s)))
                 .filter(|(f, want)| match want {
-                    history::Want::Video => !inner.history.contains(f),
+                    // A big GIF known as a video but not yet as an image may have its GIF pass
+                    // in the content history too (`place` would send it to the optimizer).
+                    history::Want::Video => !inner.history.contains(f) || (args::is_gif(f) && !inner.history.contains_image(f, inner.lossy_for(f), inner.redo_stripped())),
                     _ => !inner.history.contains_image(f, inner.lossy_for(f), inner.redo_stripped()),
                 })
                 .map(|(f, want)| (f.clone(), want))
@@ -127,10 +129,20 @@ impl Engine {
             let mut inner = self.lock();
             let mut hits = 0;
             for ((file, hash), want) in hashed.into_iter().zip(wants) {
-                if hash.is_some_and(|h| inner.history.contains_content(&h, want)) {
+                if let Some(h) = hash.filter(|h| inner.history.contains_content(h, want)) {
                     match want {
                         history::Want::Video => {
                             inner.history.add(&file);
+                            // A GIF that went through the video attempt and the GIF optimizer
+                            // (moved or renamed since): known for its GIF pass too, else
+                            // `place` sends it to the optimizer again.
+                            if args::is_gif(&file) {
+                                let (lossy, strip) = (inner.lossy_for(&file), inner.redo_stripped());
+                                let as_image = if lossy { history::Want::ImageLossy { strip } } else { history::Want::ImageLossless { strip } };
+                                if inner.history.contains_content(&h, as_image) {
+                                    inner.history.add_image(&file, image::mode(lossy, strip));
+                                }
+                            }
                         }
                         history::Want::ImageLossy { strip } => inner.history.add_image(&file, image::mode(true, strip)),
                         history::Want::ImageLossless { strip } => inner.history.add_image(&file, image::mode(false, strip)),

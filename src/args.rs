@@ -100,6 +100,9 @@ pub struct Streams {
     pub duration_is_estimate: bool,
     /// Data tracks by tag (`tmcd` timecode, `qtvr`, `gpmd` telemetry...).
     pub data: Vec<String>,
+    /// The start timecode (`timecode` stream tag): a `tmcd` track's value in MOV/MP4, a
+    /// `TIMECODE` tag on the video in MKV (which has no timecode tracks).
+    pub timecode: Option<String>,
     /// HDR transfer (PQ or HLG) on the main picture.
     pub hdr: bool,
     /// HDR10 static metadata on the first frame (filled by the engine for HDR files only).
@@ -195,6 +198,11 @@ impl Streams {
                 continue;
             }
             in_tags = false;
+            if s.timecode.is_none() {
+                if let Some((_, v)) = line.split_once(':').filter(|(k, _)| k.trim().eq_ignore_ascii_case("timecode")) {
+                    s.timecode = Some(v.trim().to_string());
+                }
+            }
             if line.contains("DOVI configuration record") {
                 s.dolby_vision = true;
             }

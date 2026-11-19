@@ -94,6 +94,13 @@ impl Tools {
         self.paths.contains_key(name)
     }
 
+    /// The same tools without `names` (tests: a machine missing them).
+    #[cfg(test)]
+    pub fn without(mut self, names: &[&str]) -> Self {
+        self.paths.retain(|k, _| !names.contains(k));
+        self
+    }
+
     /// e.g. "found: beeim, oxipng, ... | missing: pingo, ect"
     pub fn summary(&self) -> String {
         let (found, missing): (Vec<&str>, Vec<&str>) = NAMES.iter().partition(|n| self.has(n));
@@ -106,6 +113,18 @@ impl Tools {
                 " | run through a Scoop shim with arguments (Stop and Pause reach only the shim): {}",
                 self.behind_shims.join(", ")
             ));
+        }
+        // What `image::lossy_tools_present` decides per file, said once.
+        let no_png = !self.has("beeim") && !self.has("pingo");
+        let no_jpg = !(self.has("djpeg") && (self.has("cjpegli") || self.has("cjpeg"))) && !self.has("pingo");
+        let what = match (self.has("ssimulacra2"), no_png, no_jpg) {
+            (false, ..) | (true, true, true) => Some("pictures (needs ssimulacra2, and pingo or beeim for PNG, cjpegli or cjpeg for JPEG)"),
+            (true, true, false) => Some("PNG, comics and cover art (needs pingo or beeim)"),
+            (true, false, true) => Some("JPEG, comics and cover art (needs djpeg with cjpegli or cjpeg, or pingo)"),
+            (true, false, false) => None,
+        };
+        if let Some(what) = what {
+            s.push_str(&format!(" | visually lossless search unavailable for {what}: they get the lossless pass, noted as lossless"));
         }
         s
     }

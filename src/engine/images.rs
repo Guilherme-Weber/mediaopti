@@ -217,7 +217,17 @@ impl Engine {
             inner.run.images_total += 1;
             inner.run.stage_total[2] += 1;
         }
+        // Its new content (or the kept GIF's) went through the video attempt as well: moved
+        // or renamed later, it is recognised as done for video too, not encoded again.
+        let tried_as_video = match &result {
+            ImageResult::Smaller { content, .. } | ImageResult::Kept { content, .. } => *content,
+            _ => None,
+        };
         self.finish_image(input, lossy, result);
+        if let Some((hash, size)) = tried_as_video {
+            self.lock().history.add_content(hash, size, crate::history::VIDEO_MODE);
+            self.schedule_history_save();
+        }
         outcome
     }
 
@@ -358,10 +368,16 @@ impl Engine {
                 inner.run.stage_done[stage] += 1;
             }
             inner.cpu_progress.remove(path);
+            // A GIF here that is known as a video went through the video attempt: its new
+            // content counts as tried for video too (moved later, it isn't encoded again).
+            let tried_as_video = args::is_gif(path) && inner.history.contains(path);
             let mut remember = |inner: &mut Inner, content: Option<(ContentHash, u64)>| {
                 inner.history.add_image(path, mode);
                 if let Some((hash, size)) = content {
                     inner.history.add_content(hash, size, mode);
+                    if tried_as_video {
+                        inner.history.add_content(hash, size, crate::history::VIDEO_MODE);
+                    }
                 }
                 remembered = true;
             };
@@ -763,6 +779,9 @@ pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, dispo
     if system::hard_link_count(path).unwrap_or(1) > 1 {
         return ImageResult::Skipped("it is a hard link (several names for one file)".into());
     }
+    if let Some(tool) = image::missing_tool(ctx, kind) {
+        return ImageResult::ToolUnavailable(format!("{tool} is missing"));
+    }
     // Most music has nothing to try: don't copy (to C:) or decode it.
     if kind.is_audio() && !crate::audio::worth_trying(ctx, kind, path) {
         if ctx.gate.short_of_memory.load(std::sync::atomic::Ordering::Relaxed) {
@@ -773,7 +792,10 @@ pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, dispo
     // A big picture's visually lossless search runs alone, and only with its memory free;
     // otherwise this file gets the lossless pass only (and is tried again later).
     let pictured = matches!(kind, image::Kind::Png | image::Kind::Jpg | image::Kind::Bmp | image::Kind::Tga);
-    let lossy_need = if ctx.lossy && pictured { image::pixel_count(path).map_or(0, |px| px.saturating_mul(LOSSY_BYTES_PER_PIXEL)) } else { 0 };
+    // Without its tools the lossy part can't run: lossless only, noted as lossless (said once
+    // at the start of the batch, in the tools line). Decided first: no memory wait for it.
+    let no_lossy_tools = image::has_lossy_part(ctx, kind) && !image::lossy_tools_present(ctx, kind);
+    let lossy_need = if ctx.lossy && pictured && !no_lossy_tools { image::pixel_count(path).map_or(0, |px| px.saturating_mul(LOSSY_BYTES_PER_PIXEL)) } else { 0 };
     let _big_job = if lossy_need >= BIG_LOSSY_JOB {
         let Some(guard) = one_big_lossy_job(&ctx.gate) else { return ImageResult::Stopped };
         Some(guard)
@@ -783,9 +805,9 @@ pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, dispo
     let lossless_ctx;
     let refused = system::lossless_only_in_tests(path)
         || lossy_need >= BIG_LOSSY_JOB && !big_lossy_fits(lossy_need, system::memory_status().map(|m| m.available_commit));
-    let ctx = if ctx.lossy && refused {
+    let ctx = if ctx.lossy && (refused || no_lossy_tools) {
         opts.lossless_only.store(true, Ordering::Relaxed);
-        if let Some(warn) = &opts.warn {
+        if let Some(warn) = opts.warn.as_ref().filter(|_| refused) {
             warn(format!(
                 "{}: its visually lossless pass needs about {:.0} GB of free memory; lossless only this time",
                 path.display(),

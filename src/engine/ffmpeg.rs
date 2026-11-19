@@ -568,7 +568,9 @@ pub(super) fn streams_lost(before: &args::Streams, after: &args::Streams) -> Opt
         }
     }
     let tmcd = |s: &args::Streams| s.data.iter().filter(|t| *t == "tmcd").count();
-    if tmcd(after) < tmcd(before) {
+    // MKV has no timecode tracks: the muxer keeps the value as a TIMECODE tag instead.
+    let timecode_kept = before.timecode.is_some() && after.timecode == before.timecode;
+    if tmcd(after) < tmcd(before) && !timecode_kept {
         lost.push("its timecode track".into());
     }
     for (what, b, a) in [
@@ -792,6 +794,14 @@ mod tests {
         let changed = Streams { tags: vec![("toolname".into(), "WMEU".into()), ("vbr_peak".into(), "1".into())], ..before.clone() };
         assert!(super::streams_lost(&wmv, &changed).unwrap().contains("its tags (vbr peak)"));
         assert!(!super::same_tag_key("vbr peak", "vbrpeak"));
+        // A timecode track that became an MKV tag with the same value is kept; another value
+        // or none is lost.
+        let mov = Streams { data: vec!["tmcd".into()], timecode: Some("01:00:00:00".into()), ..before.clone() };
+        let mkv = Streams { timecode: Some("01:00:00:00".into()), ..before.clone() };
+        assert_eq!(super::streams_lost(&mov, &mkv), None);
+        assert!(super::streams_lost(&mov, &before).unwrap().contains("timecode track"));
+        let other = Streams { timecode: Some("02:00:00:00".into()), ..before.clone() };
+        assert!(super::streams_lost(&mov, &other).unwrap().contains("timecode track"));
         // Both spellings present with different values: each finds its own.
         let both = Streams { tags: vec![("foo bar".into(), "A".into()), ("foo_bar".into(), "B".into())], ..before };
         assert_eq!(super::streams_lost(&both, &both), None);

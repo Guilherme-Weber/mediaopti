@@ -272,6 +272,39 @@ fn a_second_video_track_is_never_dropped() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A camera MOV with PCM audio and a timecode track becomes an MKV (with FLAC): MKV has no
+/// timecode tracks but keeps the value as a TIMECODE tag. That counted as "lost its
+/// timecode track", a failure remembered after the whole encode.
+#[test]
+fn a_camera_timecode_survives_as_an_mkv_tag() {
+    let Some(ff) = ffmpeg() else {
+        skip_test!("bundled ffmpeg not found");
+        return;
+    };
+    let root = test_dir("timecode-mkv");
+    let media = root.join("media");
+    std::fs::create_dir_all(&media).unwrap();
+    make(&ff, &["-f", "lavfi", "-i", "testsrc2=size=640x360:rate=25:duration=2,noise=alls=30:allf=t", "-f", "lavfi", "-i", "sine=d=2",
+        "-c:v", "libx264", "-qp", "0", "-c:a", "pcm_s16le", "-timecode", "01:00:00:00"], &media.join("C0001.MOV"));
+    let rt = runtime();
+    let (engine, rec) = new_engine(&rt, &root, ff.clone());
+    rt.block_on(async {
+        engine.apply_options(opts("av1_nvenc", 1.0));
+        engine.load_dir(media.clone()).await;
+        engine.clone().run_batch(opts("av1_nvenc", 1.0)).await;
+    });
+    let logs = rec.logs.lock().unwrap().join("\n");
+    println!("{logs}");
+    assert!(!logs.contains("timecode track"), "{logs}");
+    assert_eq!(engine.snapshot().failed_this_run, 0, "{logs}");
+    let out = media.join("C0001.mkv");
+    assert!(out.exists(), "{logs}");
+    let listing = Command::new(&ff).args(["-hide_banner", "-i"]).arg(&out).output().unwrap();
+    let after = crate::args::Streams::parse(&String::from_utf8_lossy(&listing.stderr));
+    assert_eq!(after.timecode.as_deref(), Some("01:00:00:00"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A phone video's tags survive: recording date, place, make and model in the MP4, and the
 /// date in an MKV (a QuickTime date listed twice used to be dropped there).
 #[test]

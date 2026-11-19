@@ -283,7 +283,8 @@ fn repack(ctx: &Ctx, kind: Kind, src: &Path, work: &Path) -> Result<Optimized, E
                 zout.start_file(name, options)?;
                 io::copy(&mut f, &mut zout)?;
             }
-            expected.push(Expected { name: f.name_raw().to_vec(), crc, stored, dir: f.is_dir() });
+            // `add_directory` always writes a folder stored (it has no data either way).
+            expected.push(Expected { name: f.name_raw().to_vec(), crc, stored: stored || f.is_dir(), dir: f.is_dir() });
         }
         start = end;
     }
@@ -576,6 +577,34 @@ mod tests {
         assert!(ok);
         let r = optimize(&c, Kind::Cbz, &enc, &dir).unwrap();
         assert!(r.best.is_none() && r.note.as_deref().is_some_and(|n| n.contains("encrypted")), "{:?}", r.note);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Java's ZipOutputStream and Python's zipfile write folder entries deflated; the zip
+    /// crate writes them stored. The check wanted the original method, so every such EPUB,
+    /// CBZ or Office file had its repack thrown away.
+    #[test]
+    fn deflated_folder_entries_do_not_spoil_the_repack() {
+        let Some(c) = ctx() else {
+            skip_test!("tools not found");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("mo-zip-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pic = png_bytes(&c, &dir);
+        let src = dir.join("book.cbz");
+        let mut z = ZipWriter::new(File::create(&src).unwrap());
+        let deflated = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        z.start_file("pages/", deflated).unwrap(); // a folder, written as Java does
+        z.start_file("pages/01.png", SimpleFileOptions::default().compression_method(CompressionMethod::Stored)).unwrap();
+        z.write_all(&pic).unwrap();
+        z.finish().unwrap();
+        assert!(!entries(&src)[0].1, "the folder entry is deflated in the original");
+        let work = dir.join("w");
+        std::fs::create_dir_all(&work).unwrap();
+        let r = optimize(&c, Kind::Cbz, &src, &work).unwrap();
+        assert!(r.best.is_some(), "repack thrown away: {:?}", r.note);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
