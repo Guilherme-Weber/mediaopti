@@ -3,7 +3,10 @@
 Notable changes to mediaopti. Earlier versions are described in their
 [GitHub releases](https://github.com/Guilherme-Weber/mediaopti/releases).
 
-## Unreleased
+## 3.2.0
+
+A release of the window only: what is processed, how it is verified and the results are the
+same as in 3.1.0. Built with Rust 1.100.
 
 ### Changed
 
