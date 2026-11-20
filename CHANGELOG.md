@@ -3,7 +3,7 @@
 Notable changes to mediaopti. Earlier versions are described in their
 [GitHub releases](https://github.com/Guilherme-Weber/mediaopti/releases).
 
-## Unreleased
+## 3.3.2
 
 ### Changed
 
