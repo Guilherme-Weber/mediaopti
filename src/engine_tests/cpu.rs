@@ -150,6 +150,14 @@ fn a_lower_quality_floor_redoes_pictures_done_at_a_higher_one() {
     std::fs::rename(&png, moved.join("photo.png")).unwrap();
     let (pending, logs) = run(4);
     assert_eq!(pending, 1, "done at 93, redone at 80: {logs}");
+    // The "Saved" line gives the score the lossy result was measured at.
+    let score: f64 = logs
+        .split("(lossy, SSIMULACRA2 ")
+        .nth(1)
+        .and_then(|rest| rest.split(')').next())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("no score in the log: {logs}"));
+    assert!((80.0..100.0).contains(&score), "{score}: {logs}");
     let (pending, logs) = run(2);
     assert_eq!(pending, 0, "done at 80, known at 93: {logs}");
     // Moved again and scanned at 93, then 80 chosen before Start (no new scan): it was

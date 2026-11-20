@@ -205,7 +205,7 @@ impl Engine {
             ));
             if run.images_total > 0 {
                 self.log(format!(
-                    "Images and other files: {} processed, {} made smaller with a visually lossless (lossy) pass",
+                    "Images and other files: {} processed, {} made smaller with a lossy pass (scores in their lines)",
                     run.images_done, run.images_lossy
                 ));
             }

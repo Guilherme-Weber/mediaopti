@@ -9,7 +9,7 @@ and replaced originals go to the Recycle Bin (or a backup folder) by default.
 | Type | Formats | Method |
 |---|---|---|
 | Videos | mp4, mkv, mov, avi, wmv, webm, flv, m4v, mts, m2ts, ts, 3gp, mpg, mpeg; GIFs over 1 MB | NVENC AV1/HEVC/H.264 or x264. If the preset isn't smaller, stronger settings are retried while VMAF stays ≥ 93. Audio tracks, subtitles, attachments, cover pictures, chapters, tags (recording date, place, camera) and HDR10 metadata are kept (MKV when MP4 can't hold them); PCM audio becomes FLAC. |
-| Images | png, jpg, gif, bmp, tga | beeim/pingo, oxipng, ECT, mozjpeg, jpegli, gifsicle. Lossless, or visually lossless (SSIMULACRA2 ≥ 93). |
+| Images | png, jpg, gif, bmp, tga | beeim/pingo, oxipng, ECT, mozjpeg, jpegli, gifsicle. Lossless, or lossy at a chosen floor: SSIMULACRA2 ≥ 93 (visually lossless), 85 or 80. The log gives each lossy result's score. |
 | Audio | flac, mp3, ogg, wav, m4a (ALAC), aiff, ape, wv, tta | FLAC and OptiVorbis. Cover art optimized; FLAC and Ogg repacked; the decoded audio stays identical. |
 | Documents | pdf, docx/xlsx/pptx, odt/ods/odp/odg, epub, cbz, cbr | qpdf, MuPDF and 7-Zip. Pictures inside optimized. Text and drawings are never changed, and PDF pages are rendered and compared. |
 

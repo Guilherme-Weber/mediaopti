@@ -908,9 +908,10 @@ pub(crate) fn ssim_score(ctx: &Ctx, a: &Path, b: &Path) -> Result<Option<f64>, R
 pub(crate) type Encoder<'e> = Box<dyn FnMut(u32) -> Result<Option<PathBuf>, RunError> + Send + 'e>;
 
 /// Binary-searches quality `n` in `lo..=hi` (higher = better) for the smallest output that
-/// still scores >= target and is below `limit` bytes. One probe at a fairly strong setting
-/// first: already-optimized images don't get smaller there, and are skipped cheaply.
-pub(crate) fn quality_search(ctx: &Ctx, reference: &Path, lo: u32, hi: u32, encode: &mut Encoder, limit: u64) -> Result<Option<PathBuf>, RunError> {
+/// still scores >= target and is below `limit` bytes, with its score. One probe at a fairly
+/// strong setting first: already-optimized images don't get smaller there, and are skipped
+/// cheaply.
+pub(crate) fn quality_search(ctx: &Ctx, reference: &Path, lo: u32, hi: u32, encode: &mut Encoder, limit: u64) -> Result<Option<(PathBuf, f64)>, RunError> {
     let probe = hi - (hi - lo) / 4;
     let first = encode(probe)?;
     let (mut lo, mut hi) = (i64::from(lo), i64::from(hi));
@@ -928,7 +929,7 @@ pub(crate) fn quality_search(ctx: &Ctx, reference: &Path, lo: u32, hi: u32, enco
         }
         Some(_) => {}
     }
-    let mut best: Option<(PathBuf, u64)> = None;
+    let mut best: Option<(PathBuf, u64, f64)> = None;
     let mut cached = Some((probe, first));
     while lo <= hi {
         let n = ((lo + hi) / 2) as u32;
@@ -947,24 +948,44 @@ pub(crate) fn quality_search(ctx: &Ctx, reference: &Path, lo: u32, hi: u32, enco
             hi = i64::from(n) - 1; // too big to be useful: go lower, no need to score it
             continue;
         }
-        if ssim_score(ctx, reference, &out)?.is_some_and(|q| q >= ctx.target) {
-            if best.as_ref().is_none_or(|(_, b)| s < *b) {
-                best = Some((out, s));
+        match ssim_score(ctx, reference, &out)?.filter(|q| *q >= ctx.target) {
+            Some(q) => {
+                if best.as_ref().is_none_or(|(_, b, _)| s < *b) {
+                    best = Some((out, s, q));
+                }
+                hi = i64::from(n) - 1;
             }
-            hi = i64::from(n) - 1;
-        } else {
-            lo = i64::from(n) + 1;
+            None => lo = i64::from(n) + 1,
         }
     }
-    Ok(best.map(|(p, _)| p))
+    Ok(best.map(|(p, _, q)| (p, q)))
+}
+
+/// A lossy step's label carries the score its result was measured at (`beeim-quantizer=81~87.4`):
+/// it reaches the log through comics, cover art and PDFs, whose labels nest their pictures'.
+pub(crate) fn scored_label(label: &str, score: f64) -> String {
+    format!("{label}~{:.1}", (score * 10.0).floor() / 10.0)
+}
+
+/// The lowest score in a result's steps (see [`scored_label`]): the quality of its most
+/// changed picture. `None` when no lossy step was scored.
+pub fn lowest_score(steps: &[String]) -> Option<f64> {
+    steps
+        .iter()
+        .flat_map(|s| s.split('~').skip(1))
+        .filter_map(|after| {
+            let n: String = after.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+            n.parse::<f64>().ok()
+        })
+        .min_by(f64::total_cmp)
 }
 
 /// Tries each method, each limited by the best result so far.
 pub(crate) fn search_methods(ctx: &Ctx, reference: &Path, methods: Vec<(&str, u32, u32, Encoder)>, limit: u64) -> Result<Option<(PathBuf, String)>, RunError> {
-    let found = |name: &str, c: PathBuf| {
+    let found = |name: &str, (c, score): (PathBuf, f64)| {
         let s = size(&c).unwrap_or(u64::MAX);
         let q: String = c.file_stem().map_or_default(|f| f.to_string_lossy().chars().filter(char::is_ascii_digit).collect());
-        (c, format!("{name}={q}"), s)
+        (c, scored_label(&format!("{name}={q}"), score), s)
     };
     let side_by_side = if methods.len() > 1 { methods_at_once(ctx, reference, methods.len()) } else { None };
     if let Some(_promise) = side_by_side {
@@ -1140,6 +1161,19 @@ fn lossy_jpeg(ctx: &Ctx, work: &Path, src: &Path, chain: &mut Chain, ver: &Verif
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The score rides in the label, cut (never rounded up past what was measured), and the
+    /// lowest one is found inside a comic's or a cover's nested labels.
+    #[test]
+    fn lossy_labels_carry_their_score() {
+        assert_eq!(scored_label("beeim-quantizer=81", 87.46), "beeim-quantizer=81~87.4");
+        assert_eq!(scored_label("jpegli-q=90", 93.0), "jpegli-q=90~93.0");
+        let comic = vec!["zip-repack[3 img: beeim-quantizer=70~85.9+jpegli-q=88~93.2+oxipng]".to_string(), "oxipng".into()];
+        assert_eq!(lowest_score(&comic), Some(85.9));
+        assert_eq!(lowest_score(&["cover-art[1: pingo-quality=90~80.1]".to_string()]), Some(80.1));
+        assert_eq!(lowest_score(&["qpdf+2 jpeg+3 img lossy=ssim93~100.0".to_string()]), Some(100.0));
+        assert_eq!(lowest_score(&["oxipng".to_string(), "ect-9".into()]), None);
+    }
 
     fn tools() -> Option<Tools> {
         let ffmpeg = Path::new(env!("CARGO_MANIFEST_DIR")).join("bin").join("ffmpeg.exe");

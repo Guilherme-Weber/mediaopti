@@ -3,6 +3,15 @@
 Notable changes to mediaopti. Earlier versions are described in their
 [GitHub releases](https://github.com/Guilherme-Weber/mediaopti/releases).
 
+## Unreleased
+
+### Changed
+
+- A file made smaller by a lossy pass says the quality it was measured at, instead of
+  "visually lossless": "Saved 1.2 MB (41%) from photo.png (lossy, SSIMULACRA2 84.6)". For a
+  comic or a song's cover art it is the lowest score among its pictures; for a PDF, its
+  lowest-scoring page.
+
 ## 3.3.1
 
 ### Changed

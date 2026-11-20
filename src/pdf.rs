@@ -120,20 +120,24 @@ pub fn optimize(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, RunErro
             args.extend([u, src.into(), out.clone().into()]);
             ctx.phase("rewriting", &[]);
             let ran = qpdf(ctx, args, Capture::None)?;
-            let ok = ran.success
-                && size(&out) < src_size
-                && reference.accepts(ctx, &out)?
-                && ((update.lossy == 0 && !damaged) || {
+            // The lowest page score when pages were checked (100: none changed, or not checked).
+            let pages = if ran.success && size(&out) < src_size && reference.accepts(ctx, &out)? {
+                if update.lossy == 0 && !damaged {
+                    Some(100.0)
+                } else {
                     ctx.phase("checking pages", &[]);
                     pages_look_same(ctx, src, &out, &dir.join("render"))?
-                });
-            if ok {
+                }
+            } else {
+                None
+            };
+            if let Some(score) = pages {
                 let mut label = if damaged { "qpdf (damaged original, pages checked)" } else { "qpdf" }.to_string();
                 if update.lossless > 0 {
                     label += &format!("+{} jpeg", update.lossless);
                 }
                 if update.lossy > 0 {
-                    label += &format!("+{} img lossy=ssim{}", update.lossy, ctx.target);
+                    label += &image::scored_label(&format!("+{} img lossy=ssim{}", update.lossy, ctx.target), score);
                 }
                 return Ok(Optimized::found(Some(out), vec![label]));
             }
@@ -149,7 +153,7 @@ pub fn optimize(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, RunErro
         && reference.accepts(ctx, &out)?
         && (!damaged || {
             ctx.phase("checking pages", &[]);
-            pages_look_same(ctx, src, &out, &work.join("render"))?
+            pages_look_same(ctx, src, &out, &work.join("render"))?.is_some()
         });
     let label = if damaged { "qpdf (damaged original, pages checked)" } else { "qpdf" };
     Ok(if ok { Optimized::found(Some(out), vec![label.into()]) } else { Optimized::nothing() })
@@ -157,36 +161,39 @@ pub fn optimize(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, RunErro
 
 /// Renders every page of both PDFs at 96 dpi (screen size); each page of `b` must be
 /// identical or score >= target against `a`: the document must read and look the same,
-/// not just its images.
-fn pages_look_same(ctx: &Ctx, a: &Path, b: &Path, work: &Path) -> Result<bool, RunError> {
-    let Some(mutool) = ctx.tools.get("mutool") else { return Ok(false) };
+/// not just its images. `Some(lowest page score)` (100 when every page is identical) when
+/// they do.
+fn pages_look_same(ctx: &Ctx, a: &Path, b: &Path, work: &Path) -> Result<Option<f64>, RunError> {
+    let Some(mutool) = ctx.tools.get("mutool") else { return Ok(None) };
     let mut rendered = Vec::new();
     for (name, p) in [("a", a), ("b", b)] {
         let dir = work.join(name);
         if std::fs::create_dir_all(&dir).is_err() {
-            return Ok(false);
+            return Ok(None);
         }
         let args = crate::os_args!["draw", "-q", "-r", "96", "-o", dir.join("p%05d.png"), p];
         if !tools::run(mutool, args, None, Capture::None, ctx.timeout * 2, &ctx.gate)?.success {
-            return Ok(false);
+            return Ok(None);
         }
         let mut files: Vec<PathBuf> = std::fs::read_dir(&dir).map_or_else(|_| Vec::new(), |d| d.filter_map(|e| e.ok().map(|e| e.path())).collect());
         files.sort();
         rendered.push(files);
     }
     if rendered[0].is_empty() || rendered[0].len() != rendered[1].len() {
-        return Ok(false);
+        return Ok(None);
     }
+    let mut lowest = 100.0_f64;
     for (x, y) in rendered[0].iter().zip(&rendered[1]) {
         if std::fs::read(x).ok() == std::fs::read(y).ok() {
             continue;
         }
-        if !image::ssim_score(ctx, x, y)?.is_some_and(|s| s >= ctx.target) {
-            return Ok(false);
+        match image::ssim_score(ctx, x, y)?.filter(|s| *s >= ctx.target) {
+            Some(s) => lowest = lowest.min(s),
+            None => return Ok(None),
         }
     }
     let _ = std::fs::remove_dir_all(work);
-    Ok(true)
+    Ok(Some(lowest))
 }
 
 struct Update {
@@ -528,7 +535,7 @@ mod tests {
                     assert!(!r.steps[0].contains("lossy"), "{:?}", r.steps);
                 }
                 if r.steps[0].contains("lossy") {
-                    assert!(pages_look_same(c, &pdf, &best, &work.join("again")).unwrap(), "{name}: pages differ");
+                    assert!(pages_look_same(c, &pdf, &best, &work.join("again")).unwrap().is_some(), "{name}: pages differ");
                 }
             }
         }

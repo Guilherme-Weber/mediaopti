@@ -42,6 +42,16 @@ fn may_admit(inner: &mut Inner, memory: Option<&system::MemoryStatus>) -> bool {
 
 
 
+/// What a "Saved" line says about quality: the score the lossy result was measured at (its
+/// most changed picture or page), nothing for a lossless result.
+fn quality_note(lossy: bool, score: Option<f64>) -> String {
+    match (lossy, score) {
+        (false, _) => String::new(),
+        (true, Some(s)) => format!(" (lossy, SSIMULACRA2 {s:.1})"),
+        (true, None) => " (lossy)".into(),
+    }
+}
+
 /// Log a progress line every this many images (one line per image would flood the log).
 const PROGRESS_EVERY: usize = 250;
 
@@ -49,8 +59,10 @@ pub(super) enum ImageResult {
     Smaller {
         before: u64,
         after: u64,
-        /// A lossy encoder won (quality search labels look like `beeim-quantizer=81`).
+        /// A lossy encoder won (quality search labels look like `beeim-quantizer=81~87.4`).
         lossy: bool,
+        /// SSIMULACRA2 of its most changed picture (`image::lowest_score`), when lossy.
+        score: Option<f64>,
         content: Option<(ContentHash, u64)>,
         /// Converted: the new file's path (the original's name is gone).
         renamed: Option<PathBuf>,
@@ -446,19 +458,20 @@ impl Engine {
                 remembered = true;
             };
             match result {
-                ImageResult::Smaller { before, after, lossy, content, renamed } => {
+                ImageResult::Smaller { before, after, lossy, score, content, renamed } => {
                     inner.run.compressed += 1;
                     inner.run.images_lossy += usize::from(lossy);
                     inner.space_saved_mb += (before - after) as f64 / (1024.0 * 1024.0);
                     remember(&mut inner, content);
                     let saved = format!("{} ({:.0}%)", format_size(before - after), 100.0 * (before - after) as f64 / before.max(1) as f64);
+                    let quality = quality_note(lossy, score);
                     log = Some(match renamed {
                         Some(new) => {
                             inner.history.add_image(&new, mode);
                             inner.moved(path, &new, Some(after));
-                            format!("{tag} Converted {display} to {}, saved {saved}", new.file_name().unwrap_or_default().to_string_lossy())
+                            format!("{tag} Converted {display} to {}, saved {saved}{quality}", new.file_name().unwrap_or_default().to_string_lossy())
                         }
-                        None => format!("{tag} Saved {saved} from {display}{}", if lossy { " (visually lossless)" } else { "" }),
+                        None => format!("{tag} Saved {saved} from {display}{quality}"),
                     });
                 }
                 ImageResult::Kept { content, note } => {
@@ -1061,8 +1074,9 @@ pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, dispo
     }
     restore_or_warn(&target, &attrs, opts);
     let lossy = result.steps.iter().any(|s| s.contains('='));
+    let score = image::lowest_score(&result.steps).filter(|_| lossy);
     let renamed = (target != path).then(|| target.clone());
-    ImageResult::Smaller { before, after, lossy, content: content_of(&target), renamed }
+    ImageResult::Smaller { before, after, lossy, score, content: content_of(&target), renamed }
 }
 
 /// `existing` (the new name's current file) has the same content as `path`: keeps the smaller
