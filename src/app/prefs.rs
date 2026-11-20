@@ -47,7 +47,7 @@ pub(super) const PDFS: &[(u32, &str)] = &[
     (0, "Lossless only"),
 ];
 pub(super) const AUDIO: &[(u32, &str)] = &[
-    (2, "Visually lossless (≥ 93)"),
+    (2, "Lossy, at the Images quality level"),
     (1, "Lossless only"),
 ];
 pub(super) const FIX_EXT: &[(u32, &str)] = &[
@@ -94,7 +94,7 @@ pub(super) struct Prefs {
     pub(super) conv_cbr: bool,
     /// 1 = visually lossless PDF images, 0 = lossless only.
     pub(super) lossy_docs: u32,
-    /// Cover art: 1 = lossless, 2 = visually lossless.
+    /// Cover art: 1 = lossless, 2 = lossy at the picture quality floor (`images`).
     pub(super) audio: u32,
     /// Folder for work files; empty = the system temp folder.
     pub(super) temp_dir: String,
@@ -324,6 +324,7 @@ impl Prefs {
             gif_min_mb: Some(self.gif_min_mb),
             vmaf_floor: Some(self.vmaf_floor),
             images: Some(if self.images_on { self.images } else { 0 }),
+            image_level: Some(self.images),
             convert: None,
             conversions: Some(u32::from(self.conv_wav) | u32::from(self.conv_img) << 1 | u32::from(self.conv_cbr) << 2),
             videos: Some(u32::from(self.videos)),

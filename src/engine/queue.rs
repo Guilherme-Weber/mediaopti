@@ -56,11 +56,15 @@ impl Inner {
         (if audio { self.options.audio } else { self.options.images }) == ImageMode::Lossy
     }
 
-    /// The lossy floor a file is done at: the picture setting for pictures and comics (whose
-    /// pages are pictures), the default for cover art and PDFs.
+    /// The lossy floor a file is done at: the picture setting for pictures, comics (whose
+    /// pages are pictures) and audio with cover art; the default for PDFs and for audio that
+    /// has no lossy part (Ogg, WAV: a lower floor must not redo them for nothing).
     pub(super) fn target_for(&self, file: &Path) -> u32 {
+        use image::Kind;
         match image::kind_of(file) {
-            Some(image::Kind::Png | image::Kind::Jpg | image::Kind::Gif | image::Kind::Bmp | image::Kind::Tga | image::Kind::Cbz | image::Kind::Cbr) => self.options.image_target,
+            Some(
+                Kind::Png | Kind::Jpg | Kind::Gif | Kind::Bmp | Kind::Tga | Kind::Cbz | Kind::Cbr | Kind::Flac | Kind::Mp3 | Kind::LosslessAudio,
+            ) => self.options.image_target,
             _ => image::DEFAULT_TARGET,
         }
     }

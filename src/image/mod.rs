@@ -553,7 +553,8 @@ pub fn has_lossy_part(ctx: &Ctx, kind: Kind) -> bool {
 /// visible change), 85 and 80 (smaller; 80 is about what Pinga's lossy mode gives: on five
 /// big PNGs it scored 81-83 at ~25% of the size, with slight banding seen when zoomed in).
 pub const IMAGE_TARGETS: [u32; 3] = [93, 85, 80];
-/// Audio cover art and PDF pictures keep this floor whatever the picture setting.
+/// The default floor; PDF pictures keep it whatever the picture setting (cover art follows
+/// the setting).
 pub const DEFAULT_TARGET: u32 = 93;
 
 /// History mode of a pass at the default floor (imageopti's names).

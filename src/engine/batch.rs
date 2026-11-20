@@ -146,7 +146,7 @@ impl Engine {
             self.log(format!(
                 "Starting {images} images and other files | images {}, audio {}",
                 mode_label(options.images, options.image_target),
-                mode_label(options.audio, crate::image::DEFAULT_TARGET)
+                mode_label(options.audio, options.image_target)
             ));
             self.log(self.tools().summary());
         }

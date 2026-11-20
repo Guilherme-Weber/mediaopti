@@ -91,12 +91,9 @@ pub(super) struct CpuCtx {
 
 impl CpuCtx {
     pub(super) fn new(image: image::Ctx, options: &crate::args::Options, slots: usize) -> Self {
-        // Cover art keeps the default floor (the picture setting is for pictures).
-        let audio = image::Ctx {
-            lossy: options.audio == crate::args::ImageMode::Lossy,
-            target: f64::from(image::DEFAULT_TARGET),
-            ..image.clone()
-        };
+        // Cover art follows the picture quality floor (`image.target`); the audio setting
+        // only says whether it may be lossy.
+        let audio = image::Ctx { lossy: options.audio == crate::args::ImageMode::Lossy, ..image.clone() };
         Self { image, audio, slots }
     }
 
@@ -226,8 +223,12 @@ impl Engine {
         // original is set aside, and a file another job holds is left alone.
         let engine = Arc::clone(self);
         opts.busy = Some(Arc::new(move |p: &Path| engine.lock().in_progress.contains(p)));
-        let (engine, refused, target) = (Arc::clone(self), Arc::clone(&opts.lossless_only), self.lock().target_for(input));
-        opts.note = Some(Arc::new(move |p: &Path| engine.note_content_now(p, image::mode_at(lossy && !refused.load(Ordering::Relaxed), strip, target))));
+        let (engine, refused) = (Arc::clone(self), Arc::clone(&opts.lossless_only));
+        opts.note = Some(Arc::new(move |p: &Path| {
+            // The floor of the file written (a WAV made into FLAC takes FLAC's).
+            let target = engine.lock().target_for(p);
+            engine.note_content_now(p, image::mode_at(lossy && !refused.load(Ordering::Relaxed), strip, target))
+        }));
         let engine = Arc::clone(self);
         opts.warn = Some(Arc::new(move |line: String| engine.log(line)));
         self.reset_worker(worker_id, display, "optimizing as GIF");
@@ -342,11 +343,12 @@ impl Engine {
             let engine = Arc::clone(&self);
             // The mode as the file was really done: a big picture may get the lossless pass
             // only (decided inside process_image), and must then be noted as lossless.
-            let (strip, target, refused) = {
-                let inner = self.lock();
-                (inner.options.strip, inner.target_for(&path), Arc::clone(&opts.lossless_only))
-            };
-            opts.note = Some(Arc::new(move |p: &Path| engine.note_content_now(p, image::mode_at(lossy && !refused.load(Ordering::Relaxed), strip, target))));
+            // Its floor is the written file's (a WAV made into FLAC takes FLAC's).
+            let (strip, refused) = (self.lock().options.strip, Arc::clone(&opts.lossless_only));
+            opts.note = Some(Arc::new(move |p: &Path| {
+                let target = engine.lock().target_for(p);
+                engine.note_content_now(p, image::mode_at(lossy && !refused.load(Ordering::Relaxed), strip, target))
+            }));
             let engine = Arc::clone(&self);
             opts.warn = Some(Arc::new(move |line: String| engine.log(line)));
             if let Some(line) = announce {
@@ -394,9 +396,17 @@ impl Engine {
     }
 
     fn finish_image(self: &Arc<Self>, path: &Path, lossy: bool, result: ImageResult) {
+        // The floor of the file now holding the content: a WAV made into FLAC is remembered
+        // at FLAC's, else the FLAC would be queued again at a lower picture floor.
+        let written = match &result {
+            ImageResult::Smaller { renamed: Some(new), .. } => new.as_path(),
+            ImageResult::Renamed { to, .. } => to.as_path(),
+            ImageResult::Duplicate { kept, .. } => kept.as_path(),
+            _ => path,
+        };
         let mode = {
             let inner = self.lock();
-            image::mode_at(lossy, inner.options.strip, inner.target_for(path))
+            image::mode_at(lossy, inner.options.strip, inner.target_for(written))
         };
         let mut remembered = false;
         let (mut log, mut extra) = (None, None);

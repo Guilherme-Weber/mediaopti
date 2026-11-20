@@ -416,6 +416,9 @@ pub struct RawOptions {
     /// 0 = off, 1 = lossless, 2 = lossy (visually lossless, SSIMULACRA2 >= 93), 3 = lossy at
     /// 85, 4 = lossy at 80.
     pub images: Option<u32>,
+    /// The Images quality selector (as `images`, 1-4) even when Images is off: it sets the
+    /// floor of cover art too. `None` = taken from `images`.
+    pub image_level: Option<u32>,
     /// 0 = keep file formats, anything else = all conversions (older settings); see
     /// `conversions` for each one.
     pub convert: Option<u32>,
@@ -491,7 +494,7 @@ impl Options {
                 Some(2..=4) => ImageMode::Lossy,
                 _ => d.images,
             },
-            image_target: match raw.images {
+            image_target: match raw.image_level.or(raw.images) {
                 Some(3) => 85,
                 Some(4) => 80,
                 _ => d.image_target,
@@ -802,6 +805,11 @@ mod tests {
         for (v, t) in [(2, 93), (3, 85), (4, 80)] {
             let o = Options::normalize(RawOptions { images: Some(v), ..RawOptions::default() });
             assert_eq!((o.images, o.image_target), (ImageMode::Lossy, t));
+        }
+        // Images off keeps the chosen level for cover art; lossless only means 93.
+        for (level, t) in [(4, 80), (1, 93)] {
+            let o = Options::normalize(RawOptions { images: Some(0), image_level: Some(level), ..RawOptions::default() });
+            assert_eq!((o.images, o.image_target), (ImageMode::Off, t));
         }
         assert_eq!(o.crf, 23);
         assert_eq!(o.preset, "slow");

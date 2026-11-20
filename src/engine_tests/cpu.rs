@@ -165,6 +165,57 @@ fn a_lower_quality_floor_redoes_pictures_done_at_a_higher_one() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Cover art follows the picture floor: a FLAC done at 93 is done again at 80 (its cover may
+/// get smaller), one done at 80 is known at 93, and the batch log says which floor covers use.
+#[test]
+fn cover_art_follows_the_picture_quality_floor() {
+    let Some(ff) = ffmpeg() else {
+        skip_test!("bundled ffmpeg not found");
+        return;
+    };
+    let tools = crate::image::tools::Tools::discover(ff.clone(), &std::env::temp_dir());
+    // Everything a FLAC's lossy cover pass needs (`missing_tool`, `lossy_tools_present`).
+    let jpeg_encoder = tools.has("djpeg") && (tools.has("cjpegli") || tools.has("cjpeg"));
+    let lossy = (tools.has("beeim") || tools.has("pingo")) && (jpeg_encoder || tools.has("pingo"));
+    if !["oxipng", "jpegtran", "flac", "ssimulacra2"].iter().all(|t| tools.has(t)) || !lossy {
+        skip_test!("tools for lossy cover art not found");
+        return;
+    }
+    let root = test_dir("cover-floor");
+    let media = root.join("media");
+    std::fs::create_dir_all(&media).unwrap();
+    let art = root.join("art.png");
+    make(&ff, &["-f", "lavfi", "-i", "mandelbrot=s=320x240", "-frames:v", "1", "-compression_level", "1"], &art);
+    make(&ff, &["-f", "lavfi", "-i", "sine=duration=2", "-i", art.to_str().unwrap(), "-map", "0", "-map", "1", "-c:a", "flac",
+        "-c:v", "png", "-disposition:v", "attached_pic"], &media.join("song.flac"));
+    let rt = runtime();
+    let at = |images: u32| RawOptions { images: Some(images), audio: Some(2), conversions: Some(1), ..opts("av1_nvenc", 1.0) };
+    let run = |images: u32| {
+        let (engine, rec) = new_engine(&rt, &root, ff.clone());
+        rt.block_on(async {
+            engine.apply_options(at(images));
+            engine.load_dir(media.clone()).await;
+            let pending = engine.snapshot().pending_files;
+            engine.clone().run_batch(at(images)).await;
+            (pending, rec.logs.lock().unwrap().join("\n"))
+        })
+    };
+    let (pending, logs) = run(2);
+    assert_eq!(pending, 1, "{logs}");
+    // A WAV made into FLAC at 80 is remembered at FLAC's floor, not WAV's (93): it isn't
+    // queued again.
+    make(&ff, &["-f", "lavfi", "-i", "sine=duration=2", "-c:a", "pcm_s16le"], &media.join("tone.wav"));
+    let (pending, logs) = run(4);
+    assert_eq!(pending, 2, "done at 93, redone at 80, and the new WAV: {logs}");
+    assert!(logs.contains("audio lossy (SSIMULACRA2 >= 80)"), "{logs}");
+    assert!(media.join("tone.flac").exists(), "{logs}");
+    let (pending, logs) = run(4);
+    assert_eq!(pending, 0, "both known at 80: {logs}");
+    let (pending, logs) = run(2);
+    assert_eq!(pending, 0, "done at 80, known at 93: {logs}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A picture whose visually lossless search couldn't have its memory gets the lossless pass
 /// only, remembered as lossless: a later lossy run (with the memory free) still does it, even
 /// though its new content was noted before it replaced the original.

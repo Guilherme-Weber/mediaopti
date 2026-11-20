@@ -3,6 +3,15 @@
 Notable changes to mediaopti. Earlier versions are described in their
 [GitHub releases](https://github.com/Guilherme-Weber/mediaopti/releases).
 
+## 3.3.1
+
+### Changed
+
+- Cover art in FLAC, MP3 and other lossless audio follows the Images quality level (it
+  stayed at 93), also while Images is switched off; with Images at lossless only, covers
+  stay at 93. Lowering the level checks the audio files once more for smaller covers; the
+  sound itself never changes. PDF pictures still stay at 93.
+
 ## 3.3.0
 
 ### Added
