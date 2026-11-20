@@ -2,12 +2,14 @@
 
 use super::*;
 
-/// The CPU slots a batch's image, audio and document workers share: every core but two (left
-/// for the desktop). The stages run after the videos (rolling), so they get the cores; slots
-/// beyond the active workers stay idle for big jobs (comic pages) to borrow.
+/// The CPU slots a batch's image, audio and document workers share: every core but one (the
+/// user's choice, 2026-11-19; it was two). The tools run at below-normal priority
+/// (`tools::run`), so the desktop and games still come first. The stages run after the
+/// videos (rolling), so they get the cores; slots beyond the active workers stay idle for big
+/// jobs (comic pages, big pictures: `images::Lent`) to borrow.
 pub fn cpu_slot_count() -> usize {
     let cores = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
-    cores.saturating_sub(2).max(1)
+    cores.saturating_sub(1).max(1)
 }
 
 /// Whether another encoder may start now. The first encoder always may (otherwise a
@@ -34,11 +36,12 @@ pub(super) async fn free_vram_mb() -> Option<u64> {
     String::from_utf8_lossy(&out.stdout).lines().next()?.trim().parse().ok()
 }
 
-fn mode_label(mode: ImageMode) -> &'static str {
+fn mode_label(mode: ImageMode, target: u32) -> String {
     match mode {
-        ImageMode::Off => "off",
-        ImageMode::Lossless => "lossless",
-        ImageMode::Lossy => "visually lossless (SSIMULACRA2 >= 93)",
+        ImageMode::Off => "off".into(),
+        ImageMode::Lossless => "lossless".into(),
+        ImageMode::Lossy if target >= crate::image::DEFAULT_TARGET => format!("visually lossless (SSIMULACRA2 >= {target})"),
+        ImageMode::Lossy => format!("lossy (SSIMULACRA2 >= {target})"),
     }
 }
 
@@ -142,8 +145,8 @@ impl Engine {
         if images > 0 {
             self.log(format!(
                 "Starting {images} images and other files | images {}, audio {}",
-                mode_label(options.images),
-                mode_label(options.audio)
+                mode_label(options.images, options.image_target),
+                mode_label(options.audio, crate::image::DEFAULT_TARGET)
             ));
             self.log(self.tools().summary());
         }

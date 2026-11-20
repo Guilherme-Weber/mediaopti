@@ -117,6 +117,12 @@ export component AppWindow inherits Window {
     callback stop();
     callback toggle-pause();
     callback forget-history();
+    // The in-app question (see the dialog at the end): what it asks and the yes button's text.
+    in-out property <bool> confirm-open;
+    in property <string> confirm-title;
+    in property <string> confirm-text;
+    in property <string> confirm-yes: "OK";
+    callback confirm-accepted();
     callback clear-log();
     callback open-logs();
     callback check-update();
@@ -870,7 +876,7 @@ export component AppWindow inherits Window {
                                 spacing: 2px;
                                 Text { text: "mediaopti " + root.app-version; font-size: 18px; font-weight: 600; color: Theme.text; }
                                 Text {
-                                    text: "Makes a media library smaller. A file is replaced only when the result is smaller and passes verification (identical pixels or audio, or SSIMULACRA2 / VMAF ≥ 93); dates and attributes are kept.";
+                                    text: "Makes a media library smaller. A file is replaced only when the result is smaller and passes verification (identical pixels or audio, or the chosen quality floor: SSIMULACRA2 ≥ 93 by default, VMAF ≥ 93); dates and attributes are kept.";
                                     font-size: 13px;
                                     color: Theme.text-secondary;
                                     wrap: word-wrap;
@@ -1144,6 +1150,68 @@ export component AppWindow inherits Window {
         width: root.width;
         height: root.height;
         background: root.repaint-all ? #00000001 : #00000000;
+    }
+
+    // A question in the app's own look (the system message box ignores the theme). Rust fills
+    // the texts and opens it; Esc, No or a click outside close it.
+    if root.confirm-open: Rectangle {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        background: #000000A8;
+        TouchArea { clicked => { root.confirm-open = false; } }
+        FocusScope {
+            init => { self.focus(); }
+            // Seen before the buttons: Esc closes; Tab can't take the focus to the page behind
+            // (where Enter would press a hidden button and Esc no longer close the dialog).
+            capture-key-pressed(event) => {
+                if event.text == Key.Escape {
+                    root.confirm-open = false;
+                    return accept;
+                }
+                if event.text == Key.Tab || event.text == Key.Backtab {
+                    return accept;
+                }
+                reject
+            }
+            Rectangle {
+                width: min(480px, root.width - 64px);
+                height: dialog-layout.preferred-height;
+                background: Theme.card-background;
+                border-radius: Theme.radius;
+                border-width: 1px;
+                border-color: #FFFFFF1F;
+                drop-shadow-blur: 24px;
+                drop-shadow-color: #00000080;
+                // Clicks on the card don't reach the backdrop.
+                TouchArea { }
+                dialog-layout := VerticalLayout {
+                    padding: 24px;
+                    spacing: 14px;
+                    HorizontalLayout {
+                        spacing: 10px;
+                        Glyph { glyph: "\u{E7BA}"; font-size: 20px; color: Theme.caution; width: 22px; vertical-alignment: center; }
+                        Text { text: root.confirm-title; font-size: 18px; font-weight: 600; color: Theme.text; vertical-alignment: center; wrap: word-wrap; }
+                    }
+                    Text { text: root.confirm-text; font-size: 14px; color: Theme.text-secondary; wrap: word-wrap; }
+                    HorizontalLayout {
+                        alignment: LayoutAlignment.end;
+                        spacing: 8px;
+                        padding-top: 6px;
+                        Button { text: "Cancel"; clicked => { root.confirm-open = false; } }
+                        Button {
+                            text: root.confirm-yes;
+                            primary: true;
+                            clicked => {
+                                root.confirm-open = false;
+                                root.confirm-accepted();
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // While files are dragged over the window: where they will go.

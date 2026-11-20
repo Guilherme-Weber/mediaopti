@@ -110,6 +110,61 @@ fn images_and_videos_in_one_batch() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A picture done at the default floor (93) is done again when a lower one (80) is chosen,
+/// even moved meanwhile (recognised by its content, which knew only "lossy": the 93 pass was
+/// taken for an 80 one and the picture never got the smaller level); done at 80, it is known
+/// at 93 too.
+#[test]
+fn a_lower_quality_floor_redoes_pictures_done_at_a_higher_one() {
+    let Some(ff) = ffmpeg() else {
+        skip_test!("bundled ffmpeg not found");
+        return;
+    };
+    let tools = crate::image::tools::Tools::discover(ff.clone(), &std::env::temp_dir());
+    if !["oxipng", "ssimulacra2"].iter().all(|t| tools.has(t)) {
+        skip_test!("image tools not found");
+        return;
+    }
+    let root = test_dir("floors");
+    let media = root.join("media");
+    std::fs::create_dir_all(&media).unwrap();
+    let png = media.join("photo.png");
+    make(&ff, &["-f", "lavfi", "-i", "mandelbrot=s=320x240", "-frames:v", "1", "-compression_level", "1"], &png);
+    let rt = runtime();
+    let at = |images: u32| RawOptions { images: Some(images), ..opts("av1_nvenc", 1.0) };
+    let run = |images: u32| {
+        let (engine, rec) = new_engine(&rt, &root, ff.clone());
+        rt.block_on(async {
+            engine.apply_options(at(images));
+            engine.load_dir(media.clone()).await;
+            let pending = engine.snapshot().pending_files;
+            engine.clone().run_batch(at(images)).await;
+            (pending, rec.logs.lock().unwrap().join("\n"))
+        })
+    };
+    let (pending, logs) = run(2);
+    assert_eq!(pending, 1, "{logs}");
+    // Moved: only its content can say it was done.
+    let moved = media.join("sub");
+    std::fs::create_dir_all(&moved).unwrap();
+    std::fs::rename(&png, moved.join("photo.png")).unwrap();
+    let (pending, logs) = run(4);
+    assert_eq!(pending, 1, "done at 93, redone at 80: {logs}");
+    let (pending, logs) = run(2);
+    assert_eq!(pending, 0, "done at 80, known at 93: {logs}");
+    // Moved again and scanned at 93, then 80 chosen before Start (no new scan): it was
+    // remembered as done at 93 only, and 80 would have compressed it again.
+    let again = media.join("other");
+    std::fs::create_dir_all(&again).unwrap();
+    std::fs::rename(moved.join("photo.png"), again.join("photo.png")).unwrap();
+    let (engine, _) = new_engine(&rt, &root, ff.clone());
+    engine.apply_options(at(2));
+    rt.block_on(engine.load_dir(media.clone()));
+    engine.apply_options(at(4));
+    assert_eq!(engine.snapshot().pending_files, 0, "known for the 80 pass its content had");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A picture whose visually lossless search couldn't have its memory gets the lossless pass
 /// only, remembered as lossless: a later lossy run (with the memory free) still does it, even
 /// though its new content was noted before it replaced the original.

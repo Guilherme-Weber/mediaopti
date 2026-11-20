@@ -44,6 +44,9 @@ pub struct Launch {
     pub start: bool,
     /// The page shown first (`--page=settings` / `--page=about` / `--page=advanced`).
     pub page: i32,
+    /// Debug builds: `--preview-confirm` opens the in-app question at start (screenshots of
+    /// the dialog without clicking: `scripts/ui-shots.ps1`).
+    pub preview_confirm: bool,
 }
 
 impl Launch {
@@ -59,6 +62,8 @@ impl Launch {
                     "advanced" => 3,
                     _ => 0,
                 };
+            } else if cfg!(debug_assertions) && arg == "--preview-confirm" {
+                launch.preview_confirm = true;
             } else if arg.starts_with("--") {
                 // Unknown flag: ignore rather than treating it as a folder.
             } else if launch.folder.is_none() {
@@ -319,23 +324,19 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
     {
         let engine = engine.clone();
         let weak = window.as_weak();
+        // Asked in the app's own dialog (themed), answered through `confirm-accepted`.
         window.on_forget_history(move || {
             let Some(w) = weak.upgrade() else { return };
-            let handle = w.window().window_handle();
-            let confirmed = rfd::MessageDialog::new()
-                .set_level(rfd::MessageLevel::Warning)
-                .set_title("Forget processed history")
-                .set_description(
-                    "Forget the processed history for this app? Existing video files will not be changed.",
-                )
-                .set_buttons(rfd::MessageButtons::YesNo)
-                .set_parent(&handle)
-                .show()
-                == rfd::MessageDialogResult::Yes;
-            if confirmed {
-                engine.in_background(Engine::clear_history);
-            }
+            w.set_confirm_title("Forget the processed history?".into());
+            w.set_confirm_text(
+                "Every file will be processed again at the next run, as if it were new. Nothing changes on disk now. \
+                 Pictures already made smaller with a visually lossless pass would be compressed again on top of it."
+                    .into(),
+            );
+            w.set_confirm_yes("Forget history".into());
+            w.set_confirm_open(true);
         });
+        window.on_confirm_accepted(move || engine.in_background(Engine::clear_history));
     }
     window.on_clear_log(|| with_controller(Controller::clear_log));
     {
@@ -486,6 +487,9 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
     }
 
     window.set_page(launch.page);
+    if launch.preview_confirm {
+        window.invoke_forget_history();
+    }
 
     // First paint, then honour command-line options.
     with_controller(Controller::render);

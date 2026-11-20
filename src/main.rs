@@ -56,11 +56,15 @@ fn main() -> Result<(), slint::PlatformError> {
         std::thread::sleep(std::time::Duration::from_millis(200));
     };
     let Some(_instance) = instance else {
-        rfd::MessageDialog::new()
-            .set_level(rfd::MessageLevel::Info)
-            .set_title("mediaopti")
-            .set_description("mediaopti is already running.")
-            .show();
+        // Its window comes to the front instead of a message (the system box ignores the
+        // app's theme); the message only when that window can't be found.
+        if !system::show_running_instance() {
+            rfd::MessageDialog::new()
+                .set_level(rfd::MessageLevel::Info)
+                .set_title("mediaopti")
+                .set_description("mediaopti is already running.")
+                .show();
+        }
         return Ok(());
     };
 

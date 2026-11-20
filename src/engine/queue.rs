@@ -56,6 +56,15 @@ impl Inner {
         (if audio { self.options.audio } else { self.options.images }) == ImageMode::Lossy
     }
 
+    /// The lossy floor a file is done at: the picture setting for pictures and comics (whose
+    /// pages are pictures), the default for cover art and PDFs.
+    pub(super) fn target_for(&self, file: &Path) -> u32 {
+        match image::kind_of(file) {
+            Some(image::Kind::Png | image::Kind::Jpg | image::Kind::Gif | image::Kind::Bmp | image::Kind::Tga | image::Kind::Cbz | image::Kind::Cbr) => self.options.image_target,
+            _ => image::DEFAULT_TARGET,
+        }
+    }
+
     /// Files already processed without removing metadata are done again.
     pub(super) fn redo_stripped(&self) -> bool {
         self.options.strip && self.options.redo_stripped
@@ -66,7 +75,7 @@ impl Inner {
         if !self.is_image_job(file, size) {
             history::Want::Video
         } else if self.lossy_for(file) {
-            history::Want::ImageLossy { strip: self.redo_stripped() }
+            history::Want::ImageLossy { strip: self.redo_stripped(), target: self.target_for(file) }
         } else {
             history::Want::ImageLossless { strip: self.redo_stripped() }
         }
@@ -108,7 +117,7 @@ impl Inner {
             if !self.cpu_job_enabled(file) {
                 // Not remembered: they may be optimized once switched on.
                 Place::Off { gif: args::is_gif(file) }
-            } else if self.history.contains_image(file, self.lossy_for(file), self.redo_stripped()) {
+            } else if self.history.contains_image(file, self.lossy_for(file), self.redo_stripped(), self.target_for(file)) {
                 Place::Known
             } else if self.failed.contains(file) {
                 Place::Failed
@@ -123,7 +132,7 @@ impl Inner {
             // being encoded again.
             if args::is_gif(file)
                 && self.cpu_job_enabled(file)
-                && !self.history.contains_image(file, self.lossy_for(file), self.redo_stripped())
+                && !self.history.contains_image(file, self.lossy_for(file), self.redo_stripped(), self.target_for(file))
                 && !self.failed.contains(file)
             {
                 Place::Cpu

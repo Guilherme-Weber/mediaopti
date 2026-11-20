@@ -335,6 +335,9 @@ pub struct Options {
     /// path does too.
     pub gpu_decode: Option<(u32, u32)>,
     pub images: ImageMode,
+    /// The SSIMULACRA2 floor of lossy pictures (`image::IMAGE_TARGETS`: 93, 85 or 80). Audio
+    /// cover art and PDF pictures keep 93.
+    pub image_target: u32,
     /// Lossless format conversions (WAV -> FLAC, BMP/TGA -> PNG, CBR -> CBZ), each on or off.
     pub convert: Conversions,
     /// Videos (and animated GIFs over the limit) are processed at all.
@@ -380,6 +383,7 @@ impl Default for Options {
             cq_boost: 0,
             gpu_decode: None,
             images: ImageMode::Lossy,
+            image_target: crate::image::DEFAULT_TARGET,
             convert: Conversions::ALL,
             videos: true,
             docs: true,
@@ -409,7 +413,8 @@ pub struct RawOptions {
     pub backup_dir: Option<String>,
     pub gif_min_mb: Option<u32>,
     pub vmaf_floor: Option<u32>,
-    /// 0 = off, 1 = lossless, 2 = lossy (visually lossless).
+    /// 0 = off, 1 = lossless, 2 = lossy (visually lossless, SSIMULACRA2 >= 93), 3 = lossy at
+    /// 85, 4 = lossy at 80.
     pub images: Option<u32>,
     /// 0 = keep file formats, anything else = all conversions (older settings); see
     /// `conversions` for each one.
@@ -483,8 +488,13 @@ impl Options {
             images: match raw.images {
                 Some(0) => ImageMode::Off,
                 Some(1) => ImageMode::Lossless,
-                Some(2) => ImageMode::Lossy,
+                Some(2..=4) => ImageMode::Lossy,
                 _ => d.images,
+            },
+            image_target: match raw.images {
+                Some(3) => 85,
+                Some(4) => 80,
+                _ => d.image_target,
             },
             convert: match (raw.conversions, raw.convert) {
                 (Some(mask), _) => Conversions::from_mask(mask),
@@ -787,6 +797,12 @@ mod tests {
         assert_eq!(o.convert, Conversions::ALL, "conversions on by default");
         assert!(o.videos && o.docs);
         assert_eq!(o.images, ImageMode::Lossy, "images: visually lossless by default");
+        assert_eq!(o.image_target, 93, "an unknown value keeps the default floor");
+        // The lower floors are lossy passes at 85 and 80.
+        for (v, t) in [(2, 93), (3, 85), (4, 80)] {
+            let o = Options::normalize(RawOptions { images: Some(v), ..RawOptions::default() });
+            assert_eq!((o.images, o.image_target), (ImageMode::Lossy, t));
+        }
         assert_eq!(o.crf, 23);
         assert_eq!(o.preset, "slow");
         assert_eq!(o.encoder, "av1_nvenc");

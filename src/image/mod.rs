@@ -366,8 +366,10 @@ pub struct Ctx {
     pub strict_alpha: bool,
     /// PDFs may get lossy images (at the target, every rendered page checked).
     pub lossy_docs: bool,
-    /// Several files run at once: keep each tool single-threaded.
-    pub parallel: bool,
+    /// Threads each tool of this job may use: 1 while several files run at once (one CPU
+    /// slot each), more when the job borrowed idle slots (`process_image`: a few big files
+    /// left the CPU mostly idle), 0 for the tool's own default (one job alone).
+    pub threads: usize,
     pub timeout: Duration,
     /// Stop and Pause.
     pub gate: tools::Gate,
@@ -447,6 +449,43 @@ pub(crate) fn one_big_lossy_job(gate: &tools::Gate) -> Option<std::sync::MutexGu
     }
 }
 
+/// Commit memory promised to jobs for what they take beyond one thread and one search (their
+/// tools' extra threads, lossy methods side by side), until they end. Jobs starting together
+/// all see the same free memory; each counts the others' promises before taking more.
+static PROMISED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Memory promised to one job; given back when it is dropped.
+pub(crate) struct Promise(u64);
+
+impl Drop for Promise {
+    fn drop(&mut self) {
+        PROMISED.fetch_sub(self.0, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// What other jobs were promised and haven't given back.
+pub(crate) fn promised() -> u64 {
+    PROMISED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Promises `amount` when the free commit memory (`available`), less what others were
+/// promised, still leaves `keep` after it. `None` when it doesn't fit; unknown memory fits
+/// (with nothing tracked).
+pub(crate) fn promise(amount: u64, available: Option<u64>, keep: u64) -> Option<Promise> {
+    use std::sync::atomic::Ordering::SeqCst;
+    let Some(available) = available else { return Some(Promise(0)) };
+    let mut current = PROMISED.load(SeqCst);
+    loop {
+        if available.saturating_sub(current) < amount.saturating_add(keep) {
+            return None;
+        }
+        match PROMISED.compare_exchange(current, current.saturating_add(amount), SeqCst, SeqCst) {
+            Ok(_) => return Some(Promise(amount)),
+            Err(now) => current = now,
+        }
+    }
+}
+
 /// For a picture inside a document or comic (`pixels` of it): whether its visually lossless
 /// search may run now, holding the one-big-search turn when it is big (as for a picture on
 /// its own: a 150-megapixel comic page needs ~20 GB). `Ok((false, None))`: lossless only.
@@ -510,12 +549,29 @@ pub fn has_lossy_part(ctx: &Ctx, kind: Kind) -> bool {
         }
 }
 
+/// The visually lossless floors offered for pictures (SSIMULACRA2): 93 (the default, no
+/// visible change), 85 and 80 (smaller; 80 is about what Pinga's lossy mode gives: on five
+/// big PNGs it scored 81-83 at ~25% of the size, with slight banding seen when zoomed in).
+pub const IMAGE_TARGETS: [u32; 3] = [93, 85, 80];
+/// Audio cover art and PDF pictures keep this floor whatever the picture setting.
+pub const DEFAULT_TARGET: u32 = 93;
+
+/// History mode of a pass at the default floor (imageopti's names).
 pub fn mode(lossy: bool, strip: bool) -> &'static str {
-    match (lossy, strip) {
-        (true, false) => "lossy-normal-t93",
-        (true, true) => "lossy-normal-t93-strip",
-        (false, false) => "lossless-normal",
-        (false, true) => "lossless-normal-strip",
+    mode_at(lossy, strip, DEFAULT_TARGET)
+}
+
+/// History mode of a pass at floor `target` (`lossy-normal-t85`); a lossless pass has none.
+pub fn mode_at(lossy: bool, strip: bool, target: u32) -> &'static str {
+    match (lossy, strip, target) {
+        (false, false, _) => "lossless-normal",
+        (false, true, _) => "lossless-normal-strip",
+        (true, false, 85) => "lossy-normal-t85",
+        (true, true, 85) => "lossy-normal-t85-strip",
+        (true, false, 80) => "lossy-normal-t80",
+        (true, true, 80) => "lossy-normal-t80-strip",
+        (true, false, _) => "lossy-normal-t93",
+        (true, true, _) => "lossy-normal-t93-strip",
     }
 }
 
@@ -756,8 +812,9 @@ fn png_chain<'a>(ctx: &'a Ctx, work: &Path, src: &Path, restore_from: &Path, ver
         c.inplace("pingo", "pingo", |o| crate::os_args!["-s4", "-lossless", "-quiet", "-nostrip", alpha, o], &mut check, Some(&repair))?;
     }
     let mut args = crate::os_args!["-o", if ctx.max.oxipng_max { "max" } else { "4" }, "-q"];
-    if ctx.parallel {
-        args.extend(crate::os_args!["-t", "1"]);
+    if ctx.threads > 0 {
+        // Same output whatever the thread count (checked byte for byte on a 13.7 MP PNG).
+        args.extend(crate::os_args!["-t", ctx.threads.to_string()]);
     }
     if !ctx.strict_alpha {
         args.push("--alpha".into());
@@ -778,12 +835,19 @@ fn png_chain<'a>(ctx: &'a Ctx, work: &Path, src: &Path, restore_from: &Path, ver
     )?;
     if ctx.max.png_ect && !apng {
         let strict = ctx.strict_alpha;
+        let threads = ctx.threads;
         // -6, not -9: -9 costs ~5x the time (Pictures sample: -0.50% vs -0.26% under 2 MP,
         // -0.39% vs -0.29% above), and ECT was ~38% of all tool time on a lossy image run.
         let args = |o: &Path| {
             let mut a = crate::os_args!["-6", "-quiet"];
             if strict {
                 a.push("--strict".into()); // keeps fully transparent pixels
+            }
+            // Per-block threads: the same bytes, 41 s -> 20 s on a 13.7 MP PNG.
+            match threads {
+                1 => {}
+                0 => a.push("--mt-deflate".into()),
+                n => a.push(format!("--mt-deflate={n}").into()),
             }
             a.push(o.into());
             a
@@ -840,7 +904,7 @@ pub(crate) fn ssim_score(ctx: &Ctx, a: &Path, b: &Path) -> Result<Option<f64>, R
     s
 }
 
-pub(crate) type Encoder<'e> = Box<dyn FnMut(u32) -> Result<Option<PathBuf>, RunError> + 'e>;
+pub(crate) type Encoder<'e> = Box<dyn FnMut(u32) -> Result<Option<PathBuf>, RunError> + Send + 'e>;
 
 /// Binary-searches quality `n` in `lo..=hi` (higher = better) for the smallest output that
 /// still scores >= target and is below `limit` bytes. One probe at a fairly strong setting
@@ -848,10 +912,21 @@ pub(crate) type Encoder<'e> = Box<dyn FnMut(u32) -> Result<Option<PathBuf>, RunE
 pub(crate) fn quality_search(ctx: &Ctx, reference: &Path, lo: u32, hi: u32, encode: &mut Encoder, limit: u64) -> Result<Option<PathBuf>, RunError> {
     let probe = hi - (hi - lo) / 4;
     let first = encode(probe)?;
-    if first.as_deref().and_then(size).is_none_or(|s| s >= limit) {
-        return Ok(None);
-    }
     let (mut lo, mut hi) = (i64::from(lo), i64::from(hi));
+    match first.as_deref().and_then(size) {
+        // The encoder failed on this picture: no search.
+        None => return Ok(None),
+        // At the default floor this skips already-optimized images cheaply (measured). At a
+        // lower one the wins sit below the probe (a JPEG saved at q75 grows at q88): the
+        // search goes on underneath it instead.
+        Some(s) if s >= limit => {
+            if ctx.target >= f64::from(DEFAULT_TARGET) {
+                return Ok(None);
+            }
+            hi = i64::from(probe) - 1;
+        }
+        Some(_) => {}
+    }
     let mut best: Option<(PathBuf, u64)> = None;
     let mut cached = Some((probe, first));
     while lo <= hi {
@@ -885,16 +960,59 @@ pub(crate) fn quality_search(ctx: &Ctx, reference: &Path, lo: u32, hi: u32, enco
 
 /// Tries each method, each limited by the best result so far.
 pub(crate) fn search_methods(ctx: &Ctx, reference: &Path, methods: Vec<(&str, u32, u32, Encoder)>, limit: u64) -> Result<Option<(PathBuf, String)>, RunError> {
+    let found = |name: &str, c: PathBuf| {
+        let s = size(&c).unwrap_or(u64::MAX);
+        let q: String = c.file_stem().map_or_default(|f| f.to_string_lossy().chars().filter(char::is_ascii_digit).collect());
+        (c, format!("{name}={q}"), s)
+    };
+    let side_by_side = if methods.len() > 1 { methods_at_once(ctx, reference, methods.len()) } else { None };
+    if let Some(_promise) = side_by_side {
+        // Each method searches against `limit` on its own thread; the smallest passing
+        // result wins, as when they ran in turn and each later one only had to beat the
+        // best so far (a candidate bigger than that one never won either way).
+        let results: Vec<Result<Option<Found>, RunError>> = std::thread::scope(|scope| {
+            let running: Vec<_> = methods
+                .into_iter()
+                .map(|(name, lo, hi, mut enc)| scope.spawn(move || Ok(quality_search(ctx, reference, lo, hi, &mut enc, limit)?.map(|c| found(name, c)))))
+                .collect();
+            running.into_iter().map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p))).collect()
+        });
+        let mut best: Option<(PathBuf, String, u64)> = None;
+        for r in results {
+            if let Some(c) = r? {
+                if best.as_ref().is_none_or(|b| c.2 < b.2) {
+                    best = Some(c);
+                }
+            }
+        }
+        return Ok(best.map(|(p, l, _)| (p, l)));
+    }
     let mut best: Option<(PathBuf, String, u64)> = None;
     for (name, lo, hi, mut enc) in methods {
         let cap = best.as_ref().map_or(limit, |b| b.2);
         if let Some(c) = quality_search(ctx, reference, lo, hi, &mut enc, cap)? {
-            let s = size(&c).unwrap_or(u64::MAX);
-            let q: String = c.file_stem().map_or_default(|f| f.to_string_lossy().chars().filter(char::is_ascii_digit).collect());
-            best = Some((c, format!("{name}={q}"), s));
+            best = Some(found(name, c));
         }
     }
     Ok(best.map(|(p, l, _)| (p, l)))
+}
+
+/// A method's best output: its file, label (`beeim-quantizer=81`) and size.
+type Found = (PathBuf, String, u64);
+
+/// Whether `n` lossy methods may search side by side: the job runs on several threads and
+/// the memory of the `n - 1` extra searches (each scores candidates with ssimulacra2:
+/// `LOSSY_BYTES_PER_PIXEL` a pixel) can be promised, leaving the job's own search and 2 GB.
+/// The promise (held for the search) keeps other jobs from counting on the same memory.
+fn methods_at_once(ctx: &Ctx, reference: &Path, n: usize) -> Option<Promise> {
+    // A job on one thread (documents, comic pages) searches one method at a time.
+    if ctx.threads == 1 || (ctx.threads > 0 && n > ctx.threads) {
+        return None;
+    }
+    let pixels = pixel_count(reference)?;
+    let one = pixels.saturating_mul(LOSSY_BYTES_PER_PIXEL);
+    let available = crate::system::memory_status().map(|m| m.available_commit)?;
+    promise(one.saturating_mul(n as u64 - 1), Some(available), one.saturating_add(BIG_LOSSY_RESERVE))
 }
 
 fn lossy_png(ctx: &Ctx, work: &Path, src: &Path, chain: &mut Chain, ver: &Verifier) -> Result<(), RunError> {
@@ -952,12 +1070,15 @@ fn lossy_jpeg(ctx: &Ctx, work: &Path, src: &Path, chain: &mut Chain, ver: &Verif
         return Ok(());
     }
     // Only JPEGs saved at high quality get smaller at >= 93: on a 200-JPEG sample, q >= 90
-    // kept 24 of 25 wins and skipped a third of the files.
-    if !ctx.max.jpg_low_q && jpeg::quality(src).is_some_and(|q| q < 90.0) {
+    // kept 24 of 25 wins and skipped a third of the files. Both limits were measured at 93;
+    // at a lower floor (85, 80) lower qualities pass, so the whole range is searched.
+    let low_floor = ctx.target < f64::from(DEFAULT_TARGET);
+    if !ctx.max.jpg_low_q && !low_floor && jpeg::quality(src).is_some_and(|q| q < 90.0) {
         return Ok(());
     }
     // Winners were q90-98 on the Pictures sample; max searches from 50.
-    let lo_q = if ctx.max.jpg_wide { 50 } else { 84 };
+    let wide = ctx.max.jpg_wide || low_floor;
+    let lo_q = if wide { 50 } else { 84 };
     let lw = work.join("lossy");
     let _ = std::fs::create_dir_all(&lw);
     let pnm = lw.join("dec.pnm");
@@ -990,7 +1111,7 @@ fn lossy_jpeg(ctx: &Ctx, work: &Path, src: &Path, chain: &mut Chain, ver: &Verif
         let lw2 = lw.clone();
         methods.push((
             "pingo-quality",
-            if ctx.max.jpg_wide { 50 } else { 90 },
+            if wide { 50 } else { 90 },
             100,
             Box::new(move |n| {
                 let out = lw2.join(format!("pg{n}.jpg"));
@@ -1034,7 +1155,7 @@ mod tests {
             strip: false,
             strict_alpha: false,
             lossy_docs: false,
-            parallel: false,
+            threads: 0,
             timeout: Duration::from_secs(120),
             gate: tools::Gate::default(),
             max: crate::image::Max::default(),

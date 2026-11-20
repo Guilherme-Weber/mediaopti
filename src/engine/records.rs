@@ -116,7 +116,7 @@ impl Engine {
                         // it to the optimizer): that is what its content may already have.
                         history::Want::Video if args::is_gif(f) && inner.history.contains(f) => {
                             let strip = inner.redo_stripped();
-                            if inner.lossy_for(f) { history::Want::ImageLossy { strip } } else { history::Want::ImageLossless { strip } }
+                            if inner.lossy_for(f) { history::Want::ImageLossy { strip, target: inner.target_for(f) } } else { history::Want::ImageLossless { strip } }
                         }
                         w => w,
                     };
@@ -128,7 +128,7 @@ impl Engine {
                 .map(|(f, _, want)| (f, want))
                 .filter(|(f, want)| match want {
                     history::Want::Video => !inner.history.contains(f),
-                    _ => !inner.history.contains_image(f, inner.lossy_for(f), inner.redo_stripped()),
+                    _ => !inner.history.contains_image(f, inner.lossy_for(f), inner.redo_stripped(), inner.target_for(f)),
                 })
                 .map(|(f, want)| (f.clone(), want))
                 .unzip()
@@ -150,15 +150,24 @@ impl Engine {
                             // (moved or renamed since): known for its GIF pass too, else
                             // `place` sends it to the optimizer again.
                             if args::is_gif(&file) {
-                                let (lossy, strip) = (inner.lossy_for(&file), inner.redo_stripped());
-                                let as_image = if lossy { history::Want::ImageLossy { strip } } else { history::Want::ImageLossless { strip } };
+                                let (lossy, strip, target) = (inner.lossy_for(&file), inner.redo_stripped(), inner.target_for(&file));
+                                let as_image = if lossy { history::Want::ImageLossy { strip, target } } else { history::Want::ImageLossless { strip } };
                                 if inner.history.contains_content(&h, as_image) {
-                                    inner.history.add_image(&file, image::mode(lossy, strip));
+                                    let mode = inner.history.content_image_mode(&h).unwrap_or(image::mode_at(lossy, strip, target));
+                                    inner.history.add_image(&file, mode);
                                 }
                             }
                         }
-                        history::Want::ImageLossy { strip } => inner.history.add_image(&file, image::mode(true, strip)),
-                        history::Want::ImageLossless { strip } => inner.history.add_image(&file, image::mode(false, strip)),
+                        // Remembered for the strongest pass its content had (covering the
+                        // one asked for: `covered_by`), not just the one asked at this scan.
+                        history::Want::ImageLossy { strip, target } => {
+                            let mode = inner.history.content_image_mode(&h).unwrap_or(image::mode_at(true, strip, target));
+                            inner.history.add_image(&file, mode);
+                        }
+                        history::Want::ImageLossless { strip } => {
+                            let mode = inner.history.content_image_mode(&h).unwrap_or(image::mode(false, strip));
+                            inner.history.add_image(&file, mode);
+                        }
                     }
                     hits += 1;
                 }

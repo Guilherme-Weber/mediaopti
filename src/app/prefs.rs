@@ -38,6 +38,8 @@ pub(super) const GIFS: &[(u32, &str)] = &[
 ];
 pub(super) const IMAGES: &[(u32, &str)] = &[
     (2, "Visually lossless (SSIMULACRA2 ≥ 93)"),
+    (3, "High quality, smaller (≥ 85)"),
+    (4, "Smallest, slight banding up close (≥ 80, like Pinga)"),
     (1, "Lossless only (pixel-identical)"),
 ];
 pub(super) const PDFS: &[(u32, &str)] = &[
@@ -79,7 +81,7 @@ pub(super) struct Prefs {
     pub(super) backup_dir: String,
     pub(super) gif_min_mb: u32,
     pub(super) vmaf_floor: u32,
-    /// 1 = lossless, 2 = visually lossless.
+    /// 1 = lossless, 2 = visually lossless (93), 3 = high quality (85), 4 = smallest (80).
     pub(super) images: u32,
     /// Each type on or off.
     pub(super) videos: bool,

@@ -3,6 +3,33 @@
 Notable changes to mediaopti. Earlier versions are described in their
 [GitHub releases](https://github.com/Guilherme-Weber/mediaopti/releases).
 
+## Unreleased
+
+### Added
+
+- Pictures have two smaller quality levels besides visually lossless (SSIMULACRA2 ≥ 93):
+  "High quality" (≥ 85) and "Smallest" (≥ 80, about what Pinga's lossy mode gives, with
+  slight banding seen up close). On five big PNGs, 93 found no lossy version at all (even
+  pingo's quality 100 scored 86-89), while Pinga's output scored 81-83 at ~25% of the size.
+  Comics follow the setting; cover art and PDF pictures stay at 93. A picture done at a
+  higher level is done again at a lower one (moved or renamed too); one done at a lower
+  level is not redone. At 85 and 80, JPEGs saved below quality 90 are searched too. On the
+  same five PNGs: 33% of the size at 85 (scores 85.4-86.2), 25% at 80 (80.3-81.0; Pinga's
+  output was 28%).
+
+### Changed
+
+- Pictures keep the CPU busy: their tools (oxipng, ECT) run on every thread, at
+  below-normal priority, with the same results as on one, and their lossy methods search
+  side by side, as far as the free memory allows (what each picture takes beyond one thread
+  is set aside, so pictures starting together don't all count on the same memory). Five
+  big PNGs: 733 s before, 551 s now, the same bytes.
+- Audio, documents and pictures use every core but one (it was two); their tools still run
+  at below-normal priority, so the desktop and games come first.
+- "Forget history" asks in the app's own dialog, which says what it really does (every file
+  is processed again; pictures already made smaller would be compressed again), and
+  starting the app a second time brings its window to the front instead of a message box.
+
 ## 3.2.1
 
 Fixes from a long real run (14 failures, 13 of them false) and from a review of the whole

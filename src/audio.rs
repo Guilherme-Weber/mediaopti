@@ -974,7 +974,7 @@ mod tests {
             strip: false,
             strict_alpha: false,
             lossy_docs: false,
-            parallel: false,
+            threads: 0,
             timeout: Duration::from_secs(120),
             gate: crate::image::tools::Gate::default(),
             max: crate::image::Max::default(),

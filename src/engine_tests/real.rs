@@ -78,7 +78,8 @@ fn real_folder_run() {
         originals: Some(2),
         gif_min_mb: Some(1),
         vmaf_floor: Some(93),
-        images: Some(2),
+        // MEDIAOPTI_REAL_IMAGES=<n>: the Images setting (2 = >= 93, 3 = >= 85, 4 = >= 80).
+        images: Some(std::env::var("MEDIAOPTI_REAL_IMAGES").ok().and_then(|v| v.parse().ok()).unwrap_or(2)),
         convert: Some(1),
         lossy_docs: Some(1),
         audio: Some(2),

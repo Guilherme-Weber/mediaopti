@@ -73,7 +73,8 @@ fn inner_ctx(ctx: &Ctx, kind: Kind) -> Ctx {
         // colours are content: an editor could change the alpha later).
         strict_alpha: ctx.strict_alpha || kind == Kind::Doc,
         lossy_docs: false,
-        parallel: ctx.parallel,
+        // Pages run side by side on borrowed slots: one thread each.
+        threads: 1,
         timeout: ctx.timeout,
         gate: ctx.gate.clone(),
         max: ctx.max,
@@ -507,7 +508,7 @@ mod tests {
             strip: false,
             strict_alpha: false,
             lossy_docs: false,
-            parallel: false,
+            threads: 0,
             timeout: Duration::from_secs(120),
             gate: crate::image::tools::Gate::default(),
             max: crate::image::Max::default(),

@@ -429,6 +429,77 @@ impl SingleInstance {
     }
 }
 
+/// Brings the window of the instance already running to the front (restored if minimized):
+/// starting the app a second time shows it instead of a message box. Its window is a visible
+/// top-level one whose title ends with "mediaopti" (it shows the progress before), in another
+/// process of this same executable. False when none was found.
+pub fn show_running_instance() -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM};
+    use windows_sys::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, SetForegroundWindow, ShowWindow, SW_RESTORE,
+    };
+
+    struct Search {
+        exe: std::path::PathBuf,
+        found: HWND,
+    }
+
+    fn exe_of(pid: u32) -> Option<std::path::PathBuf> {
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h.is_null() {
+                return None;
+            }
+            let mut buf = [0u16; 1024];
+            let mut len = buf.len() as u32;
+            let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &raw mut len) != 0;
+            CloseHandle(h);
+            ok.then(|| std::path::PathBuf::from(String::from_utf16_lossy(&buf[..len as usize])))
+        }
+    }
+
+    unsafe extern "system" fn each(hwnd: HWND, param: LPARAM) -> windows_sys::core::BOOL {
+        // SAFETY: `param` is the `Search` passed to `EnumWindows` below, alive for the call.
+        let search = unsafe { &mut *(param as *mut Search) };
+        unsafe {
+            if IsWindowVisible(hwnd) == 0 {
+                return 1;
+            }
+            let mut title = [0u16; 256];
+            let n = GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32);
+            if n <= 0 || !String::from_utf16_lossy(&title[..n as usize]).ends_with("mediaopti") {
+                return 1;
+            }
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(hwnd, &raw mut pid);
+            // Paths compared as Windows does (case-insensitive), both from the same API.
+            let same = exe_of(pid).is_some_and(|e| e.to_string_lossy().to_lowercase() == search.exe.to_string_lossy().to_lowercase());
+            if pid == std::process::id() || !same {
+                return 1;
+            }
+        }
+        search.found = hwnd;
+        0 // found: stop
+    }
+
+    // This process's path from the same API as the others' (`current_exe` keeps the case and
+    // form it was started with: a short 8.3 path or another case would never match).
+    let Some(exe) = exe_of(std::process::id()) else { return false };
+    let mut search = Search { exe, found: std::ptr::null_mut() };
+    unsafe {
+        EnumWindows(Some(each), &raw mut search as LPARAM);
+        if search.found.is_null() {
+            return false;
+        }
+        if IsIconic(search.found) != 0 {
+            ShowWindow(search.found, SW_RESTORE);
+        }
+        SetForegroundWindow(search.found);
+    }
+    true
+}
+
 fn clear_readonly(path: &Path) {
     if let Ok(meta) = fs::metadata(path) {
         let mut perms = meta.permissions();

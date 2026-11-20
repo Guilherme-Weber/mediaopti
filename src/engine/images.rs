@@ -91,7 +91,12 @@ pub(super) struct CpuCtx {
 
 impl CpuCtx {
     pub(super) fn new(image: image::Ctx, options: &crate::args::Options, slots: usize) -> Self {
-        let audio = image::Ctx { lossy: options.audio == crate::args::ImageMode::Lossy, ..image.clone() };
+        // Cover art keeps the default floor (the picture setting is for pictures).
+        let audio = image::Ctx {
+            lossy: options.audio == crate::args::ImageMode::Lossy,
+            target: f64::from(image::DEFAULT_TARGET),
+            ..image.clone()
+        };
         Self { image, audio, slots }
     }
 
@@ -187,12 +192,12 @@ impl Engine {
         image::Ctx {
             tools: self.tools(),
             lossy: options.images == crate::args::ImageMode::Lossy,
-            target: 93.0,
+            target: f64::from(options.image_target),
             lossy_min_gain: 0.03,
             strip: options.strip,
             strict_alpha: false,
             lossy_docs: options.lossy_docs,
-            parallel: slots > 1,
+            threads: if slots > 1 { 1 } else { 0 },
             timeout: std::time::Duration::from_secs(900),
             gate: image::tools::Gate::new(cancel, Some(self.paused.subscribe())),
             max: max_parts(options),
@@ -221,8 +226,8 @@ impl Engine {
         // original is set aside, and a file another job holds is left alone.
         let engine = Arc::clone(self);
         opts.busy = Some(Arc::new(move |p: &Path| engine.lock().in_progress.contains(p)));
-        let (engine, refused) = (Arc::clone(self), Arc::clone(&opts.lossless_only));
-        opts.note = Some(Arc::new(move |p: &Path| engine.note_content_now(p, image::mode(lossy && !refused.load(Ordering::Relaxed), strip))));
+        let (engine, refused, target) = (Arc::clone(self), Arc::clone(&opts.lossless_only), self.lock().target_for(input));
+        opts.note = Some(Arc::new(move |p: &Path| engine.note_content_now(p, image::mode_at(lossy && !refused.load(Ordering::Relaxed), strip, target))));
         let engine = Arc::clone(self);
         opts.warn = Some(Arc::new(move |line: String| engine.log(line)));
         self.reset_worker(worker_id, display, "optimizing as GIF");
@@ -337,8 +342,11 @@ impl Engine {
             let engine = Arc::clone(&self);
             // The mode as the file was really done: a big picture may get the lossless pass
             // only (decided inside process_image), and must then be noted as lossless.
-            let (strip, refused) = (self.lock().options.strip, Arc::clone(&opts.lossless_only));
-            opts.note = Some(Arc::new(move |p: &Path| engine.note_content_now(p, image::mode(lossy && !refused.load(Ordering::Relaxed), strip))));
+            let (strip, target, refused) = {
+                let inner = self.lock();
+                (inner.options.strip, inner.target_for(&path), Arc::clone(&opts.lossless_only))
+            };
+            opts.note = Some(Arc::new(move |p: &Path| engine.note_content_now(p, image::mode_at(lossy && !refused.load(Ordering::Relaxed), strip, target))));
             let engine = Arc::clone(&self);
             opts.warn = Some(Arc::new(move |line: String| engine.log(line)));
             if let Some(line) = announce {
@@ -386,7 +394,10 @@ impl Engine {
     }
 
     fn finish_image(self: &Arc<Self>, path: &Path, lossy: bool, result: ImageResult) {
-        let mode = image::mode(lossy, self.lock().options.strip);
+        let mode = {
+            let inner = self.lock();
+            image::mode_at(lossy, inner.options.strip, inner.target_for(path))
+        };
         let mut remembered = false;
         let (mut log, mut extra) = (None, None);
         let tag = match image::kind_of(path).map(image::Kind::stage) {
@@ -554,6 +565,51 @@ impl Engine {
 }
 
 use image::{big_lossy_fits, one_big_lossy_job, BIG_LOSSY_JOB, LOSSY_BYTES_PER_PIXEL};
+
+/// oxipng's commit memory (the hungriest tool; ECT takes less) for a picture, measured on a
+/// 31.2 MP PNG: 0.52 GB on one thread, 1.33 GB on 16 (ECT 0.35 -> 0.80 GB; 80 -> 42 s and
+/// 114 -> 76 s). So about 17 bytes a pixel for the first thread and 1.75 for each more.
+const MT_BASE_BYTES_PER_PIXEL: u64 = 17;
+const MT_EXTRA_PER_THREAD_PER_100_PIXELS: u64 = 175;
+
+/// Commit memory a picture's tools take on `threads` threads.
+fn tool_memory(pixels: u64, threads: u64) -> u64 {
+    pixels
+        .saturating_mul(MT_BASE_BYTES_PER_PIXEL)
+        .saturating_add((pixels.saturating_mul(MT_EXTRA_PER_THREAD_PER_100_PIXELS) / 100).saturating_mul(threads.saturating_sub(1)))
+}
+
+/// Threads a picture's tools may use with `free` commit memory (free now, less what other
+/// jobs were promised): as many as fit past a 2 GB reserve, all cores when they all fit (a
+/// 100 MP picture with 6 GB free still gets 15). Never a cliff from all to one: one only
+/// when even one thread's base doesn't fit. 0 = every core (the tool's default).
+fn picture_threads(pixels: u64, cores: u64, free: Option<u64>) -> usize {
+    let Some(free) = free.map(|a| a.saturating_sub(IMAGE_MIN_FREE_COMMIT)) else { return 0 };
+    let per_thread = (pixels.saturating_mul(MT_EXTRA_PER_THREAD_PER_100_PIXELS) / 100).max(1);
+    let base = tool_memory(pixels, 1);
+    let threads = if free <= base { 1 } else { 1 + (free - base) / per_thread };
+    if threads >= cores { 0 } else { usize::try_from(threads).unwrap_or(1).max(1) }
+}
+
+/// A picture's threads, with the memory of its extra threads promised (`image::promise`) so
+/// pictures starting together don't all count on the same free memory.
+fn picture_threads_promised(pixels: u64, cores: u64) -> (usize, Option<image::Promise>) {
+    for _ in 0..4 {
+        let available = system::memory_status().map(|m| m.available_commit);
+        let threads = picture_threads(pixels, cores, available.map(|a| a.saturating_sub(image::promised())));
+        let used = if threads == 0 { cores } else { threads as u64 };
+        let extra = tool_memory(pixels, used).saturating_sub(tool_memory(pixels, 1));
+        if extra == 0 {
+            return (threads, None);
+        }
+        // The picture's own first thread must still fit beside the promise (as in
+        // `picture_threads`). Another job took memory meanwhile: count again.
+        if let Some(p) = image::promise(extra, available, tool_memory(pixels, 1).saturating_add(IMAGE_MIN_FREE_COMMIT)) {
+            return (threads, Some(p));
+        }
+    }
+    (1, None)
+}
 
 /// Runs one CPU job so that a panic in it (a bug, a malformed file nobody foresaw) fails that
 /// file only, not remembered: the worker, its CPU slot and the counters carry on as for any
@@ -806,6 +862,15 @@ pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, dispo
         }
         return ImageResult::Kept { content: content_of(path), note: None };
     }
+    // PDF pictures keep the default floor: the picture setting's lower ones are for pictures
+    // (a page must stay readable).
+    let pdf_ctx;
+    let ctx = if kind == image::Kind::Pdf && ctx.target < f64::from(image::DEFAULT_TARGET) {
+        pdf_ctx = image::Ctx { target: f64::from(image::DEFAULT_TARGET), ..ctx.clone() };
+        &pdf_ctx
+    } else {
+        ctx
+    };
     // A big picture's visually lossless search runs alone, and only with its memory free;
     // otherwise this file gets the lossless pass only (and is tried again later).
     let pictured = matches!(kind, image::Kind::Png | image::Kind::Jpg | image::Kind::Bmp | image::Kind::Tga);
@@ -833,6 +898,22 @@ pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, dispo
         }
         lossless_ctx = image::Ctx { lossy: false, ..ctx.clone() };
         &lossless_ctx
+    } else {
+        ctx
+    };
+    // A picture's tools use every core (oxipng, ECT: the same bytes as with one thread), at
+    // below-normal priority: the files running at once fill each other's gaps (tool changes,
+    // disk) and the CPU stays busy; a few big PNGs used to leave most of it idle. Its lossy
+    // methods may then search side by side too. As many threads as its memory allows
+    // (`picture_threads`), never a drop from all to one.
+    let threaded_ctx;
+    let mut _threads_memory = None;
+    let ctx = if pictured && ctx.threads == 1 {
+        let cores = std::thread::available_parallelism().map_or(4, |n| n.get() as u64);
+        let (threads, promise) = picture_threads_promised(image::pixel_count(path).unwrap_or(0), cores);
+        _threads_memory = promise;
+        threaded_ctx = image::Ctx { threads, ..ctx.clone() };
+        &threaded_ctx
     } else {
         ctx
     };
@@ -1021,6 +1102,23 @@ fn keep_smaller_copy(path: &Path, existing: &Path, smaller: Option<&(PathBuf, u6
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Threads by memory, never a drop from all to one: the 31 MP picture measured runs on
+    /// every core; a 100 MP one gets as many as fit; only a real shortage leaves one.
+    #[test]
+    fn picture_threads_follow_the_memory() {
+        const GB: u64 = 1 << 30;
+        assert_eq!(picture_threads(31_200_000, 16, Some(4 * GB)), 0, "1.3 GB past the reserve: every core");
+        assert_eq!(picture_threads(31_200_000, 16, Some(5 * GB / 2)), 1, "only 0.5 GB past it: one thread's base");
+        assert_eq!(tool_memory(31_200_000, 16) / (1 << 20), 1286, "about the 1.33 GB measured");
+        assert_eq!(tool_memory(u64::MAX, 200), u64::MAX, "a damaged header can't overflow");
+        assert_eq!(picture_threads(100_000_000, 16, Some(6 * GB)), 15, "4 GB past the reserve");
+        assert_eq!(picture_threads(100_000_000, 16, Some(12 * GB)), 0, "enough for all");
+        assert_eq!(picture_threads(100_000_000, 16, Some(3 * GB)), 1, "less than one thread's base");
+        assert_eq!(picture_threads(100_000_000, 16, None), 0, "unknown memory: as the tools default");
+        let some = picture_threads(160_000_000, 16, Some(8 * GB));
+        assert!((2..16).contains(&some), "{some}");
+    }
 
     /// Workers waking together used to see the same free memory and all start: each one let
     /// in a moment ago now raises what the next needs, a little.

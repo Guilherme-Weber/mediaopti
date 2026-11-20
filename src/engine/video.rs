@@ -43,8 +43,10 @@ impl Engine {
     fn remember_without_gif_pass(&self, input: &Path) {
         if args::is_gif(input) {
             let mut inner = self.lock();
+            // The lowest floor: a lossy pass there covers every request (`contains_image`).
+            let lowest = crate::image::IMAGE_TARGETS.iter().copied().min().unwrap_or(crate::image::DEFAULT_TARGET);
             for (lossy, strip) in [(true, false), (false, false), (true, true), (false, true)] {
-                inner.history.add_image(input, crate::image::mode(lossy, strip));
+                inner.history.add_image(input, crate::image::mode_at(lossy, strip, lowest));
             }
         }
     }
