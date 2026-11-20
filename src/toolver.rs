@@ -210,11 +210,14 @@ mod tests {
     /// stall the version check until its time limit.
     #[test]
     fn a_long_stderr_does_not_stall_the_version_check() {
+        // A stall runs into the limit. Well under it is enough: PowerShell alone took 18 s
+        // to start on a busy CI runner (2026-11-20), so a fixed 15 s failed with no stall.
+        let limit = Duration::from_secs(60);
         let t = std::time::Instant::now();
         let script = "[Console]::Error.Write('x' * 200000); [Console]::Out.Write('tool v1.2.3')";
-        let out = output_of(Path::new("powershell"), &["-NoProfile", "-Command", script], Duration::from_secs(30)).unwrap();
+        let out = output_of(Path::new("powershell"), &["-NoProfile", "-Command", script], limit).unwrap();
         assert!(out.contains("tool v1.2.3"), "{}", &out[..out.len().min(200)]);
-        assert!(t.elapsed() < Duration::from_secs(15), "took {:?}", t.elapsed());
+        assert!(t.elapsed() < limit * 3 / 4, "took {:?}", t.elapsed());
     }
 
     #[test]
