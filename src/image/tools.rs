@@ -573,7 +573,13 @@ fn ran_out_of_memory(success: bool, code: Option<i32>, stderr: &[u8]) -> bool {
     });
     // STATUS_NO_MEMORY, STATUS_COMMITMENT_LIMIT
     const NO_MEMORY: [u32; 2] = [0xC000_0017, 0xC000_012D];
-    if MESSAGE.is_match(&String::from_utf8_lossy(stderr)) {
+    let text = String::from_utf8_lossy(stderr);
+    if text.lines().any(|line| {
+        // libpng caps ancillary chunks (e.g. a 10 MB Photoshop XMP iTXt) at
+        // PNG_USER_CHUNK_MALLOC_MAX (8 MB) and logs `libpng warning: iTXt: out of memory`
+        // while still decoding all pixels cleanly.
+        !(success && line.trim_start().starts_with("libpng warning:")) && MESSAGE.is_match(line)
+    }) {
         return true;
     }
     !success
@@ -600,6 +606,8 @@ mod tests {
         assert!(oom(false, Some(1), b"terminate called after throwing an instance of 'std::bad_alloc'"));
         assert!(!oom(false, Some(1), b"Invalid data found when processing input"));
         assert!(!oom(true, Some(0), b""));
+        assert!(!oom(true, Some(0), b"libpng warning: iTXt: out of memory\n"));
+        assert!(oom(false, Some(1), b"libpng error: Out of memory\n"));
     }
 
     use super::*;

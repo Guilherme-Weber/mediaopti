@@ -16,20 +16,6 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 
-# Rotated logs: mediaopti.N.log is older than mediaopti.(N-1).log; mediaopti.log is the newest.
-$files = Get-ChildItem -LiteralPath $LogDir -Filter 'mediaopti*.log' | Sort-Object {
-    if ($_.Name -match '^mediaopti\.(\d+)\.log$') { - [int]$Matches[1] } else { 0 }
-}
-if (-not $files) { throw "no logs in $LogDir" }
-$lines = @(foreach ($f in $files) { Get-Content -LiteralPath $f.FullName -Encoding UTF8 })
-
-# A run starts at its first "Starting ..." line (videos first, then images) after a scan.
-$starts = @()
-for ($i = 0; $i -lt $lines.Count; $i++) {
-    if ($lines[$i] -match '^\S+ \S+ Starting \d+ ' -and ($i -eq 0 -or $lines[$i - 1] -notmatch '^\S+ \S+ Starting \d+ ')) { $starts += $i }
-}
-if (-not $starts) { throw 'no run found in the logs' }
-
 # The cause of a failure line, without the file: grouped by its first words, numbers dropped.
 function Get-Cause([string]$Line) {
     $body = $Line -replace '^\S+ \S+ (\[[^\]]+\] )?', ''
@@ -68,6 +54,20 @@ if ($Failures) {
     }
     exit 0
 }
+
+# Rotated logs: mediaopti.N.log is older than mediaopti.(N-1).log; mediaopti.log is the newest.
+$files = Get-ChildItem -LiteralPath $LogDir -Filter 'mediaopti*.log' | Sort-Object {
+    if ($_.Name -match '^mediaopti\.(\d+)\.log$') { - [int]$Matches[1] } else { 0 }
+}
+if (-not $files) { throw "no logs in $LogDir" }
+$lines = @(foreach ($f in $files) { Get-Content -LiteralPath $f.FullName -Encoding UTF8 })
+
+# A run starts at its first "Starting ..." line (videos first, then images) after a scan.
+$starts = @()
+for ($i = 0; $i -lt $lines.Count; $i++) {
+    if ($lines[$i] -match '^\S+ \S+ Starting \d+ ' -and ($i -eq 0 -or $lines[$i - 1] -notmatch '^\S+ \S+ Starting \d+ ')) { $starts += $i }
+}
+if (-not $starts) { throw 'no run found in the logs' }
 
 $chosen = $starts | Select-Object -Last $Runs
 foreach ($s in $chosen) {

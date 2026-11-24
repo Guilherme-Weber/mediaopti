@@ -69,3 +69,15 @@ be removed from the history for them to be redone.
 - Fix: add a Windows Defender folder exclusion for `%APPDATA%\mediaopti\tools`, restore
   `beeim.exe` (or let `mediaopti` re-download it / copy it back from `bin/beeim.exe` on next
   start), and start another run — all failed and deferred PNG/BMP files are retried cleanly.
+
+### "not enough memory; left as it was, tried again next run" on PNGs with >8 MB XMP (`iTXt`): false, fixed after 3.4.0
+
+- Seen: 2 Division 2 mobile wallpaper PNGs on 2026-11-24 (~1.3 MB pixels + 10.8 MB Adobe Photoshop
+  `DocumentAncestors` bloat inside an uncompressed `iTXt` chunk), with >20 GB RAM free.
+- Cause: `libpng` (used by `ssimulacra2`) caps ancillary metadata chunks at
+  `PNG_USER_CHUNK_MALLOC_MAX` (8 MB) and prints `libpng warning: iTXt: out of memory` to stderr
+  while still decoding all pixels and exiting 0 with the exact score. `ran_out_of_memory`
+  matched `"out of memory"` on stderr even when `success == true`.
+- Fix: `ran_out_of_memory` in `src/image/tools.rs` ignores `libpng warning:` lines when the tool
+  exited successfully (`success == true`), while still catching `libpng error:` and ffmpeg
+  `get_buffer() failed` OOMs. Test: `running_out_of_memory_is_recognised`.
