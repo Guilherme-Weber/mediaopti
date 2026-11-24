@@ -9,7 +9,7 @@
 
 param([switch]$Force, [string]$Version = '')
 
-$PinnedVersion = '9.0.2'
+$PinnedVersion = '9.1'
 if (-not $Version) { $Version = $PinnedVersion }
 
 $ErrorActionPreference = 'Stop'
@@ -28,7 +28,7 @@ if ((Test-Path $target) -and -not $Force) {
 }
 
 if ($Version -eq 'latest') {
-    $Version = (Invoke-RestMethod "$baseUrl/release-version").Trim()
+    $Version = ([string](Invoke-RestMethod "$baseUrl/release-version")).Trim()
 }
 $version = $Version
 $zipUrl = "$baseUrl/packages/ffmpeg-$version-essentials_build.zip"

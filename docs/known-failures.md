@@ -53,3 +53,19 @@ be removed from the history for them to be redone.
   resources (1450)` / `Insufficient quota (1453)`: commit memory ran out (big lossy PDF
   searches in parallel). Since 3.1.0 these are `ToolUnavailable`, never remembered, and big
   searches wait for memory.
+
+## Images (2026-11-23)
+
+### `could not start ...\tools\beeim.exe: ... virus or potentially unwanted software (os error 225)` / `cannot find the file specified (os error 2)`
+
+- Seen: 21x `os error 225` (20 PNG + 1 BMP) followed by `os error 2` on BMPs during a large
+  parallel image run on 2026-11-23.
+- Cause: Windows Defender flagged and quarantined `%APPDATA%/mediaopti/tools/beeim.exe` mid-run
+  (false positive). After 20 consecutive PNG failures (`TOOL_FAILURES_TO_STOP`), the remaining
+  PNGs were cleanly dropped from that run (`left for the next run`), while BMPs kept hitting
+  `os error 2` when converting BMP -> PNG and invoking `beeim`.
+- Classification: `ToolUnavailable` ("a tool problem, not the file's: tried again next run"),
+  so zero files were remembered as broken in history.
+- Fix: add a Windows Defender folder exclusion for `%APPDATA%\mediaopti\tools`, restore
+  `beeim.exe` (or let `mediaopti` re-download it / copy it back from `bin/beeim.exe` on next
+  start), and start another run — all failed and deferred PNG/BMP files are retried cleanly.
