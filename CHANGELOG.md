@@ -3,6 +3,38 @@
 Notable changes to mediaopti. Earlier versions are described in their
 [GitHub releases](https://github.com/Guilherme-Weber/mediaopti/releases).
 
+## 3.5.0
+
+### Added
+
+- **Legacy & game videos:** `.bik` (Bink 1), `.xmv` (Xbox Media Video), `.ogv` (Ogg Theora),
+  `.asf` and `.pss` are now supported in the video pipeline (AV1 NVENC + VMAF >= 93). Bink
+  audio tracks (`binkaudio_dct`/`binkaudio_rdft`, non-copyable in MP4/MKV) transcode directly
+  to AAC (96 kb/s per channel) in `.mp4`, preserving all audio tracks; `.xmv` PCM audio
+  converts losslessly to FLAC in `.mkv` with bit-exact verification.
+- **Animated WebP to AV1 video:** animated `.webp` files (detected via streaming RIFF/WEBP
+  `VP8X` + `ANMF` header parsing) convert to `.mp4` with decoded `framecrc` frame-count and
+  duration verification, matching animated GIF safety; static `.webp` files are left untouched.
+- **Opus cover art optimization:** `.opus` files carrying `METADATA_BLOCK_PICTURE` cover art
+  optimize their embedded PNG/JPEG pictures using the active Images quality level (93/85/80),
+  copying all Ogg audio pages verbatim and verifying decoded audio via `audio_hash`.
+- **Maximum-effort lossless `.zip` recompression:** plain `.zip` archives are recompressed
+  losslessly with `ect -9 --mt-deflate -zip` in the Documents stage and verified by
+  decompressing every entry through its CRC-32 (skipping encrypted, signed or non-Deflate
+  archives).
+- **XMP bloat scanner script:** added `scripts/find-xmp-bloat.ps1` (read-only by default, with
+  optional `-OutCsv`, `-FromCsv` and verified byte-for-byte `-Fix`) to find and clean PNGs
+  bloated by Adobe Photoshop's `DocumentAncestors` XMP bug.
+
+### Fixed
+
+- **False "not enough memory" on PNGs with >8 MB XMP:** `ran_out_of_memory` now ignores
+  non-fatal `libpng warning:` lines (such as `libpng warning: iTXt: out of memory` when a
+  Photoshop `iTXt` chunk exceeds libpng's 8 MB `PNG_USER_CHUNK_MALLOC_MAX` cap) when the tool
+  exits cleanly (`success == true`), while still catching real `libpng error:` and ffmpeg OOMs.
+- **`scripts/log-summary.ps1 -Failures`:** now reads `failures.log` directly even when
+  `mediaopti*.log` has rotated past the last `Starting ...` line.
+
 ## 3.4.0
 
 Major throughput and memory-safety overhaul for images, documents and large libraries, plus
