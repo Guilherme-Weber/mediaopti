@@ -386,7 +386,7 @@ impl Engine {
         };
         // Off in Advanced options, or MEDIAOPTI_GPU_DECODE=0 (comparisons, a driver that misbehaves).
         let off = !allowed || std::env::var_os("MEDIAOPTI_GPU_DECODE").is_some_and(|v| v == "0");
-        if off || !matches!(encoder.as_str(), "av1_nvenc" | "hevc_nvenc") || args::is_gif(input) {
+        if off || !matches!(encoder.as_str(), "av1_nvenc" | "hevc_nvenc") || args::is_animated_picture(input) {
             return None;
         }
         streams.gpu_size
@@ -492,8 +492,8 @@ impl Engine {
     pub(super) async fn video_timing(&self, path: &Path) -> Result<Option<(u64, f64)>, Unfinished> {
         let mut cmd = tokio::process::Command::new(&self.ffmpeg_path);
         cmd.args(["-hide_banner", "-v", "error", "-i"]).arg(path).args(["-map", "0:v:0"]);
-        if args::is_gif(path) {
-            // Each decoded frame keeps the GIF's own delay; wrapped_avframe skips any encoding.
+        if args::is_animated_picture(path) {
+            // Each decoded frame keeps the GIF/WebP's own delay; wrapped_avframe skips any encoding.
             cmd.args(["-fps_mode", "passthrough", "-enc_time_base", "demux", "-c:v", "wrapped_avframe", "-f", "framecrc", "-"]);
         } else {
             cmd.args(["-c", "copy", "-f", "framemd5", "-"]);

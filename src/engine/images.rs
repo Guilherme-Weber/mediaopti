@@ -965,11 +965,11 @@ pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, dispo
     // they are (nothing writes to `src`: in-place tools copy to `work` first, write-to tools
     // write into `work`), saving millions of redundant temp copies on C:.
     let ascii_short = path.as_os_str().len() < 248 && path.to_str().is_some_and(str::is_ascii);
-    let in_place = (matches!(kind, image::Kind::Flac | image::Kind::Mp3 | image::Kind::Ogg) && path.as_os_str().len() < 248)
+    let in_place = (matches!(kind, image::Kind::Flac | image::Kind::Mp3 | image::Kind::Ogg | image::Kind::Opus) && path.as_os_str().len() < 248)
         || (matches!(kind, image::Kind::Png | image::Kind::Jpg | image::Kind::Gif) && kind == named && ascii_short);
     let factor = match kind {
         image::Kind::Pdf => 16,
-        _ if matches!(kind, image::Kind::Flac | image::Kind::Mp3 | image::Kind::Ogg) && in_place => 2,
+        _ if matches!(kind, image::Kind::Flac | image::Kind::Mp3 | image::Kind::Ogg | image::Kind::Opus) && in_place => 2,
         _ => 4,
     };
     let workdir = match WorkDir::new(path, state.0, factor, &opts.temp, &format!("mediaopti-img-{}-{job}", std::process::id())) {

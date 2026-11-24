@@ -43,6 +43,7 @@ pub fn optimize(ctx: &Ctx, kind: Kind, src: &Path, work: &Path) -> Result<Optimi
         Kind::Mp3 => mp3(ctx, src, work),
         Kind::Wav => wav(ctx, src, work),
         Kind::Ogg => ogg(ctx, src, work),
+        Kind::Opus => opus(ctx, src, work),
         Kind::LosslessAudio => lossless_to_flac(ctx, src, work),
         _ => unreachable!("not audio"),
     };
@@ -339,6 +340,14 @@ pub fn worth_trying(ctx: &Ctx, kind: Kind, path: &Path) -> bool {
         }),
         Kind::Wav => ctx.tools.has("flac") && wav_format(path).ok().flatten().is_some(),
         Kind::Ogg => ctx.tools.has("optivorbis") && ogg_info(path).ok().flatten().is_some(),
+        Kind::Opus => opus_read_headers(path).ok().flatten().is_some_and(|h| {
+            h.comments.iter().any(|c| {
+                opus_picture_b64(c)
+                    .and_then(base64_decode)
+                    .and_then(|raw| picture_parse(&raw).map(|p| has_art(p.data)))
+                    .unwrap_or(false)
+            })
+        }),
         _ => true,
     }
 }
@@ -453,6 +462,358 @@ fn ogg(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, AudioError> {
             got_len % frame == 0 && decoded(ctx, src, Some(got_len / frame))?.is_some_and(|(h, n)| h == got && n == got_len)
         });
     Ok(if same { Optimized::found(Some(out), vec!["optivorbis".into()]) } else { Optimized::nothing() })
+}
+
+// ---------------------------------------------------------------- Ogg Opus (cover art)
+
+/// Standard Ogg CRC-32 (RFC 3533: polynomial 0x04C11DB7, MSB-first, no reflection, init 0).
+fn ogg_crc32(data: &[u8]) -> u32 {
+    static TABLE: std::sync::LazyLock<[u32; 256]> = std::sync::LazyLock::new(|| {
+        let mut t = [0u32; 256];
+        for (i, slot) in t.iter_mut().enumerate() {
+            let mut r = (i as u32) << 24;
+            for _ in 0..8 {
+                r = if r & 0x8000_0000 != 0 { (r << 1) ^ 0x04C1_1DB7 } else { r << 1 };
+            }
+            *slot = r;
+        }
+        t
+    });
+    let t = &*TABLE;
+    let mut crc = 0u32;
+    for &b in data {
+        crc = (crc << 8) ^ t[((crc >> 24) as u8 ^ b) as usize];
+    }
+    crc
+}
+
+fn base64_decode(input: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    let mut buf = [0u8; 4];
+    let mut n = 0usize;
+    let mut pad = 0usize;
+    for &b in input {
+        if b.is_ascii_whitespace() {
+            continue;
+        }
+        let v = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => {
+                pad += 1;
+                0
+            }
+            _ => return None,
+        };
+        if pad > 0 && b != b'=' {
+            return None;
+        }
+        buf[n] = v;
+        n += 1;
+        if n == 4 {
+            out.push((buf[0] << 2) | (buf[1] >> 4));
+            if pad < 2 {
+                out.push((buf[1] << 4) | (buf[2] >> 2));
+            }
+            if pad < 1 {
+                out.push((buf[2] << 6) | buf[3]);
+            }
+            n = 0;
+            pad = 0;
+        }
+    }
+    (n == 0).then_some(out)
+}
+
+fn base64_encode(data: &[u8]) -> Vec<u8> {
+    const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = Vec::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+        out.push(ALPHA[(b0 >> 2) as usize]);
+        out.push(ALPHA[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize]);
+        out.push(if chunk.len() > 1 { ALPHA[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] } else { b'=' });
+        out.push(if chunk.len() > 2 { ALPHA[(b2 & 0x3f) as usize] } else { b'=' });
+    }
+    out
+}
+
+/// If `comment` is `METADATA_BLOCK_PICTURE=<base64>` (case-insensitive key), returns the base64 slice.
+fn opus_picture_b64(comment: &[u8]) -> Option<&[u8]> {
+    let eq = comment.iter().position(|&b| b == b'=')?;
+    comment[..eq].eq_ignore_ascii_case(b"METADATA_BLOCK_PICTURE").then_some(&comment[eq + 1..])
+}
+
+struct OpusHeaders {
+    serial: u32,
+    head_page: Vec<u8>,
+    vendor: Vec<u8>,
+    comments: Vec<Vec<u8>>,
+    audio_at: u64,
+}
+
+/// Reads the `OpusHead` page and `OpusTags` packet of a single-stream Ogg Opus file without
+/// reading the audio pages. Returns `Ok(None)` for non-Opus or unusual/chained streams.
+fn opus_read_headers(path: &Path) -> io::Result<Option<OpusHeaders>> {
+    type OggPage = ([u8; 27], Vec<u8>, Vec<u8>);
+    let mut f = BufReader::new(File::open(path)?);
+    let read_page = |f: &mut BufReader<File>| -> io::Result<Option<OggPage>> {
+        let mut h = [0u8; 27];
+        match read_full(f, &mut h)? {
+            0 => return Ok(None),
+            27 if &h[..4] == b"OggS" && h[4] == 0 => {}
+            _ => return Ok(None),
+        }
+        let mut lacing = vec![0u8; usize::from(h[26])];
+        if read_full(f, &mut lacing)? != lacing.len() {
+            return Ok(None);
+        }
+        let body_len: usize = lacing.iter().map(|&l| usize::from(l)).sum();
+        if body_len as u64 > MAX_META {
+            return Ok(None);
+        }
+        let mut body = vec![0u8; body_len];
+        if read_full(f, &mut body)? != body_len {
+            return Ok(None);
+        }
+        Ok(Some((h, lacing, body)))
+    };
+
+    // Page 0: BOS with a single OpusHead packet.
+    let Some((h0, l0, b0)) = read_page(&mut f)? else { return Ok(None) };
+    if h0[5] & 0x02 == 0 || !b0.starts_with(b"OpusHead") || b0.len() < 19 || l0.last().is_none_or(|&l| l == 255) {
+        return Ok(None);
+    }
+    // Must hold exactly one packet on Page 0.
+    if l0.iter().filter(|&&l| l < 255).count() != 1 {
+        return Ok(None);
+    }
+    let serial = u32::from_le_bytes(h0[14..18].try_into().unwrap());
+    let mut head_page = Vec::with_capacity(27 + l0.len() + b0.len());
+    head_page.extend_from_slice(&h0);
+    head_page.extend_from_slice(&l0);
+    head_page.extend_from_slice(&b0);
+
+    // Pages 1..=k: the single OpusTags packet, finishing at the end of page k (RFC 7845).
+    let mut tags_pkt = Vec::new();
+    let mut first = true;
+    loop {
+        let Some((h, lacing, body)) = read_page(&mut f)? else { return Ok(None) };
+        let page_serial = u32::from_le_bytes(h[14..18].try_into().unwrap());
+        if page_serial != serial || h[5] & 0x02 != 0 {
+            return Ok(None);
+        }
+        if first && h[5] & 0x01 != 0 {
+            return Ok(None);
+        }
+        if !first && h[5] & 0x01 == 0 {
+            return Ok(None);
+        }
+        first = false;
+        let terminators = lacing.iter().filter(|&&l| l < 255).count();
+        tags_pkt.extend_from_slice(&body);
+        if tags_pkt.len() as u64 > MAX_META {
+            return Ok(None);
+        }
+        if terminators > 1 || (terminators == 1 && lacing.last().is_some_and(|&l| l == 255)) {
+            return Ok(None); // audio packet packed onto the OpusTags page: leave alone
+        }
+        if terminators == 1 {
+            break;
+        }
+    }
+    let audio_at = f.stream_position()?;
+
+    // Parse OpusTags: "OpusTags", vendor_len (u32 LE), vendor, count (u32 LE), comments...
+    if !tags_pkt.starts_with(b"OpusTags") || tags_pkt.len() < 16 {
+        return Ok(None);
+    }
+    let vl = u32::from_le_bytes(tags_pkt[8..12].try_into().unwrap()) as usize;
+    let Some(mut pos) = 12usize.checked_add(vl) else { return Ok(None) };
+    let Some(vendor) = tags_pkt.get(12..pos).map(<[u8]>::to_vec) else { return Ok(None) };
+    let Some(count_bytes) = tags_pkt.get(pos..pos + 4).and_then(|s| <[u8; 4]>::try_from(s).ok()) else { return Ok(None) };
+    let count = u32::from_le_bytes(count_bytes) as usize;
+    pos += 4;
+    let mut comments = Vec::with_capacity(count.min(4096));
+    for _ in 0..count {
+        let Some(cl_bytes) = tags_pkt.get(pos..pos + 4).and_then(|s| <[u8; 4]>::try_from(s).ok()) else { return Ok(None) };
+        let cl = u32::from_le_bytes(cl_bytes) as usize;
+        pos += 4;
+        let Some(end) = pos.checked_add(cl) else { return Ok(None) };
+        let Some(entry) = tags_pkt.get(pos..end) else { return Ok(None) };
+        comments.push(entry.to_vec());
+        pos = end;
+    }
+    // Preserve any unusual trailing vendor padding by skipping files that carry it.
+    if pos != tags_pkt.len() {
+        return Ok(None);
+    }
+    Ok(Some(OpusHeaders { serial, head_page, vendor, comments, audio_at }))
+}
+
+/// Writes a single Ogg packet across 1+ pages with sequential `seq`, returning the next `seq`.
+fn write_ogg_packet(w: &mut impl Write, serial: u32, mut seq: u32, packet: &[u8]) -> io::Result<u32> {
+    // Each page carries up to 255 segments (max 255 * 255 = 65025 bytes).
+    let mut segs: Vec<u8> = Vec::with_capacity(packet.len() / 255 + 1);
+    let mut rem = packet.len();
+    while rem >= 255 {
+        segs.push(255);
+        rem -= 255;
+    }
+    segs.push(rem as u8);
+
+    let mut offset = 0usize;
+    let mut first = true;
+    for chunk in segs.chunks(255) {
+        let body_len: usize = chunk.iter().map(|&s| usize::from(s)).sum();
+        let body = &packet[offset..offset + body_len];
+        offset += body_len;
+
+        let mut page = Vec::with_capacity(27 + chunk.len() + body_len);
+        page.extend_from_slice(b"OggS");
+        page.push(0); // version
+        page.push(u8::from(!first)); // 0x01 = continuation page
+        page.extend_from_slice(&0u64.to_le_bytes()); // granule position 0 for header pages
+        page.extend_from_slice(&serial.to_le_bytes());
+        page.extend_from_slice(&seq.to_le_bytes());
+        page.extend_from_slice(&0u32.to_le_bytes()); // CRC placeholder
+        page.push(chunk.len() as u8);
+        page.extend_from_slice(chunk);
+        page.extend_from_slice(body);
+        let crc = ogg_crc32(&page);
+        page[22..26].copy_from_slice(&crc.to_le_bytes());
+        w.write_all(&page)?;
+        seq = seq.wrapping_add(1);
+        first = false;
+    }
+    Ok(seq)
+}
+
+/// Streams remaining Ogg audio pages from `src` at `audio_at` to `out`, renumbering
+/// `page_sequence_number` from `seq` and updating each page's CRC-32. Returns `false` if a
+/// chained stream or corrupt page is found.
+fn copy_ogg_audio_pages(src: &Path, audio_at: u64, serial: u32, mut seq: u32, out: &mut impl Write) -> io::Result<bool> {
+    let mut f = BufReader::new(File::open(src)?);
+    f.seek(SeekFrom::Start(audio_at))?;
+    let mut page = Vec::new();
+    let mut seen_any = false;
+    loop {
+        let mut h = [0u8; 27];
+        match read_full(&mut f, &mut h)? {
+            0 => return Ok(seen_any),
+            27 if &h[..4] == b"OggS" && h[4] == 0 => {}
+            _ => return Ok(false),
+        }
+        let page_serial = u32::from_le_bytes(h[14..18].try_into().unwrap());
+        if page_serial != serial || h[5] & 0x02 != 0 {
+            return Ok(false); // chained or multi-stream Ogg
+        }
+        let nsegs = usize::from(h[26]);
+        let mut lacing = vec![0u8; nsegs];
+        if read_full(&mut f, &mut lacing)? != nsegs {
+            return Ok(false);
+        }
+        let body_len: usize = lacing.iter().map(|&l| usize::from(l)).sum();
+        page.clear();
+        page.reserve(27 + nsegs + body_len);
+        h[18..22].copy_from_slice(&seq.to_le_bytes());
+        h[22..26].copy_from_slice(&[0; 4]);
+        page.extend_from_slice(&h);
+        page.extend_from_slice(&lacing);
+        let start = page.len();
+        page.resize(start + body_len, 0);
+        if read_full(&mut f, &mut page[start..])? != body_len {
+            return Ok(false);
+        }
+        let crc = ogg_crc32(&page);
+        page[22..26].copy_from_slice(&crc.to_le_bytes());
+        out.write_all(&page)?;
+        seq = seq.wrapping_add(1);
+        seen_any = true;
+    }
+}
+
+/// Optimizes embedded cover art (`METADATA_BLOCK_PICTURE`) in an Ogg Opus file; audio packets
+/// are copied verbatim without re-encoding and verified via `audio_hash`.
+fn opus(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, AudioError> {
+    let Some(orig) = opus_read_headers(src)? else {
+        return Ok(Optimized::nothing());
+    };
+    let mut new_comments = orig.comments.clone();
+    let (mut n_art, mut art_steps) = (0usize, BTreeSet::new());
+    for (k, comment) in new_comments.iter_mut().enumerate() {
+        let Some(b64) = opus_picture_b64(comment) else { continue };
+        let Some(raw) = base64_decode(b64) else { continue };
+        let Some(pic) = picture_parse(&raw) else { continue };
+        if pic.data.len() < MIN_ART {
+            continue;
+        }
+        if let Some((img, s)) = optimize_art(ctx, pic.data, &work.join(format!("art{k}")))? {
+            let built = picture_build(&pic, &img);
+            let mut entry = b"METADATA_BLOCK_PICTURE=".to_vec();
+            entry.extend_from_slice(&base64_encode(&built));
+            *comment = entry;
+            n_art += 1;
+            art_steps.extend(s);
+        }
+    }
+    if n_art == 0 {
+        return Ok(Optimized::nothing());
+    }
+
+    // Build OpusTags packet.
+    let mut pkt = Vec::with_capacity(orig.vendor.len() + 64);
+    pkt.extend_from_slice(b"OpusTags");
+    pkt.extend_from_slice(&(orig.vendor.len() as u32).to_le_bytes());
+    pkt.extend_from_slice(&orig.vendor);
+    pkt.extend_from_slice(&(new_comments.len() as u32).to_le_bytes());
+    for c in &new_comments {
+        pkt.extend_from_slice(&(c.len() as u32).to_le_bytes());
+        pkt.extend_from_slice(c);
+    }
+
+    let out = work.join("out.opus");
+    {
+        let mut w = io::BufWriter::new(File::create(&out)?);
+        w.write_all(&orig.head_page)?;
+        let next_seq = write_ogg_packet(&mut w, orig.serial, 1, &pkt)?;
+        if !copy_ogg_audio_pages(src, orig.audio_at, orig.serial, next_seq, &mut w)? {
+            return Ok(Optimized::nothing());
+        }
+        w.flush()?;
+    }
+
+    if std::fs::metadata(&out)?.len() >= std::fs::metadata(src)?.len() {
+        return Ok(Optimized::nothing());
+    }
+    let Some(re) = opus_read_headers(&out)? else { return Ok(Optimized::nothing()) };
+    let headers_ok = re.head_page == orig.head_page
+        && re.vendor == orig.vendor
+        && re.comments.len() == orig.comments.len()
+        && re.comments.iter().zip(&orig.comments).all(|(a, b)| match (opus_picture_b64(a), opus_picture_b64(b)) {
+            (Some(ba), Some(bb)) => match (base64_decode(ba), base64_decode(bb)) {
+                (Some(ra), Some(rb)) => match (picture_parse(&ra), picture_parse(&rb)) {
+                    (Some(pa), Some(pb)) => pa.ptype == pb.ptype && pa.mime == pb.mime && pa.desc == pb.desc && pa.width == pb.width && pa.height == pb.height,
+                    _ => a == b,
+                },
+                _ => a == b,
+            },
+            (None, None) => a == b,
+            _ => false,
+        });
+    if !headers_ok {
+        return Ok(Optimized::nothing());
+    }
+    let mut orig_audio = None;
+    if !same_audio(ctx, src, &mut orig_audio, &out)? {
+        return Ok(Optimized::nothing());
+    }
+    Ok(Optimized::found(Some(out), vec![art_label(n_art, &art_steps)]))
 }
 
 // ---------------------------------------------------------------- other lossless -> FLAC
@@ -1237,6 +1598,62 @@ mod tests {
         let best = r.best.unwrap_or_else(|| panic!("no gain ({:?})", r.note));
         println!("Ogg: {} -> {} {:?}", std::fs::metadata(&ogg).unwrap().len(), std::fs::metadata(&best).unwrap().len(), r.steps);
         assert_eq!(ogg_info(&best).unwrap(), Some(info), "format or tags changed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An Ogg Opus file with an uncompressed PNG cover (`METADATA_BLOCK_PICTURE`): the cover
+    /// shrinks, all tags and decoded audio samples stay identical, and an Opus without cover art
+    /// is skipped cheaply by `worth_trying`.
+    #[test]
+    fn opus_cover_art_is_optimized() {
+        let Some(c) = ctx() else {
+            skip_test!("audio tools not found");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("mo-opus-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = |p: &Path| p.to_string_lossy().into_owned();
+        let plain = dir.join("plain.opus");
+        ff(&c, &["-f", "lavfi", "-i", "sine=frequency=440:duration=3", "-c:a", "libopus", "-metadata", "title=OpusTrack", &s(&plain)]);
+        assert!(!worth_trying(&c, Kind::Opus, &plain), "no cover art -> skipped cheaply");
+
+        // Build a valid Opus file carrying an uncompressed PNG in METADATA_BLOCK_PICTURE.
+        let cover = dir.join("cover.png");
+        ff(&c, &["-f", "lavfi", "-i", "mandelbrot=s=300x300", "-frames:v", "1", "-compression_level", "0", &s(&cover)]);
+        let png_data = std::fs::read(&cover).unwrap();
+        let orig = opus_read_headers(&plain).unwrap().expect("opus headers");
+        let pic = Picture { ptype: 3, mime: b"image/png", desc: b"Front", width: 300, height: 300, data: &png_data };
+        let mut comments = orig.comments.clone();
+        let mut pic_comment = b"METADATA_BLOCK_PICTURE=".to_vec();
+        pic_comment.extend_from_slice(&base64_encode(&picture_build(&pic, &png_data)));
+        comments.push(pic_comment);
+        let mut pkt = b"OpusTags".to_vec();
+        pkt.extend_from_slice(&(orig.vendor.len() as u32).to_le_bytes());
+        pkt.extend_from_slice(&orig.vendor);
+        pkt.extend_from_slice(&(comments.len() as u32).to_le_bytes());
+        for cm in &comments {
+            pkt.extend_from_slice(&(cm.len() as u32).to_le_bytes());
+            pkt.extend_from_slice(cm);
+        }
+        let with_cover = dir.join("with_cover.opus");
+        {
+            let mut w = io::BufWriter::new(File::create(&with_cover).unwrap());
+            w.write_all(&orig.head_page).unwrap();
+            let seq = write_ogg_packet(&mut w, orig.serial, 1, &pkt).unwrap();
+            assert!(copy_ogg_audio_pages(&plain, orig.audio_at, orig.serial, seq, &mut w).unwrap());
+            w.flush().unwrap();
+        }
+        assert!(worth_trying(&c, Kind::Opus, &with_cover), "cover art detected");
+        let before = std::fs::metadata(&with_cover).unwrap().len();
+        let work = dir.join("w");
+        std::fs::create_dir_all(&work).unwrap();
+        let r = optimize(&c, Kind::Opus, &with_cover, &work).unwrap();
+        let best = r.best.unwrap_or_else(|| panic!("no gain ({:?})", r.note));
+        let after = std::fs::metadata(&best).unwrap().len();
+        assert!(after < before, "{before} -> {after}");
+        assert!(r.steps[0].starts_with("cover-art[1:"), "{:?}", r.steps);
+        assert_eq!(audio_hash(&c, &with_cover).unwrap(), audio_hash(&c, &best).unwrap(), "decoded audio changed");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

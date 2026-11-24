@@ -195,26 +195,34 @@ impl Engine {
             return Outcome::Skipped;
         }
 
-        // Skip static 1-frame GIFs and tiny spacer GIFs immediately.
-        if args::is_gif(&input) {
+        // Skip static 1-frame GIFs/WebPs and tiny spacers immediately.
+        if args::is_animated_picture(&input) {
             let path = input.clone();
+            let webp = args::is_webp(&input);
             let valid = self
                 .blocking(move || {
-                    std::fs::File::open(&path)
-                        .is_ok_and(|f| system::is_animated_and_valid_gif(std::io::BufReader::new(f)))
+                    std::fs::File::open(&path).is_ok_and(|f| {
+                        let r = std::io::BufReader::new(f);
+                        if webp {
+                            system::is_animated_and_valid_webp(r)
+                        } else {
+                            system::is_animated_and_valid_gif(r)
+                        }
+                    })
                 })
                 .await;
             if !valid {
-                // The scan sends still and tiny GIFs to the images: this one changed since
-                // (replaced on disk). Not remembered: the next scan places it as it is now.
+                // The scan sends still/tiny GIFs to images and ignores still WebPs: this one
+                // changed since (replaced on disk). Not remembered: checked again next time.
                 self.lock().in_progress.remove(&input);
                 {
                     let mut inner = self.lock();
                     inner.run.completed += 1;
                     inner.run.skipped += 1;
                 }
+                let kind_name = if webp { "WebP" } else { "GIF" };
                 self.log(format!(
-                    "[Worker {worker_id}] Skipped {display}: it is no longer an animated GIF (changed since the scan); it will be checked again next time"
+                    "[Worker {worker_id}] Skipped {display}: it is no longer an animated {kind_name} (changed since the scan); it will be checked again next time"
                 ));
                 self.send_state(false);
                 return Outcome::Skipped;
@@ -223,7 +231,7 @@ impl Engine {
 
         // What it holds besides the picture decides the container (MKV when MP4 can't
         // hold it) and is carried over by every attempt, then checked in the result.
-        let streams = if args::is_gif(&input) { Ok(args::Streams::default()) } else { self.probe_streams(&input).await };
+        let streams = if args::is_animated_picture(&input) { Ok(args::Streams::default()) } else { self.probe_streams(&input).await };
         let Ok(streams) = streams else {
             // Not knowing its tracks, an encode would drop them: never go on without.
             if self.job_released() {
@@ -372,7 +380,7 @@ impl Engine {
         // Audio stream copy rejected by the muxer -> transcode audio to AAC. Never lossless
         // audio: the check only counts tracks, so FLAC/TrueHD/PCM would silently become AAC
         // (and the failure is rarely the audio's; the CPU fallback below copies it).
-        if can_retry(self, &attempt) && !tried_cpu && initial_mode == Mode::Primary && !args::is_gif(&input) && streams.lossless_audio {
+        if can_retry(self, &attempt) && !tried_cpu && initial_mode == Mode::Primary && !args::is_animated_picture(&input) && streams.lossless_audio {
             self.log(format!(
                 "[Worker {worker_id}] The first encode failed on {display}; its audio is lossless, so it is not re-encoded to AAC"
             ));
@@ -380,7 +388,7 @@ impl Engine {
         if can_retry(self, &attempt)
             && !tried_cpu
             && initial_mode == Mode::Primary
-            && !args::is_gif(&input)
+            && !args::is_animated_picture(&input)
             && !streams.lossless_audio
         {
             self.log_remove(&tmp);
@@ -552,9 +560,10 @@ impl Engine {
         // video must keep everything else it held (audio tracks, subtitles, attachments,
         // covers, chapters) and its length.
         let lost: Result<Option<String>, super::ffmpeg::Unfinished> = async {
-            if args::is_gif(&input) {
-                let (gif_timing, video_timing) = (self.video_timing(&input).await?, self.video_timing(&tmp).await?);
-                return Ok(super::ffmpeg::timing_mismatch(gif_timing, video_timing).map(|why| format!("doesn't match the GIF ({why})")));
+            if args::is_animated_picture(&input) {
+                let (anim_timing, video_timing) = (self.video_timing(&input).await?, self.video_timing(&tmp).await?);
+                let label = if args::is_webp(&input) { "WebP" } else { "GIF" };
+                return Ok(super::ffmpeg::timing_mismatch(anim_timing, video_timing).map(|why| format!("doesn't match the {label} ({why})")));
             }
             let after = self.probe_streams(&tmp).await?;
             let mut why = super::ffmpeg::streams_lost(&streams, &after);

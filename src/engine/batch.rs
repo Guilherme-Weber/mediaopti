@@ -72,7 +72,7 @@ impl Engine {
                 return;
             }
             (opts.videos && !inner.gifs_checked && inner.dir.is_some())
-                .then(|| inner.files.iter().filter(|f| args::is_gif(f)).cloned().collect::<Vec<_>>())
+                .then(|| inner.files.iter().filter(|f| args::is_animated_picture(f)).cloned().collect::<Vec<_>>())
         };
         let checked_gifs = need_gifs.map(|gifs| super::scan::find_static_gifs(&gifs, None));
         {
@@ -106,7 +106,7 @@ impl Engine {
         let lazy_gifs = {
             let inner = self.lock();
             (!inner.working && inner.dir.is_some() && opts.videos && !inner.gifs_checked)
-                .then(|| inner.files.iter().filter(|f| args::is_gif(f)).cloned().collect::<Vec<_>>())
+                .then(|| inner.files.iter().filter(|f| args::is_animated_picture(f)).cloned().collect::<Vec<_>>())
         };
         let checked_gifs = match lazy_gifs {
             Some(gifs) => Some(self.blocking(move || super::scan::find_static_gifs(&gifs, None)).await),

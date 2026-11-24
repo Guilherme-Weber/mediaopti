@@ -38,6 +38,8 @@ pub enum Kind {
     Wav,
     /// Ogg Vorbis, repacked losslessly by OptiVorbis.
     Ogg,
+    /// Ogg Opus: embedded cover art (`METADATA_BLOCK_PICTURE`) optimized; audio pages copied verbatim.
+    Opus,
     /// Other lossless audio (ALAC in .m4a, AIFF, APE, WavPack, TTA), converted to FLAC when
     /// conversions are on and the FLAC is smaller. (An .m4a holding AAC is left alone.)
     LosslessAudio,
@@ -46,6 +48,8 @@ pub enum Kind {
     Tga,
     /// Office, OpenDocument and EPUB: zip repacked, pictures inside optimized losslessly.
     Doc,
+    /// Plain ZIP archive: recompressed losslessly at maximum Deflate effort (`ect -9`).
+    Zip,
     /// Comic book archive (zip): pictures inside follow the image setting.
     Cbz,
     /// Comic book archive (RAR), converted to CBZ when conversions are on.
@@ -56,16 +60,16 @@ pub enum Kind {
 
 impl Kind {
     pub fn is_audio(self) -> bool {
-        matches!(self, Kind::Flac | Kind::Mp3 | Kind::Wav | Kind::Ogg | Kind::LosslessAudio)
+        matches!(self, Kind::Flac | Kind::Mp3 | Kind::Wav | Kind::Ogg | Kind::Opus | Kind::LosslessAudio)
     }
 
     pub fn is_archive(self) -> bool {
-        matches!(self, Kind::Doc | Kind::Cbz | Kind::Cbr)
+        matches!(self, Kind::Doc | Kind::Zip | Kind::Cbz | Kind::Cbr)
     }
 
-    /// Documents: PDF, Office/ODF/EPUB, comics.
+    /// Documents: PDF, Office/ODF/EPUB, comics, plain ZIPs.
     pub fn is_document(self) -> bool {
-        matches!(self, Kind::Pdf | Kind::Doc | Kind::Cbz | Kind::Cbr)
+        matches!(self, Kind::Pdf | Kind::Doc | Kind::Zip | Kind::Cbz | Kind::Cbr)
     }
 
     /// The CPU queue stage this kind runs in: 0 audio (disk-heavy, few at a time), 1 documents
@@ -94,9 +98,11 @@ pub fn kind_of(path: &Path) -> Option<Kind> {
         "wav" => Some(Kind::Wav),
         "m4a" | "aif" | "aiff" | "aifc" | "ape" | "wv" | "tta" => Some(Kind::LosslessAudio),
         "ogg" | "oga" => Some(Kind::Ogg),
+        "opus" => Some(Kind::Opus),
         "bmp" => Some(Kind::Bmp),
         "tga" => Some(Kind::Tga),
         "docx" | "xlsx" | "pptx" | "docm" | "xlsm" | "pptm" | "odt" | "ods" | "odp" | "odg" | "epub" => Some(Kind::Doc),
+        "zip" => Some(Kind::Zip),
         "cbz" => Some(Kind::Cbz),
         "cbr" => Some(Kind::Cbr),
         "pdf" => Some(Kind::Pdf),
@@ -726,7 +732,8 @@ pub fn missing_tool(ctx: &Ctx, kind: Kind) -> Option<&'static str> {
         Kind::Flac | Kind::LosslessAudio => &["flac", "oxipng", "jpegtran"],
         Kind::Wav => &["flac"],
         Kind::Ogg => &["optivorbis"],
-        Kind::Mp3 | Kind::Doc | Kind::Cbz => &["oxipng", "jpegtran"],
+        Kind::Mp3 | Kind::Opus | Kind::Doc | Kind::Cbz => &["oxipng", "jpegtran"],
+        Kind::Zip => &["ect"],
         Kind::Cbr => &["7z", "oxipng", "jpegtran"],
         // Its JPEGs are re-optimized through jpegtran and checked with djpeg.
         Kind::Pdf => &["qpdf", "jpegtran", "djpeg"],
@@ -746,7 +753,7 @@ pub fn lossy_tools_present(ctx: &Ctx, kind: Kind) -> bool {
             Kind::Png | Kind::Bmp | Kind::Tga => png,
             Kind::Jpg => jpg,
             // Comic pages and cover art may be either.
-            Kind::Cbz | Kind::Cbr | Kind::Flac | Kind::Mp3 | Kind::LosslessAudio => png && jpg,
+            Kind::Cbz | Kind::Cbr | Kind::Flac | Kind::Mp3 | Kind::Opus | Kind::LosslessAudio => png && jpg,
             // Its pictures become JPEGs, and its pages are rendered to check them.
             Kind::Pdf => t.has("mutool") && jpeg_encoder,
             _ => true,
@@ -758,7 +765,7 @@ pub fn lossy_tools_present(ctx: &Ctx, kind: Kind) -> bool {
 pub fn has_lossy_part(ctx: &Ctx, kind: Kind) -> bool {
     ctx.lossy
         && match kind {
-            Kind::Png | Kind::Jpg | Kind::Bmp | Kind::Tga | Kind::Cbz | Kind::Cbr | Kind::Flac | Kind::Mp3 | Kind::LosslessAudio => true,
+            Kind::Png | Kind::Jpg | Kind::Bmp | Kind::Tga | Kind::Cbz | Kind::Cbr | Kind::Flac | Kind::Mp3 | Kind::Opus | Kind::LosslessAudio => true,
             Kind::Pdf => ctx.lossy_docs,
             _ => false,
         }
@@ -1728,8 +1735,9 @@ mod tests {
             ("optivorbis", &[Kind::Ogg]),
             ("qpdf", &[Kind::Pdf]),
             ("7z", &[Kind::Cbr]),
+            ("ect", &[Kind::Zip]),
             ("gifsicle", &[Kind::Gif]),
-            ("jpegtran", &[Kind::Jpg, Kind::Doc, Kind::Cbz, Kind::Mp3]),
+            ("jpegtran", &[Kind::Jpg, Kind::Doc, Kind::Cbz, Kind::Mp3, Kind::Opus]),
             ("oxipng", &[Kind::Png, Kind::Bmp]),
         ] {
             let c = without(&[tool]);

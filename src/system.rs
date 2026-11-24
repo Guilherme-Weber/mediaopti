@@ -1101,6 +1101,65 @@ pub fn is_animated_and_valid_gif(mut reader: impl Read) -> bool {
     }
 }
 
+/// Whether `reader` is an animated WebP (`RIFF....WEBP` with a `VP8X` chunk whose
+/// animation bit is set, canvas at least 16x16, and at least two `ANMF` frame chunks).
+/// Streams chunk headers without decoding pixels.
+pub fn is_animated_and_valid_webp(mut reader: impl Read) -> bool {
+    let mut head = [0u8; 12];
+    if reader.read_exact(&mut head).is_err() || &head[..4] != b"RIFF" || &head[8..12] != b"WEBP" {
+        return false;
+    }
+    let mut has_anim_flag = false;
+    let mut frames = 0u32;
+    let mut chunks = 0u32;
+    let mut hdr = [0u8; 8];
+    while chunks < 50_000 && reader.read_exact(&mut hdr).is_ok() {
+        chunks += 1;
+        let len = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+        // RIFF chunks are padded to an even byte boundary.
+        let padded = u64::from(len) + u64::from(len & 1);
+        match &hdr[..4] {
+            b"VP8X" => {
+                if len < 10 {
+                    return false;
+                }
+                let mut vp8x = [0u8; 10];
+                if reader.read_exact(&mut vp8x).is_err() {
+                    return false;
+                }
+                let anim = vp8x[0] & 0x02 != 0;
+                let width = 1 + (u32::from(vp8x[4]) | (u32::from(vp8x[5]) << 8) | (u32::from(vp8x[6]) << 16));
+                let height = 1 + (u32::from(vp8x[7]) | (u32::from(vp8x[8]) << 8) | (u32::from(vp8x[9]) << 16));
+                if !anim || width < 16 || height < 16 {
+                    return false;
+                }
+                has_anim_flag = true;
+                if padded > 10 && std::io::copy(&mut reader.by_ref().take(padded - 10), &mut std::io::sink()).unwrap_or(0) != padded - 10 {
+                    return false;
+                }
+            }
+            b"ANMF" => {
+                if !has_anim_flag {
+                    return false;
+                }
+                frames += 1;
+                if frames >= 2 {
+                    return true;
+                }
+                if std::io::copy(&mut reader.by_ref().take(padded), &mut std::io::sink()).unwrap_or(0) != padded {
+                    return false;
+                }
+            }
+            _ => {
+                if std::io::copy(&mut reader.by_ref().take(padded), &mut std::io::sink()).unwrap_or(0) != padded {
+                    return false;
+                }
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1125,6 +1184,38 @@ mod tests {
         assert!(is_animated_and_valid_gif(Cursor::new(gif(32, 32, 2, 10))));
         assert!(!is_animated_and_valid_gif(Cursor::new(gif(1, 1, 5, 10)))); // spacer
         assert!(!is_animated_and_valid_gif(Cursor::new(b"not a gif at all".to_vec())));
+    }
+
+    #[test]
+    fn webp_animation_detection() {
+        let make = |w: u32, h: u32, anim: bool, anmf_count: usize| -> Vec<u8> {
+            let mut body = Vec::new();
+            body.extend_from_slice(b"WEBP");
+            body.extend_from_slice(b"VP8X");
+            body.extend_from_slice(&10u32.to_le_bytes());
+            let mut vp8x = [0u8; 10];
+            if anim {
+                vp8x[0] = 0x02;
+            }
+            let (wm, hm) = (w - 1, h - 1);
+            vp8x[4..7].copy_from_slice(&wm.to_le_bytes()[..3]);
+            vp8x[7..10].copy_from_slice(&hm.to_le_bytes()[..3]);
+            body.extend_from_slice(&vp8x);
+            for _ in 0..anmf_count {
+                body.extend_from_slice(b"ANMF");
+                body.extend_from_slice(&3u32.to_le_bytes()); // odd length exercises RIFF padding
+                body.extend_from_slice(&[1, 2, 3, 0]);
+            }
+            let mut out = b"RIFF".to_vec();
+            out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            out.extend_from_slice(&body);
+            out
+        };
+        assert!(is_animated_and_valid_webp(Cursor::new(make(64, 64, true, 2))));
+        assert!(!is_animated_and_valid_webp(Cursor::new(make(64, 64, true, 1))));
+        assert!(!is_animated_and_valid_webp(Cursor::new(make(64, 64, false, 2))));
+        assert!(!is_animated_and_valid_webp(Cursor::new(make(8, 8, true, 3))));
+        assert!(!is_animated_and_valid_webp(Cursor::new(b"not a webp".to_vec())));
     }
 
     #[test]

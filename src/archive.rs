@@ -28,6 +28,7 @@ const SIGNATURE_MARKERS: &[&str] = &["_xmlsignatures/", "META-INF/documentsignat
 pub fn optimize(ctx: &Ctx, kind: Kind, src: &Path, work: &Path) -> Result<Optimized, RunError> {
     let r = match kind {
         Kind::Doc | Kind::Cbz => repack(ctx, kind, src, work),
+        Kind::Zip => recompress_zip(ctx, src, work),
         Kind::Cbr => cbr(ctx, src, work),
         _ => unreachable!("not an archive"),
     };
@@ -310,6 +311,82 @@ fn repack(ctx: &Ctx, kind: Kind, src: &Path, work: &Path) -> Result<Optimized, E
         return Ok(Optimized::nothing());
     }
     Ok(Optimized::found(Some(out), vec![label("zip-repack", n_img, &steps)]))
+}
+
+struct ZipEntryExpect {
+    name: Vec<u8>,
+    crc: u32,
+    size: u64,
+    dir: bool,
+}
+
+/// Plain `.zip` archive: recompressed losslessly at maximum Deflate effort (`ect -9 -zip`).
+/// Every entry's raw name, order, uncompressed size and CRC-32 are verified by decompressing
+/// the whole result before it can replace the original.
+fn recompress_zip(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, Error> {
+    let Some(ect) = ctx.tools.get("ect") else {
+        return Ok(Optimized::skipped("ect is missing"));
+    };
+    let Ok(mut zin) = ZipArchive::new(BufReader::new(File::open(src)?)) else {
+        return Ok(Optimized::skipped("not a valid zip"));
+    };
+    if zin.is_empty() {
+        return Ok(Optimized::nothing());
+    }
+    let mut expected = Vec::with_capacity(zin.len());
+    for i in 0..zin.len() {
+        let Ok(f) = zin.by_index_raw(i) else { return Ok(Optimized::skipped("damaged zip")) };
+        if f.encrypted() {
+            return Ok(Optimized::skipped("encrypted: skipped"));
+        }
+        if !matches!(f.compression(), CompressionMethod::Stored | CompressionMethod::Deflated) {
+            return Ok(Optimized::skipped("unsupported zip compression (e.g. LZMA/Deflate64): skipped"));
+        }
+        if let Ok(name) = std::str::from_utf8(f.name_raw()) {
+            if SIGNATURE_MARKERS.iter().any(|m| name.starts_with(m)) {
+                return Ok(Optimized::skipped("digitally signed: skipped"));
+            }
+        }
+        expected.push(ZipEntryExpect { name: f.name_raw().to_vec(), crc: f.crc32(), size: f.size(), dir: f.is_dir() });
+    }
+    drop(zin);
+
+    let out = work.join("repack.zip");
+    std::fs::copy(src, &out)?;
+    ctx.phase("recompressing zip", &[&out]);
+    let mut args = crate::os_args!["-9", "-quiet", "-zip"];
+    if ctx.threads == 0 {
+        args.push("--mt-deflate".into());
+    } else if ctx.threads > 1 {
+        args.push(format!("--mt-deflate={}", ctx.threads).into());
+    }
+    args.push(out.as_os_str().to_os_string());
+    let ran = tools::run(ect, args, Some(work), Capture::None, ctx.timeout, &ctx.gate)?;
+    if !ran.success {
+        return Ok(Optimized::nothing());
+    }
+    let before = std::fs::metadata(src)?.len();
+    let after = std::fs::metadata(&out).map_or(u64::MAX, |m| m.len());
+    if after >= before {
+        return Ok(Optimized::nothing());
+    }
+    ctx.phase("verifying", &[&out]);
+    let Ok(mut zout) = ZipArchive::new(BufReader::new(File::open(&out)?)) else {
+        return Ok(Optimized::nothing());
+    };
+    if zout.len() != expected.len() {
+        return Ok(Optimized::nothing());
+    }
+    for (i, want) in expected.iter().enumerate() {
+        let Ok(mut f) = zout.by_index(i) else { return Ok(Optimized::nothing()) };
+        if f.name_raw() != want.name.as_slice() || f.crc32() != want.crc || f.size() != want.size || f.is_dir() != want.dir {
+            return Ok(Optimized::nothing());
+        }
+        if io::copy(&mut f, &mut io::sink()).is_err() {
+            return Ok(Optimized::nothing());
+        }
+    }
+    Ok(Optimized::found(Some(out), vec!["ect-zip-9".into()]))
 }
 
 /// Whether a CBZ holds the same files as an extracted CBR folder: the same names, each file
@@ -725,6 +802,40 @@ mod tests {
         std::fs::create_dir_all(&work).unwrap();
         let r = optimize(&c, Kind::Cbz, &src, &work).unwrap();
         assert!(r.best.is_none() && r.note.as_deref().is_some_and(|n| n.contains("non-UTF-8")), "{:?}", r.note);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Plain `.zip` archives are recompressed losslessly at max effort (`ect -9`) with every
+    /// entry verified through its CRC.
+    #[test]
+    fn plain_zip_recompresses_at_max_effort_losslessly() {
+        let Some(c) = ctx().filter(|c| c.tools.has("ect")) else {
+            skip_test!("ect not found");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("mo-zipmax-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("pack.zip");
+        let payload = "mediaopti zip maximum recompression test line\n".repeat(4000);
+        {
+            let mut z = ZipWriter::new(File::create(&src).unwrap());
+            z.start_file("notes.txt", SimpleFileOptions::default().compression_method(CompressionMethod::Deflated).compression_level(Some(1)))
+                .unwrap();
+            z.write_all(payload.as_bytes()).unwrap();
+            z.finish().unwrap();
+        }
+        let before = std::fs::metadata(&src).unwrap().len();
+        let work = dir.join("w");
+        std::fs::create_dir_all(&work).unwrap();
+        let r = optimize(&c, Kind::Zip, &src, &work).unwrap();
+        let best = r.best.expect("recompressed smaller");
+        assert!(std::fs::metadata(&best).unwrap().len() < before);
+        assert_eq!(r.steps, ["ect-zip-9"]);
+        let mut z = ZipArchive::new(File::open(&best).unwrap()).unwrap();
+        let mut got = String::new();
+        z.by_name("notes.txt").unwrap().read_to_string(&mut got).unwrap();
+        assert_eq!(got, payload);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

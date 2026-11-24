@@ -107,22 +107,31 @@ fn is_system_folder(e: &walkdir::DirEntry) -> bool {
     e.file_type().is_dir() && e.metadata().is_ok_and(|m| m.file_attributes() & HIDDEN_AND_SYSTEM == HIDDEN_AND_SYSTEM)
 }
 
-/// Checks which GIFs in `files` are static/non-animated (in parallel across up to 8 threads).
+/// Checks which GIFs and WebPs in `files` are static/non-animated (in parallel across up to 8 threads).
 pub(super) fn find_static_gifs(files: &[PathBuf], cancel: Option<&AtomicBool>) -> HashSet<PathBuf> {
-    let gifs: Vec<&PathBuf> = files.iter().filter(|p| args::is_gif(p)).collect();
-    if gifs.is_empty() {
+    let pics: Vec<&PathBuf> = files.iter().filter(|p| args::is_animated_picture(p)).collect();
+    if pics.is_empty() {
         return HashSet::new();
     }
     let mut static_gifs = HashSet::new();
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
     std::thread::scope(|scope| {
-        let handles: Vec<_> = gifs
-            .chunks(gifs.len().div_ceil(threads).max(1))
+        let handles: Vec<_> = pics
+            .chunks(pics.len().div_ceil(threads).max(1))
             .map(|part| {
                 scope.spawn(move || {
                     part.iter()
                         .take_while(|_| cancel.is_none_or(|c| !c.load(Ordering::Relaxed)))
-                        .filter(|p| !std::fs::File::open(p).is_ok_and(|f| system::is_animated_and_valid_gif(std::io::BufReader::new(f))))
+                        .filter(|p| {
+                            !std::fs::File::open(p).is_ok_and(|f| {
+                                let r = std::io::BufReader::new(f);
+                                if args::is_webp(p) {
+                                    system::is_animated_and_valid_webp(r)
+                                } else {
+                                    system::is_animated_and_valid_gif(r)
+                                }
+                            })
+                        })
                         .map(|p| (*p).clone())
                         .collect::<Vec<_>>()
                 })
@@ -237,11 +246,11 @@ pub(super) fn scan_folder(
         }
     }
 
-    // Still or animated: read GIF headers only when Videos is enabled (when Videos is off,
-    // every GIF goes to images either way — skipping this avoids opening 65k+ GIFs on an HDD).
+    // Still or animated: read GIF/WebP headers only when Videos is enabled (when Videos is off,
+    // GIFs go to images and WebPs are skipped — avoiding opening 65k+ files on an HDD).
     if check_gifs {
-        let gif_paths: Vec<PathBuf> = with_sizes.iter().map(|(p, _)| p).filter(|p| args::is_gif(p)).cloned().collect();
-        static_gifs = find_static_gifs(&gif_paths, Some(cancel));
+        let anim_paths: Vec<PathBuf> = with_sizes.iter().map(|(p, _)| p).filter(|p| args::is_animated_picture(p)).cloned().collect();
+        static_gifs = find_static_gifs(&anim_paths, Some(cancel));
     }
     if cancel.load(Ordering::Relaxed) {
         return ScanResult {

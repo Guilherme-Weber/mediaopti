@@ -63,7 +63,7 @@ impl Inner {
         use image::Kind;
         match image::kind_of(file) {
             Some(
-                Kind::Png | Kind::Jpg | Kind::Gif | Kind::Bmp | Kind::Tga | Kind::Cbz | Kind::Cbr | Kind::Flac | Kind::Mp3 | Kind::LosslessAudio,
+                Kind::Png | Kind::Jpg | Kind::Gif | Kind::Bmp | Kind::Tga | Kind::Cbz | Kind::Cbr | Kind::Flac | Kind::Mp3 | Kind::Opus | Kind::LosslessAudio,
             ) => self.options.image_target,
             _ => image::DEFAULT_TARGET,
         }
@@ -129,7 +129,7 @@ impl Inner {
             } else {
                 Place::Cpu
             }
-        } else if !self.options.videos {
+        } else if !self.options.videos || (args::is_webp(file) && self.static_gifs.contains(file)) {
             Place::Off { gif: false }
         } else if self.history.contains(file) {
             // A GIF still here was not replaced by a video. If it never went through the GIF
@@ -266,7 +266,7 @@ impl Inner {
         let Some(i) = self.index_of(old) else { return };
         let listed = old.as_os_str() != new.as_os_str() && self.index_of(new).is_some();
         let idx = i as usize;
-        let scanned = (args::is_video_file(new) || image::kind_of(new).is_some()) && !args::is_gif(new);
+        let scanned = (args::is_video_file(new) || image::kind_of(new).is_some()) && !args::is_animated_picture(new);
         if let Some(map) = &mut self.file_index {
             map.remove(&Self::path_hash(old));
         }

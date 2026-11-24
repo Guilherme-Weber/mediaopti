@@ -4,12 +4,13 @@ use std::path::{Path, PathBuf};
 
 pub const VIDEO_EXTENSIONS: &[&str] = &[
     "mp4", "mts", "m2ts", "flv", "m4v", "mkv", "mov", "webm", "avi", "wmv", "ts", "3gp", "mpg",
-    "mpeg", "gif",
+    "mpeg", "gif", "webp", "bik", "xmv", "ogv", "asf", "pss",
 ];
 
 /// Legacy/non-MP4 containers that remux cleanly into .mp4
 const REMUX_TO_MP4_EXTS: &[&str] = &[
     "mts", "m2ts", "flv", "webm", "m4v", "mov", "avi", "wmv", "ts", "3gp", "mpg", "mpeg", "gif",
+    "webp", "bik", "xmv", "ogv", "asf", "pss",
 ];
 
 
@@ -258,11 +259,12 @@ impl Streams {
 
     /// Whether an MP4 can hold all of it as it is: no attachments, subtitles only in
     /// mov_text (converting others would lose styling or can't be done at all), and audio
-    /// it takes without re-encoding (else MKV holds it; integer PCM becomes FLAC there).
+    /// it takes without re-encoding (or non-copyable game audio re-encoded to AAC; integer
+    /// PCM becomes FLAC in MKV).
     pub fn fits_mp4(&self) -> bool {
         self.attachments == 0
             && self.subtitles.iter().all(|c| c == "mov_text")
-            && self.audio_codecs.iter().all(|c| MP4_AUDIO.contains(&c.as_str()))
+            && self.audio_codecs.iter().all(|c| MP4_AUDIO.contains(&c.as_str()) || is_non_copyable_audio(c))
     }
 
     /// What makes the file unfit for re-encoding without losing something, if anything:
@@ -310,7 +312,7 @@ pub struct Blocked {
 pub fn output_ext(input: &Path, streams: &Streams) -> String {
     let ext = ext_lower(input);
     let target = if REMUX_TO_MP4_EXTS.contains(&ext.as_str()) { "mp4".to_string() } else { ext };
-    if matches!(target.as_str(), "mp4" | "m4v") && !is_gif(input) && !streams.fits_mp4() {
+    if matches!(target.as_str(), "mp4" | "m4v") && !is_animated_picture(input) && !streams.fits_mp4() {
         "mkv".into()
     } else {
         target
@@ -545,6 +547,21 @@ pub fn is_gif(path: &Path) -> bool {
     ext_lower(path) == "gif"
 }
 
+pub fn is_webp(path: &Path) -> bool {
+    ext_lower(path) == "webp"
+}
+
+/// Animated picture formats converted to video when animated (GIF, WebP).
+pub fn is_animated_picture(path: &Path) -> bool {
+    is_gif(path) || is_webp(path)
+}
+
+/// Audio codecs that neither MP4 nor MKV can stream-copy (e.g. Bink game audio): transcoded
+/// directly to AAC at 96 kb/s per channel so every track survives.
+pub fn is_non_copyable_audio(codec: &str) -> bool {
+    matches!(codec, "binkaudio_dct" | "binkaudio_rdft")
+}
+
 
 pub fn is_video_file(path: &Path) -> bool {
     VIDEO_EXTENSIONS.contains(&ext_lower(path).as_str())
@@ -591,7 +608,7 @@ pub fn build_ffmpeg_args(input: &Path, tmp: &Path, options: &Options, mode: Mode
     let x264_crf = (crf + boost).min(51);
     let preset = options.preset.as_str();
     let nvenc_preset = map_nvenc_preset(preset);
-    let gif = is_gif(Path::new(&input));
+    let gif = is_animated_picture(Path::new(&input));
 
     // -reinit_filter 0 prevents mid-stream resolution changes from crashing the filtergraph
     let base = s(&[
@@ -737,12 +754,16 @@ fn tag_flags(options: &Options) -> Vec<String> {
 }
 
 /// Every audio track copied as it is; integer PCM becomes FLAC (lossless, about half the
-/// size, and checked by decoding before the original is replaced).
+/// size, and checked by decoding before the original is replaced); non-copyable game audio
+/// (Bink) becomes AAC at 96 kb/s per channel.
 fn copy_audio(options: &Options) -> Vec<String> {
     let mut a = s(&["-map", "0:a?", "-c:a", "copy"]);
     for (i, codec) in options.streams.audio_codecs.iter().enumerate() {
         if is_integer_pcm(codec) {
             a.extend([format!("-c:a:{i}"), "flac".into()]);
+        } else if is_non_copyable_audio(codec) {
+            let ch = options.streams.audio_channels.get(i).copied().unwrap_or(1).max(1);
+            a.extend([format!("-c:a:{i}"), "aac".into(), format!("-b:a:{i}"), format!("{}k", 96 * ch)]);
         }
     }
     a
@@ -1078,5 +1099,21 @@ mod tests {
         }
         let gif = build_ffmpeg_args(Path::new("a.gif"), Path::new("a.mp4"), &o, Mode::Primary).join(" ");
         assert!(!gif.contains("0:s?"), "{gif}");
+        let webp = build_ffmpeg_args(Path::new("a.webp"), Path::new("a.mp4"), &o, Mode::Primary).join(" ");
+        assert!(webp.contains(" -an ") && !webp.contains("0:s?"), "{webp}");
+    }
+
+    #[test]
+    fn legacy_game_videos_and_webp_route_cleanly() {
+        for ext in ["bik", "xmv", "ogv", "asf", "pss", "webp"] {
+            assert!(is_video_file(Path::new(&format!("clip.{ext}"))), "{ext}");
+        }
+        let bink = Streams { audio: 2, audio_codecs: vec!["binkaudio_dct".into(), "binkaudio_rdft".into()], audio_channels: vec![1, 2], ..Streams::default() };
+        assert_eq!(output_ext(Path::new("cutscene.bik"), &bink), "mp4");
+        let args = build_ffmpeg_args(Path::new("cutscene.bik"), Path::new("cutscene.mp4"), &Options { streams: bink, ..Options::default() }, Mode::Primary).join(" ");
+        assert!(args.contains("-c:a:0 aac -b:a:0 96k -c:a:1 aac -b:a:1 192k"), "{args}");
+        let xmv = Streams { audio: 1, audio_codecs: vec!["pcm_s16le".into()], audio_channels: vec![2], ..Streams::default() };
+        assert_eq!(output_ext(Path::new("intro.xmv"), &xmv), "mkv");
+        assert_eq!(output_ext(Path::new("anim.webp"), &Streams::default()), "mp4");
     }
 }
