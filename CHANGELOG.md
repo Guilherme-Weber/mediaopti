@@ -3,6 +3,37 @@
 Notable changes to mediaopti. Earlier versions are described in their
 [GitHub releases](https://github.com/Guilherme-Weber/mediaopti/releases).
 
+## 3.5.1
+
+### Fixed
+
+- **Tool-failure counter bounds:** `RunStats::tools_failing` now sizes its array from
+  `Kind::COUNT` (all 16 formats, including `.opus` and `.zip`) instead of a hardcoded
+  `[usize; 14]`, preventing an out-of-bounds panic when recording failures on the newer kinds.
+- **Hard-linked duplicate safety & concurrent-edit guard:** unified candidate replacement
+  (`engine/replace.rs`) preserves both files when an existing same-content duplicate is a
+  hard link larger than the candidate, and re-checks the source file's `file_state` after
+  slow `same_content`/`same_video` verification before deleting or replacing it.
+- **Redundant video duration probe:** `same_video` now reuses the already-probed duration
+  instead of spawning an extra `ffmpeg` pass.
+
+### Changed
+
+- **Unified format registry (`src/format.rs`):** consolidated `Kind`, format specs, video and
+  remux extensions, conversion gates, quality floors, lossy tool ordering and in-place rules
+  into a single module.
+- **Self-contained history & direct options:** `History` now uses typed `Pass` / `QualityFloor`
+  with identical `processedFiles.txt` and `processed-content.tsv` formats (breaking the
+  `history -> image` cycle), and `RawOptions` was replaced by `Options::validated()` and
+  `Prefs::to_options()` with no `ui-settings.json` schema changes.
+- **Instance-scoped `ResourceBudget` & `WorkQueue`:** replaced global memory/disk/gate statics
+  (`PROMISED`, `BIG_LOSSY`, `RESERVED`) with an instance-scoped `ResourceBudget` backed by an
+  injectable `SystemProbe` (`OsProbe` / `FakeProbe`), shared `Slots`/`SlotGuard` across
+  archives and PDFs, and encapsulated scheduling state in `WorkQueue`.
+- **Video pipeline boundaries:** extracted `EncodePlan` out of `Options`, unified all video
+  exit paths through `VideoResult` + `finish_video`, and added a 5-method `VideoRunner` seam
+  for fast in-process video pipeline tests.
+
 ## 3.5.0
 
 ### Added
