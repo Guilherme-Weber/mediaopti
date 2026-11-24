@@ -1,5 +1,7 @@
 //! Persistent diagnostics in %APPDATA%\mediaopti\logs:
 //! - `mediaopti.log`: the activity log, rotated to `mediaopti.1.log` at 5 MB;
+//! - `failures.log`: durable append-only record of every failure line (never rotated away,
+//!   so long runs that rotate `mediaopti.log` never lose their failure causes);
 //! - `crash-<timestamp>.txt`: written by the panic hook for any panic (release builds have no
 //!   console, so this is the only trace of one). A panic in a file's job fails that file only.
 
@@ -14,7 +16,20 @@ const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 pub struct FileLog {
     path: PathBuf,
     rotated: PathBuf,
+    failures_path: PathBuf,
     state: Mutex<Option<(File, u64)>>,
+    failures: Mutex<Option<File>>,
+}
+
+/// Whether `message` is a failure line that must survive log rotation.
+pub(crate) fn is_failure_message(message: &str) -> bool {
+    let body = match message.strip_prefix('[').and_then(|r| r.split_once("] ")) {
+        Some((_, body)) => body,
+        None => message,
+    };
+    body.starts_with("Failed")
+        || body.starts_with("Stopped after an ffmpeg startup error")
+        || body.contains("stopped unexpectedly:")
 }
 
 impl FileLog {
@@ -22,11 +37,14 @@ impl FileLog {
         let _ = fs::create_dir_all(dir);
         let path = dir.join("mediaopti.log");
         let rotated = dir.join("mediaopti.1.log");
+        let failures_path = dir.join("failures.log");
         let state = Self::open_file(&path);
         Self {
             path,
             rotated,
+            failures_path,
             state: Mutex::new(state),
+            failures: Mutex::new(None),
         }
     }
 
@@ -37,18 +55,31 @@ impl FileLog {
     }
 
     /// Appends one line, prefixed with the local date and time. Never fails loudly:
-    /// logging must not break processing.
+    /// logging must not break processing. Failure lines are also persisted to `failures.log`
+    /// without rotation.
     pub fn write_line(&self, message: &str) {
         let line = format!("{} {message}\r\n", system::local_datetime());
-        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.as_ref().is_some_and(|(_, size)| *size + line.len() as u64 > MAX_LOG_BYTES) {
-            *state = None; // close before renaming
-            let _ = fs::rename(&self.path, &self.rotated);
-            *state = Self::open_file(&self.path);
+        {
+            let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.as_ref().is_some_and(|(_, size)| *size + line.len() as u64 > MAX_LOG_BYTES) {
+                *state = None; // close before renaming
+                let _ = fs::rename(&self.path, &self.rotated);
+                *state = Self::open_file(&self.path);
+            }
+            if let Some((file, size)) = state.as_mut() {
+                if file.write_all(line.as_bytes()).is_ok() {
+                    *size += line.len() as u64;
+                }
+            }
         }
-        if let Some((file, size)) = state.as_mut() {
-            if file.write_all(line.as_bytes()).is_ok() {
-                *size += line.len() as u64;
+        if is_failure_message(message) {
+            let mut failures = self.failures.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if failures.is_none() {
+                *failures = OpenOptions::new().create(true).append(true).open(&self.failures_path).ok();
+            }
+            if let Some(file) = failures.as_mut() {
+                let _ = file.write_all(line.as_bytes());
+                let _ = file.flush();
             }
         }
     }
@@ -121,6 +152,16 @@ mod tests {
         assert!(fs::read_to_string(dir.join("mediaopti.1.log")).unwrap().contains("first line"));
         let current = fs::read_to_string(dir.join("mediaopti.log")).unwrap();
         assert!(current.contains("after rotation") && !current.contains("first line"));
+        assert!(!dir.join("failures.log").exists(), "normal lines do not create failures.log");
+
+        // Failure lines are persisted to failures.log and survive multiple rotations.
+        log.write_line("[Worker 1] Failed on clip.mp4: corrupt");
+        log.state.lock().unwrap().as_mut().unwrap().1 = MAX_LOG_BYTES;
+        log.write_line("rotate 1");
+        log.state.lock().unwrap().as_mut().unwrap().1 = MAX_LOG_BYTES;
+        log.write_line("[Images] Failed on broken.png: damaged");
+        let fails = fs::read_to_string(dir.join("failures.log")).unwrap();
+        assert!(fails.contains("Failed on clip.mp4") && fails.contains("Failed on broken.png") && !fails.contains("rotate 1"));
         let _ = fs::remove_dir_all(&dir);
     }
 }

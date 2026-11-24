@@ -105,15 +105,7 @@ fn optimize_entry(ictx: &Ctx, kind: Kind, data: &[u8], work: &Path) -> Result<Op
     if std::fs::create_dir_all(work).and_then(|()| std::fs::write(&file, data)).is_err() {
         return Ok(None);
     }
-    // A huge page searches lossily alone and only with its memory free, as a picture does.
-    let (lossy, _turn) = image::lossy_turn(ictx, image::pixel_count(&file).unwrap_or(0))?;
-    let lossless;
-    let ictx = if ictx.lossy && !lossy {
-        lossless = Ctx { lossy: false, ..ictx.clone() };
-        &lossless
-    } else {
-        ictx
-    };
+    // `image::optimize` gates big lossy searches internally through `BigLossyGate`.
     let r = image::optimize(ictx, kind, &file, work)?;
     let result = r.best.and_then(|b| std::fs::read(b).ok()).filter(|b| b.len() < data.len()).map(|b| (b, r.steps));
     let _ = std::fs::remove_dir_all(work);
@@ -132,8 +124,10 @@ type Page = (usize, Kind, Vec<u8>);
 type Done = (usize, Vec<u8>, Vec<String>);
 
 /// Optimizes a batch of pictures: on this job's own thread plus the image workers' idle CPU
-/// slots (a comic's pages then use the whole CPU near the end of a run). Returns, per page,
-/// its index, bytes (optimized or not) and steps.
+/// slots (a comic's pages then use the whole CPU near the end of a run). When running one page
+/// at a time (no idle slots, or a single page), its tools use every thread (`threads: 0`,
+/// memory-checked) like standalone pictures. Returns, per page, its index, bytes (optimized
+/// or not) and steps.
 fn optimize_pages(ictx: &Ctx, pages: Vec<Page>, work: &Path, progress: Option<&image::tools::Progress>) -> Result<Vec<Done>, RunError> {
     /// Gives the borrowed slots back however the pages end, a panic included.
     struct Borrowed<'a>(Option<&'a image::tools::Slots>, usize);
@@ -151,6 +145,13 @@ fn optimize_pages(ictx: &Ctx, pages: Vec<Page>, work: &Path, progress: Option<&i
         extra = slots.borrow_idle(pages.len().saturating_sub(1).min(affordable));
     }
     let _borrowed = Borrowed(ictx.slots.as_deref(), extra);
+    // Running one page at a time: let oxipng/ECT and lossy methods use every thread
+    // (memory-checked inside `image`). Running pages in parallel: one thread per page.
+    let page_ctx = if extra == 0 {
+        Ctx { threads: 0, ..ictx.clone() }
+    } else {
+        ictx.clone()
+    };
     let next = std::sync::atomic::AtomicUsize::new(0);
     let pages: Vec<std::sync::Mutex<Option<Page>>> = pages.into_iter().map(|p| std::sync::Mutex::new(Some(p))).collect();
     let results = std::sync::Mutex::new(Vec::with_capacity(pages.len()));
@@ -161,12 +162,12 @@ fn optimize_pages(ictx: &Ctx, pages: Vec<Page>, work: &Path, progress: Option<&i
                 let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let Some(slot) = pages.get(i) else { break };
                 let Some((idx, kind, data)) = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() else { continue };
-                if failure.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some() || !ictx.gate.wait_while_paused() {
+                if failure.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some() || !page_ctx.gate.wait_while_paused() {
                     failure.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert(RunError::Cancelled);
                     break;
                 }
                 crate::system::panic_here_in_tests(work);
-                let r = optimize_entry(ictx, kind, &data, &work.join(format!("z{idx}")));
+                let r = optimize_entry(&page_ctx, kind, &data, &work.join(format!("z{idx}")));
                 if let Some(p) = progress {
                     p.step();
                 }
@@ -237,7 +238,12 @@ fn repack(ctx: &Ctx, kind: Kind, src: &Path, work: &Path) -> Result<Optimized, E
         if f.encrypted() {
             return Ok(Optimized::skipped("encrypted: skipped"));
         }
-        let name = String::from_utf8_lossy(f.name_raw()).into_owned();
+        if !matches!(f.compression(), CompressionMethod::Stored | CompressionMethod::Deflated) {
+            return Ok(Optimized::skipped("unsupported zip compression (e.g. LZMA/Deflate64): skipped"));
+        }
+        let Ok(name) = std::str::from_utf8(f.name_raw()) else {
+            return Ok(Optimized::skipped("non-UTF-8 file name inside the zip: skipped"));
+        };
         if SIGNATURE_MARKERS.iter().any(|m| name.starts_with(m)) {
             return Ok(Optimized::skipped("digitally signed: skipped"));
         }
@@ -685,6 +691,40 @@ mod tests {
         assert!(r.steps[0].contains(&format!("[{pages} img")), "{:?}", r.steps);
         assert_eq!(slots.borrow_idle(10), 3, "borrowed slots returned");
         assert_eq!(progress.get(), Some((pages, pages)), "every page counted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A zip with non-UTF-8 entry names is skipped cleanly (never reported as broken/failed).
+    #[test]
+    fn non_utf8_zip_is_skipped_not_broken() {
+        let Some(c) = ctx() else {
+            skip_test!("tools not found");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("mo-nonutf8-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("legacy.cbz");
+        {
+            let mut z = ZipWriter::new(File::create(&src).unwrap());
+            z.start_file("page01.txt", SimpleFileOptions::default().compression_method(CompressionMethod::Stored)).unwrap();
+            z.write_all(b"hello").unwrap();
+            z.finish().unwrap();
+        }
+        // Replace the ASCII filename bytes "page01.txt" with invalid UTF-8 in both local and central headers.
+        let mut raw = std::fs::read(&src).unwrap();
+        let needle = b"page01.txt";
+        let repl = b"p\xffge01.txt";
+        for i in 0..=raw.len().saturating_sub(needle.len()) {
+            if &raw[i..i + needle.len()] == needle {
+                raw[i..i + needle.len()].copy_from_slice(repl);
+            }
+        }
+        std::fs::write(&src, raw).unwrap();
+        let work = dir.join("w");
+        std::fs::create_dir_all(&work).unwrap();
+        let r = optimize(&c, Kind::Cbz, &src, &work).unwrap();
+        assert!(r.best.is_none() && r.note.as_deref().is_some_and(|n| n.contains("non-UTF-8")), "{:?}", r.note);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

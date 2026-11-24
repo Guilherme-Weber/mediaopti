@@ -159,6 +159,31 @@ pub fn optimize(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, RunErro
     Ok(if ok { Optimized::found(Some(out), vec![label.into()]) } else { Optimized::nothing() })
 }
 
+/// Free commit needed per extra PDF image or rendered page checked in parallel.
+const PAGE_COMMIT: u64 = 1024 * 1024 * 1024;
+
+/// Gives borrowed CPU slots back however the parallel loop ends, a panic included.
+struct Borrowed<'a>(Option<&'a tools::Slots>, usize);
+
+impl Drop for Borrowed<'_> {
+    fn drop(&mut self) {
+        if let Some(slots) = self.0 {
+            slots.release(self.1);
+        }
+    }
+}
+
+/// Borrows idle CPU slots for `items` parallel pieces of work, capped by free commit memory.
+fn borrow_for(ctx: &Ctx, items: usize) -> Borrowed<'_> {
+    let mut extra = 0;
+    if let Some(slots) = &ctx.slots {
+        let commit = crate::system::memory_status().map_or(u64::MAX, |m| m.available_commit);
+        let affordable = usize::try_from(commit.saturating_sub(2 * PAGE_COMMIT) / PAGE_COMMIT).unwrap_or(usize::MAX);
+        extra = slots.borrow_idle(items.saturating_sub(1).min(affordable));
+    }
+    Borrowed(ctx.slots.as_deref(), extra)
+}
+
 /// Renders every page of both PDFs at 96 dpi (screen size); each page of `b` must be
 /// identical or score >= target against `a`: the document must read and look the same,
 /// not just its images. `Some(lowest page score)` (100 when every page is identical) when
@@ -182,18 +207,63 @@ fn pages_look_same(ctx: &Ctx, a: &Path, b: &Path, work: &Path) -> Result<Option<
     if rendered[0].is_empty() || rendered[0].len() != rendered[1].len() {
         return Ok(None);
     }
-    let mut lowest = 100.0_f64;
-    for (x, y) in rendered[0].iter().zip(&rendered[1]) {
-        if std::fs::read(x).ok() == std::fs::read(y).ok() {
-            continue;
+    // Only pages whose rendered PNG bytes differ need SSIMULACRA2; score those in parallel.
+    let diff_pairs: Vec<(&PathBuf, &PathBuf)> = rendered[0]
+        .iter()
+        .zip(&rendered[1])
+        .filter(|(x, y)| std::fs::read(x).ok() != std::fs::read(y).ok())
+        .collect();
+    let lowest = if diff_pairs.is_empty() {
+        Some(100.0_f64)
+    } else {
+        let borrowed = borrow_for(ctx, diff_pairs.len());
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let failed = std::sync::atomic::AtomicBool::new(false);
+        let lowest = std::sync::Mutex::new(100.0_f64);
+        let err: std::sync::Mutex<Option<RunError>> = std::sync::Mutex::new(None);
+        std::thread::scope(|scope| {
+            for _ in 0..=borrowed.1 {
+                scope.spawn(|| loop {
+                    if failed.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(&(x, y)) = diff_pairs.get(i) else { break };
+                    if !ctx.gate.wait_while_paused() {
+                        failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                        err.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert(RunError::Cancelled);
+                        break;
+                    }
+                    match image::ssim_score(ctx, x, y) {
+                        Ok(Some(s)) if s >= ctx.target => {
+                            let mut low = lowest.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                            *low = low.min(s);
+                        }
+                        Ok(_) => {
+                            failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                            break;
+                        }
+                        Err(e) => {
+                            failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                            err.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert(e);
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        drop(borrowed);
+        if let Some(e) = err.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner) {
+            return Err(e);
         }
-        match image::ssim_score(ctx, x, y)?.filter(|s| *s >= ctx.target) {
-            Some(s) => lowest = lowest.min(s),
-            None => return Ok(None),
+        if failed.load(std::sync::atomic::Ordering::Relaxed) {
+            None
+        } else {
+            Some(*lowest.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
         }
-    }
+    };
     let _ = std::fs::remove_dir_all(work);
-    Ok(Some(lowest))
+    Ok(lowest)
 }
 
 struct Update {
@@ -280,124 +350,71 @@ fn optimize_images(ctx: &Ctx, src: &Path, work: &Path, lossy: bool) -> Result<Op
         .filter_map(|o| o.pointer("/stream/dict/~1SMask").and_then(Value::as_str))
         .collect();
     let keep_ratio = 1.0 - ctx.lossy_min_gain;
-    let (mut update, mut n_lossless, mut n_lossy) = (Map::new(), 0, 0);
     ctx.phase("pictures", &[]);
+    let image_entries: Vec<(usize, &String, &Value)> = objects
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, obj))| obj.pointer("/stream/dict/~1Subtype").and_then(Value::as_str) == Some("/Image"))
+        .map(|(n, (k, o))| (n, k, o))
+        .collect();
     if let Some(p) = &ctx.progress {
-        let images = objects.values().filter(|o| o.pointer("/stream/dict/~1Subtype").and_then(Value::as_str) == Some("/Image")).count();
-        p.set_total(images);
+        p.set_total(image_entries.len());
     }
-    for (n, (key, obj)) in objects.iter().enumerate() {
-        if let Some(p) = &ctx.progress {
-            if obj.pointer("/stream/dict/~1Subtype").and_then(Value::as_str) == Some("/Image") {
-                p.step();
-            }
-        }
-        let (Some(dict), Some(file)) = (
-            obj.pointer("/stream/dict").and_then(Value::as_object),
-            obj.pointer("/stream/datafile").and_then(Value::as_str).map(PathBuf::from),
-        ) else {
-            continue;
-        };
-        if dict.get("/Subtype").and_then(Value::as_str) != Some("/Image") || soft_masks.contains(key.trim_start_matches("obj:")) {
-            continue;
-        }
-        let file_size = size(&file);
-        if file_size == u64::MAX || file_size < MIN_IMAGE {
-            continue;
-        }
-        let filter = match dict.get("/Filter") {
-            Some(Value::Array(a)) if a.len() == 1 => a[0].as_str(),
-            Some(f) => f.as_str(),
-            None => None,
-        };
-        let lw = work.join(format!("i{n}"));
-        let _ = std::fs::create_dir_all(&lw);
-        let mut new_dict = dict.clone();
-        let mut best: Option<PathBuf> = None;
-        let mut lossy_hit = false;
-        if filter == Some("/DCTDecode") {
-            // Lossless: Huffman tables optimized, written sequential, same decoded pixels.
-            let out = lw.join("lossless.jpg");
-            let args = crate::os_args!["-copy", "all", "-revert", "-optimize", "-outfile", &out, &file];
-            if image::run(ctx, "jpegtran", args, &lw)? && size(&out) < file_size {
-                let want = djpeg_hash(ctx, &file)?;
-                if want.is_some() && djpeg_hash(ctx, &out)? == want {
-                    best = Some(out);
+    if image_entries.is_empty() {
+        return Ok(None);
+    }
+
+    // Optimize PDF images in parallel on borrowed idle CPU slots (like `archive::optimize_pages`).
+    // When running one image at a time (`extra == 0`), allow side-by-side lossy methods (`threads: 0`).
+    let borrowed = borrow_for(ctx, image_entries.len());
+    let img_ctx = if borrowed.1 == 0 {
+        Ctx { threads: 0, progress: None, ..ctx.clone() }
+    } else {
+        Ctx { threads: 1, progress: None, ..ctx.clone() }
+    };
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let results: std::sync::Mutex<Vec<(String, Value, bool)>> = std::sync::Mutex::new(Vec::new());
+    let failure: std::sync::Mutex<Option<RunError>> = std::sync::Mutex::new(None);
+    let progress = ctx.progress.as_deref();
+
+    std::thread::scope(|scope| {
+        for _ in 0..=borrowed.1 {
+            scope.spawn(|| loop {
+                if failure.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some() {
+                    break;
                 }
-            }
-            let ref_jpg = lw.join("ref.jpg"); // extracted streams have no extension; scorers want one
-            let quality_ok = ctx.max.pdf_any_q || jpeg::quality(&file).is_none_or(|q| q >= MIN_LOSSY_QUALITY);
-            // CMYK/YCCK (common in print PDFs) would be re-encoded as RGB under /DeviceCMYK.
-            let reencodable = || jpeg::head(&file).is_some_and(|d| jpeg::reencodable(&d));
-            // A huge picture searches alone and only with its memory free (`image::lossy_turn`).
-            let turn = if lossy && file_size >= MIN_LOSSY_JPEG && quality_ok && reencodable() {
-                image::lossy_turn(ctx, image::pixel_count(&file).unwrap_or(0))?
-            } else {
-                (false, None)
-            };
-            if turn.0 && std::fs::copy(&file, &ref_jpg).is_ok() {
-                let pnm = lw.join("dec.pnm");
-                if image::run(ctx, "djpeg", crate::os_args!["-outfile", &pnm, &ref_jpg], &lw)? {
-                    let keep: jpeg::Segments = jpeg::segments(&ref_jpg)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter(|(m, d)| *m == 0xE2 && d.starts_with(b"ICC_PROFILE"))
-                        .collect();
-                    let limit = (best.as_deref().map_or(file_size, size) as f64 * keep_ratio) as u64;
-                    if let Some((cand, _)) = image::search_methods(ctx, &ref_jpg, reencoders(ctx, &lw, &pnm, &keep), limit)? {
-                        best = Some(cand);
-                        lossy_hit = true;
+                let idx = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(&(n, key, obj)) = image_entries.get(idx) else { break };
+                if !img_ctx.gate.wait_while_paused() {
+                    failure.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert(RunError::Cancelled);
+                    break;
+                }
+                let r = optimize_pdf_image(&img_ctx, n, key, obj, &deref, &soft_masks, work, lossy, keep_ratio);
+                if let Some(p) = progress {
+                    p.step();
+                }
+                match r {
+                    Ok(Some(item)) => {
+                        results.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(item);
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        failure.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert(e);
+                        break;
                     }
                 }
-            }
-        } else if lossy && filter.is_none() {
-            // Plain 8-bit RGB/grey pixels (decoded from Flate by qpdf) -> JPEG.
-            let num = |k: &str| dict.get(k).map(deref).and_then(|v| v.as_u64());
-            let (Some(w), Some(h), Some(8)) = (num("/Width"), num("/Height"), num("/BitsPerComponent")) else { continue };
-            let cs = dict.get("/ColorSpace").map_or(Value::Null, deref);
-            let comps = match &cs {
-                Value::String(s) if s == "/DeviceRGB" => Some(3),
-                Value::String(s) if s == "/DeviceGray" => Some(1),
-                Value::Array(a) if a.len() == 2 && a[0] == "/ICCBased" => deref(&a[1]).get("/N").and_then(Value::as_u64),
-                _ => None,
-            };
-            let Some(comps) = comps.filter(|c| matches!(c, 1 | 3)) else { continue };
-            let masked = ["/ImageMask", "/Decode", "/Mask", "/SMask"].iter().any(|k| dict.contains_key(*k));
-            if masked || w * h < 64 * 64 || file_size != w * h * comps {
-                continue;
-            }
-            // Its turn first: a huge picture waits without its pixels held in memory.
-            let (may, _turn) = image::lossy_turn(ctx, w.saturating_mul(h))?;
-            if !may {
-                continue;
-            }
-            let Ok(data) = std::fs::read(&file) else { continue };
-            let pnm = lw.join("img.pnm");
-            let mut f = Vec::with_capacity(data.len() + 32);
-            f.extend_from_slice(format!("P{}\n{w} {h}\n255\n", if comps == 3 { 6 } else { 5 }).as_bytes());
-            f.extend_from_slice(&data);
-            if std::fs::write(&pnm, &f).is_err() {
-                continue;
-            }
-            // Its size in the PDF now: /Length if direct, else what Flate level 9 gives.
-            let encoded = dict.get("/Length").map(deref).and_then(|v| v.as_u64()).unwrap_or_else(|| {
-                let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
-                let _ = z.write_all(&data);
-                z.finish().map_or(u64::MAX, |v| v.len() as u64)
             });
-            let limit = (encoded as f64 * keep_ratio) as u64;
-            drop((data, f)); // the search reads img.pnm
-            let Some((cand, _)) = image::search_methods(ctx, &pnm, reencoders(ctx, &lw, &pnm, &Vec::new()), limit)? else { continue };
-            best = Some(cand);
-            lossy_hit = true;
-            new_dict.remove("/DecodeParms");
-            new_dict.insert("/Filter".into(), json!("/DCTDecode"));
-        } else {
-            continue;
         }
-        let Some(best) = best else { continue };
-        new_dict.remove("/Length");
-        update.insert(key.clone(), json!({"stream": {"dict": new_dict, "datafile": best.to_string_lossy()}}));
+    });
+    drop(borrowed);
+    if let Some(e) = failure.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner) {
+        return Err(e);
+    }
+    let (mut update, mut n_lossless, mut n_lossy) = (Map::new(), 0, 0);
+    let mut items = results.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+    for (key, entry, lossy_hit) in items {
+        update.insert(key, entry);
         if lossy_hit {
             n_lossy += 1;
         } else {
@@ -413,6 +430,127 @@ fn optimize_images(ctx: &Ctx, src: &Path, work: &Path, lossy: bool) -> Result<Op
         return Ok(None);
     }
     Ok(Some(Update { json: json_path, lossless: n_lossless, lossy: n_lossy }))
+}
+
+/// Optimizes a single `/Image` stream object from a qpdf JSON export.
+#[allow(clippy::too_many_arguments)]
+fn optimize_pdf_image(
+    ctx: &Ctx,
+    n: usize,
+    key: &str,
+    obj: &Value,
+    deref: &impl Fn(&Value) -> Value,
+    soft_masks: &HashSet<&str>,
+    work: &Path,
+    lossy: bool,
+    keep_ratio: f64,
+) -> Result<Option<(String, Value, bool)>, RunError> {
+    let (Some(dict), Some(file)) = (
+        obj.pointer("/stream/dict").and_then(Value::as_object),
+        obj.pointer("/stream/datafile").and_then(Value::as_str).map(PathBuf::from),
+    ) else {
+        return Ok(None);
+    };
+    if dict.get("/Subtype").and_then(Value::as_str) != Some("/Image") || soft_masks.contains(key.trim_start_matches("obj:")) {
+        return Ok(None);
+    }
+    let file_size = size(&file);
+    if file_size == u64::MAX || file_size < MIN_IMAGE {
+        return Ok(None);
+    }
+    let filter = match dict.get("/Filter") {
+        Some(Value::Array(a)) if a.len() == 1 => a[0].as_str(),
+        Some(f) => f.as_str(),
+        None => None,
+    };
+    let lw = work.join(format!("i{n}"));
+    let _ = std::fs::create_dir_all(&lw);
+    let mut new_dict = dict.clone();
+    let mut best: Option<PathBuf> = None;
+    let mut lossy_hit = false;
+    if filter == Some("/DCTDecode") {
+        // Lossless: Huffman tables optimized, written sequential, same decoded pixels.
+        let out = lw.join("lossless.jpg");
+        let args = crate::os_args!["-copy", "all", "-revert", "-optimize", "-outfile", &out, &file];
+        if image::run(ctx, "jpegtran", args, &lw)? && size(&out) < file_size {
+            let want = djpeg_hash(ctx, &file)?;
+            if want.is_some() && djpeg_hash(ctx, &out)? == want {
+                best = Some(out);
+            }
+        }
+        let ref_jpg = lw.join("ref.jpg"); // extracted streams have no extension; scorers want one
+        let quality_ok = ctx.max.pdf_any_q || jpeg::quality(&file).is_none_or(|q| q >= MIN_LOSSY_QUALITY);
+        // CMYK/YCCK (common in print PDFs) would be re-encoded as RGB under /DeviceCMYK.
+        let reencodable = || jpeg::head(&file).is_some_and(|d| jpeg::reencodable(&d));
+        // A huge picture searches alone and only with its memory free (`image::lossy_turn`).
+        let turn = if lossy && file_size >= MIN_LOSSY_JPEG && quality_ok && reencodable() {
+            image::lossy_turn(ctx, image::pixel_count(&file).unwrap_or(0))?
+        } else {
+            (false, None)
+        };
+        if turn.0 && std::fs::copy(&file, &ref_jpg).is_ok() {
+            let pnm = lw.join("dec.pnm");
+            if image::run(ctx, "djpeg", crate::os_args!["-outfile", &pnm, &ref_jpg], &lw)? {
+                let keep: jpeg::Segments = jpeg::segments(&ref_jpg)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|(m, d)| *m == 0xE2 && d.starts_with(b"ICC_PROFILE"))
+                    .collect();
+                let limit = (best.as_deref().map_or(file_size, size) as f64 * keep_ratio) as u64;
+                if let Some((cand, _)) = image::search_methods(ctx, &ref_jpg, reencoders(ctx, &lw, &pnm, &keep), limit, turn.1.is_some())? {
+                    best = Some(cand);
+                    lossy_hit = true;
+                }
+            }
+        }
+    } else if lossy && filter.is_none() {
+        // Plain 8-bit RGB/grey pixels (decoded from Flate by qpdf) -> JPEG.
+        let num = |k: &str| dict.get(k).map(deref).and_then(|v| v.as_u64());
+        let (Some(w), Some(h), Some(8)) = (num("/Width"), num("/Height"), num("/BitsPerComponent")) else { return Ok(None) };
+        let cs = dict.get("/ColorSpace").map_or(Value::Null, deref);
+        let comps = match &cs {
+            Value::String(s) if s == "/DeviceRGB" => Some(3),
+            Value::String(s) if s == "/DeviceGray" => Some(1),
+            Value::Array(a) if a.len() == 2 && a[0] == "/ICCBased" => deref(&a[1]).get("/N").and_then(Value::as_u64),
+            _ => None,
+        };
+        let Some(comps) = comps.filter(|c| matches!(c, 1 | 3)) else { return Ok(None) };
+        let masked = ["/ImageMask", "/Decode", "/Mask", "/SMask"].iter().any(|k| dict.contains_key(*k));
+        if masked || w * h < 64 * 64 || file_size != w * h * comps {
+            return Ok(None);
+        }
+        // Its turn first: a huge picture waits without its pixels held in memory.
+        let (may, _turn) = image::lossy_turn(ctx, w.saturating_mul(h))?;
+        if !may {
+            return Ok(None);
+        }
+        let Ok(data) = std::fs::read(&file) else { return Ok(None) };
+        let pnm = lw.join("img.pnm");
+        let mut f = Vec::with_capacity(data.len() + 32);
+        f.extend_from_slice(format!("P{}\n{w} {h}\n255\n", if comps == 3 { 6 } else { 5 }).as_bytes());
+        f.extend_from_slice(&data);
+        if std::fs::write(&pnm, &f).is_err() {
+            return Ok(None);
+        }
+        // Its size in the PDF now: /Length if direct, else what Flate level 9 gives.
+        let encoded = dict.get("/Length").map(deref).and_then(|v| v.as_u64()).unwrap_or_else(|| {
+            let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+            let _ = z.write_all(&data);
+            z.finish().map_or(u64::MAX, |v| v.len() as u64)
+        });
+        let limit = (encoded as f64 * keep_ratio) as u64;
+        drop((data, f)); // the search reads img.pnm
+        let Some((cand, _)) = image::search_methods(ctx, &pnm, reencoders(ctx, &lw, &pnm, &Vec::new()), limit, _turn.is_some())? else { return Ok(None) };
+        best = Some(cand);
+        lossy_hit = true;
+        new_dict.remove("/DecodeParms");
+        new_dict.insert("/Filter".into(), json!("/DCTDecode"));
+    } else {
+        return Ok(None);
+    }
+    let Some(best) = best else { return Ok(None) };
+    new_dict.remove("/Length");
+    Ok(Some((key.to_string(), json!({"stream": {"dict": new_dict, "datafile": best.to_string_lossy()}}), lossy_hit)))
 }
 
 #[cfg(test)]
@@ -539,6 +677,19 @@ mod tests {
                 }
             }
         }
+        assert_eq!(pages_look_same(&lossy, &dir.join("photo.jpg.pdf"), &dir.join("photo.jpg.pdf"), &dir.join("same")).unwrap(), Some(100.0));
+        // Multi-page PDF with borrowed CPU slots: every slot comes back.
+        let mut slotted = ctx(true).unwrap();
+        let slots = tools::Slots::new(4);
+        assert!(slots.acquire(&slotted.gate));
+        slotted.slots = Some(slots.clone());
+        let multi = dir.join("multi.pdf");
+        run_ok(&mutool, &["convert".as_ref(), "-o".as_ref(), multi.as_os_str(), jpg.as_os_str(), png.as_os_str()]);
+        let work = dir.join("w-multi");
+        std::fs::create_dir_all(&work).unwrap();
+        let r = optimize(&slotted, &multi, &work).unwrap();
+        assert!(r.best.is_some(), "multi-page PDF optimized: {:?}", r.note);
+        assert_eq!(slots.borrow_idle(10), 3, "every borrowed slot returned");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

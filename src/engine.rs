@@ -7,7 +7,7 @@ use crate::history::{self, ContentHash, History};
 use crate::progress::{self, Diagnostics, WorkerProgress};
 use crate::system::{self, OriginalAttributes, PowerGuard};
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,6 +34,7 @@ use vmaf::*;
 
 pub use batch::cpu_slot_count;
 pub use ffmpeg::locate_ffmpeg;
+pub(crate) use images::active_stage_limit;
 
 const STATE_THROTTLE: Duration = Duration::from_millis(250);
 /// Kept free on a video's drive besides room for its new version.
@@ -168,18 +169,28 @@ struct Inner {
     files: Vec<PathBuf>,
     /// Size of each entry of `files` at scan time, same order.
     file_sizes: Vec<u64>,
+    /// Lazy O(1) lookup from path hash to `files` index (`None` until first `index_of`/`moved`/`gone`,
+    /// so runs without conversions/renames/pauses take zero extra memory).
+    file_index: Option<std::collections::HashMap<u64, u32>>,
     /// Videos to do, as indices into `files` (a queued file costs 4 bytes, not a second copy
     /// of its path: a library holds about a million files).
     pending_queue: Vec<u32>,
     queue_cursor: usize,
     /// Single-frame GIFs found by the scan: always images, whatever their size.
     static_gifs: HashSet<PathBuf>,
+    /// Whether `static_gifs` has been populated for the current `files` (skipped during
+    /// scan when Videos is off to avoid opening tens of thousands of GIFs on an HDD, and
+    /// computed lazily if Videos is later turned on).
+    gifs_checked: bool,
     /// PNG/JPEG and small GIFs, processed by the CPU image workers.
-    /// CPU files by stage (audio, documents, images: see `Kind::stage`), each with its cursor
-    /// and how many run now. A stage starts when the one before has nothing left to start.
-    cpu_queues: [Vec<u32>; 3],
-    cpu_cursors: [usize; 3],
+    /// CPU files by stage (audio, documents, images: see `Kind::stage`), sorted largest-first.
+    /// `VecDeque` lets the images stage claim heavy files from the front and normal files from
+    /// the back (preventing all workers from piling onto huge memory-heavy pictures at once)
+    /// and requeue paused files at the front in O(1).
+    cpu_queues: [VecDeque<u32>; 3],
     cpu_active: [usize; 3],
+    /// Heavy images (front-of-queue, >= `HEAVY_IMAGE_BYTES`) currently running.
+    heavy_images_active: usize,
     /// The stages announced in the log this batch.
     stage_logged: [bool; 3],
     /// Bytes waiting by type (videos, audio, documents, images).
@@ -251,6 +262,8 @@ pub struct Engine {
     data_dir: PathBuf,
     /// Media files found so far by the running scan (shown while scanning).
     scan_found: Arc<std::sync::atomic::AtomicUsize>,
+    /// Set by `cancel_scan` to stop an in-progress folder scan cleanly.
+    scan_cancel: Arc<AtomicBool>,
     inner: Mutex<Inner>,
     emit: Mutex<EmitThrottle>,
     /// Serializes encoder start-up so memory checks see the previous encoder's usage.
@@ -296,16 +309,19 @@ impl Engine {
             image_tools: Mutex::new(image_tools),
             data_dir: data_dir.to_path_buf(),
             scan_found: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            scan_cancel: Arc::new(AtomicBool::new(false)),
             inner: Mutex::new(Inner {
                 dir: None,
                 files: Vec::new(),
                 file_sizes: Vec::new(),
+                file_index: None,
                 pending_queue: Vec::new(),
                 queue_cursor: 0,
                 static_gifs: HashSet::new(),
+                gifs_checked: true,
                 cpu_queues: Default::default(),
-                cpu_cursors: [0; 3],
                 cpu_active: [0; 3],
+                heavy_images_active: 0,
                 stage_logged: [false; 3],
                 queue_bytes: [0; 4],
                 queue_revision: 0,
@@ -434,6 +450,11 @@ impl Engine {
     pub fn in_background(self: &Arc<Self>, action: impl FnOnce(&Arc<Self>) + Send + 'static) {
         let engine = Arc::clone(self);
         self.rt.spawn_blocking(move || action(&engine));
+    }
+
+    /// Cancels an in-progress folder scan (safe to call anytime).
+    pub fn cancel_scan(&self) {
+        self.scan_cancel.store(true, Ordering::SeqCst);
     }
 
     pub fn data_dir(&self) -> &std::path::Path {

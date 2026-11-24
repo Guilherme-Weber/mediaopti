@@ -119,8 +119,9 @@ impl Inner {
             Place::Generated
         } else if self.is_image_job(file, size) {
             if !self.cpu_job_enabled(file) {
-                // Not remembered: they may be optimized once switched on.
-                Place::Off { gif: args::is_gif(file) }
+                // Not remembered: they may be optimized once switched on. Count GIFs that stay
+                // GIFs (still, or under the video size limit) only while videos are enabled.
+                Place::Off { gif: args::is_gif(file) && self.options.videos }
             } else if self.history.contains_image(file, self.lossy_for(file), self.redo_stripped(), self.target_for(file)) {
                 Place::Known
             } else if self.failed.contains(file) {
@@ -162,8 +163,9 @@ impl Inner {
                 .unzip();
             self.files = files;
             self.file_sizes = kept;
+            self.file_index = None;
         }
-        let (mut queue, mut cpu): (Vec<u32>, [Vec<u32>; 3]) = (Vec::new(), Default::default());
+        let (mut queue, mut cpu): (Vec<u32>, [VecDeque<u32>; 3]) = (Vec::new(), Default::default());
         let mut bytes = [0u64; 4];
         let (mut known, mut generated, mut small_gifs) = (0, 0, 0);
         for (i, file) in self.files.iter().enumerate() {
@@ -176,7 +178,7 @@ impl Inner {
                 Place::Cpu => {
                     let stage = cpu_stage(file);
                     bytes[stage + 1] += size;
-                    cpu[stage].push(i as u32);
+                    cpu[stage].push_back(i as u32);
                 }
                 Place::Video => {
                     bytes[0] += size;
@@ -187,7 +189,6 @@ impl Inner {
         self.pending_queue = queue;
         self.queue_cursor = 0;
         self.cpu_queues = cpu;
-        self.cpu_cursors = [0; 3];
         self.queue_bytes = bytes;
         self.queue_revision += 1;
         self.skipped_known = known;
@@ -201,17 +202,46 @@ impl Inner {
 
     /// CPU files queued in all stages.
     pub(super) fn cpu_total(&self) -> usize {
-        self.cpu_queues.iter().map(Vec::len).sum()
+        self.cpu_queues.iter().map(VecDeque::len).sum()
     }
 
     /// CPU files not started yet.
     pub(super) fn cpu_left(&self) -> usize {
-        self.cpu_queues.iter().zip(self.cpu_cursors).map(|(q, c)| q.len().saturating_sub(c)).sum()
+        self.cpu_queues.iter().map(VecDeque::len).sum()
     }
 
-    /// Where `file` is in `files` (a search: only for the rare Pause). Compared as strings:
-    /// the entries are the scan's own paths, and `Path`'s `==` goes component by component.
-    fn index_of(&self, file: &Path) -> Option<u32> {
+    /// Stable 64-bit hash of a path's raw `OsStr` bytes (used for the lazy O(1) `file_index`).
+    fn path_hash(path: &Path) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        path.as_os_str().hash(&mut h);
+        h.finish()
+    }
+
+    /// Ensures the lazy path-hash index is built (0 extra bytes when never called).
+    fn ensure_file_index(&mut self) {
+        if self.file_index.is_some() {
+            return;
+        }
+        let mut map = std::collections::HashMap::with_capacity(self.files.len());
+        for (i, f) in self.files.iter().enumerate() {
+            if !f.as_os_str().is_empty() {
+                map.entry(Self::path_hash(f)).or_insert(i as u32);
+            }
+        }
+        self.file_index = Some(map);
+    }
+
+    /// Where `file` is in `files` (O(1) via the lazy `file_index`, with linear fallback only
+    /// on the rare 64-bit hash collision).
+    fn index_of(&mut self, file: &Path) -> Option<u32> {
+        self.ensure_file_index();
+        let h = Self::path_hash(file);
+        if let Some(&i) = self.file_index.as_ref().and_then(|m| m.get(&h)) {
+            if self.files.get(i as usize).is_some_and(|f| f.as_os_str() == file.as_os_str()) {
+                return Some(i);
+            }
+        }
         self.files.iter().position(|f| f.as_os_str() == file.as_os_str()).map(|i| i as u32)
     }
 
@@ -224,38 +254,45 @@ impl Inner {
     /// `file` is no longer on the disk (gone since the scan): its entry is marked gone.
     pub(super) fn gone(&mut self, file: &Path) {
         if let Some(i) = self.index_of(file) {
+            if let Some(map) = &mut self.file_index {
+                map.remove(&Self::path_hash(file));
+            }
             self.files[i as usize] = PathBuf::new();
             self.queue_revision += 1;
         }
     }
 
     pub(super) fn moved(&mut self, old: &Path, new: &Path, size: Option<u64>) {
-        let (mut at, mut listed) = (None, false);
-        for (i, f) in self.files.iter().enumerate() {
-            if f.as_os_str() == old.as_os_str() {
-                at = Some(i);
-            } else if f.as_os_str() == new.as_os_str() {
-                listed = true;
-            }
-        }
-        let Some(i) = at else { return };
+        let Some(i) = self.index_of(old) else { return };
+        let listed = old.as_os_str() != new.as_os_str() && self.index_of(new).is_some();
+        let idx = i as usize;
         let scanned = (args::is_video_file(new) || image::kind_of(new).is_some()) && !args::is_gif(new);
+        if let Some(map) = &mut self.file_index {
+            map.remove(&Self::path_hash(old));
+        }
         if scanned && !listed {
-            self.files[i] = new.to_path_buf();
-            if let (Some(s), Some(size)) = (self.file_sizes.get_mut(i), size) {
+            self.files[idx] = new.to_path_buf();
+            if let Some(map) = &mut self.file_index {
+                map.insert(Self::path_hash(new), i);
+            }
+            if let (Some(s), Some(size)) = (self.file_sizes.get_mut(idx), size) {
                 *s = size;
             }
         } else {
-            self.files[i] = PathBuf::new();
+            self.files[idx] = PathBuf::new();
         }
         self.queue_revision += 1;
     }
 
     /// Adds a scanned file to `files`, returning its index for the queues.
     pub(super) fn add_file(&mut self, file: PathBuf, size: u64) -> u32 {
+        let idx = self.files.len() as u32;
+        if let Some(map) = &mut self.file_index {
+            map.entry(Self::path_hash(&file)).or_insert(idx);
+        }
         self.files.push(file);
         self.file_sizes.push(size);
-        (self.files.len() - 1) as u32
+        idx
     }
 
     /// A video whose job was ended by a Pause (to free memory): next in line again.
@@ -271,7 +308,7 @@ impl Inner {
         let stage = cpu_stage(file);
         self.in_progress.remove(file);
         if let Some(i) = self.index_of(file) {
-            self.cpu_queues[stage].insert(self.cpu_cursors[stage], i);
+            self.cpu_queues[stage].push_front(i);
         }
     }
 
@@ -279,7 +316,7 @@ impl Inner {
     pub(super) fn queue_cpu(&mut self, i: u32, size: u64) {
         let stage = cpu_stage(&self.files[i as usize]);
         self.queue_bytes[stage + 1] += size;
-        self.cpu_queues[stage].push(i);
+        self.cpu_queues[stage].push_back(i);
         self.queue_revision += 1;
     }
 
@@ -389,9 +426,9 @@ impl Inner {
             space_saved_mb: round1(self.space_saved_mb),
             queue_counts: [
                 (self.pending_queue.len().saturating_sub(self.queue_cursor), self.queue_bytes[0]),
-                (self.cpu_queues[0].len().saturating_sub(self.cpu_cursors[0]), self.queue_bytes[1]),
-                (self.cpu_queues[1].len().saturating_sub(self.cpu_cursors[1]), self.queue_bytes[2]),
-                (self.cpu_queues[2].len().saturating_sub(self.cpu_cursors[2]), self.queue_bytes[3]),
+                (self.cpu_queues[0].len(), self.queue_bytes[1]),
+                (self.cpu_queues[1].len(), self.queue_bytes[2]),
+                (self.cpu_queues[2].len(), self.queue_bytes[3]),
             ],
             queue_revision: self.queue_revision,
             cpu_jobs,
@@ -423,11 +460,12 @@ impl Engine {
             inner.dir = None;
             inner.files.clear();
             inner.file_sizes.clear();
+            inner.file_index = None;
             inner.static_gifs.clear();
+            inner.gifs_checked = true;
             inner.pending_queue.clear();
             inner.queue_cursor = 0;
             inner.cpu_queues = Default::default();
-            inner.cpu_cursors = [0; 3];
             inner.queue_bytes = [0; 4];
             inner.queue_revision += 1;
             inner.reset_run_tracking();
@@ -448,7 +486,7 @@ impl Engine {
         let cpu = ["Audio", "Document", "Image"]
             .iter()
             .enumerate()
-            .flat_map(|(s, label)| inner.cpu_queues[s].iter().skip(inner.cpu_cursors[s]).map(move |&i| (i, *label)));
+            .flat_map(|(s, label)| inner.cpu_queues[s].iter().map(move |&i| (i, *label)));
         videos
             .chain(cpu)
             .take(limit)

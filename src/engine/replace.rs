@@ -193,8 +193,18 @@ impl Journal {
     }
 }
 
+/// Whether the volume/drive holding `path` is currently mounted (if a removable drive is
+/// unplugged, we must NOT drop its pending journal entry on startup).
+fn volume_mounted(path: &Path) -> bool {
+    match super::images::volume_root(path) {
+        Some(root) => root.is_dir(),
+        None => true,
+    }
+}
+
 /// Sets the journal (once per process; later calls are ignored) and loads what earlier runs
-/// left unfinished. Entries whose temp no longer exists are dropped.
+/// left unfinished. Entries whose temp no longer exists are dropped only when their drive
+/// is mounted (an unplugged drive's entry stays until the drive returns).
 pub(super) fn init_pending_journal(path: &Path) {
     let mut j = journal();
     if j.path.is_some() {
@@ -203,7 +213,7 @@ pub(super) fn init_pending_journal(path: &Path) {
     j.path = Some(path.to_path_buf());
     let text = std::fs::read(path).map_or_default(|b| String::from_utf8_lossy(&b).into_owned());
     j.live = parse_journal(&text);
-    j.live.retain(|_, p| p.temp.is_file());
+    j.live.retain(|_, p| p.temp.is_file() || !volume_mounted(&p.temp));
     if !text.is_empty() {
         j.compact();
     }
@@ -530,5 +540,12 @@ mod tests {
         assert!(is_orphan_temp(Path::new(r"C:\v\x.mediaopti.i12.png")));
         assert!(!is_orphan_temp(Path::new(r"C:\v\notes.mediaopti.final.mp4")), "user file");
         assert!(!is_orphan_temp(Path::new(r"C:\v\my.batchviproc.mp4")), "user file");
+    }
+
+    /// A pending entry on an unplugged drive must not be dropped when the journal loads.
+    #[test]
+    fn volume_mounted_distinguishes_unplugged_drives() {
+        assert!(volume_mounted(&std::env::temp_dir().join("x.tmp")));
+        assert!(!volume_mounted(Path::new(r"Q:\unplugged-drive-test\a.mediaopti.i1.png")));
     }
 }

@@ -246,7 +246,9 @@ impl Engine {
                             |w| (w.last_progress_at.elapsed(), w.percent),
                         )
                     };
-                    let limit = if percent == 0.0 { 30 } else { 60 };
+                    // At >=99% ffmpeg may be rewriting the MP4 moov atom (+faststart) on a large
+                    // HDD output, where no new frame progress prints for a while.
+                    let limit = if percent == 0.0 { 30 } else if percent >= 99.0 { 180 } else { 60 };
                     if idle > Duration::from_secs(limit) {
                         self.log(format!(
                             "[Worker {worker_id}] Stall watchdog triggered on {display} ({}s without frame progress). Terminating process.",
@@ -371,12 +373,13 @@ impl Engine {
         true
     }
 
-    /// Whether `input` may be decoded on the GPU, and the (even) size to scale it to: a
-    /// 10-bit NVENC encoder (AV1/HEVC) and a first video stream in H.264, HEVC, AV1 or VP9
-    /// at 4:2:0, not rotated. For these the frames NVDEC +
-    /// scale_cuda hand the encoder were checked to be bit-identical to the CPU path; MPEG-4
-    /// Part 2 decodes differently and 4:2:2 is converted differently, so they stay on the CPU.
-    pub(super) async fn gpu_decodable(&self, input: &Path) -> Option<(u32, u32)> {
+    /// Whether `input` may be decoded on the GPU, using the `gpu_size` already parsed by
+    /// [`Self::probe_streams`] (no second `ffmpeg -i` spawn): a 10-bit NVENC encoder
+    /// (AV1/HEVC) and a first video stream in H.264, HEVC, AV1 or VP9 at 4:2:0, not rotated.
+    /// For these the frames NVDEC + scale_cuda hand the encoder were checked to be
+    /// bit-identical to the CPU path; MPEG-4 Part 2 decodes differently and 4:2:2 is
+    /// converted differently, so they stay on the CPU.
+    pub(super) fn gpu_decode_for(&self, streams: &args::Streams, input: &Path) -> Option<(u32, u32)> {
         let (encoder, allowed) = {
             let inner = self.lock();
             (inner.options.encoder.clone(), inner.options.gpu_decoding)
@@ -386,11 +389,7 @@ impl Engine {
         if off || !matches!(encoder.as_str(), "av1_nvenc" | "hevc_nvenc") || args::is_gif(input) {
             return None;
         }
-        let mut cmd = tokio::process::Command::new(&self.ffmpeg_path);
-        cmd.args(["-hide_banner", "-i"]).arg(input).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true);
-        system::configure_background_command(&mut cmd, true);
-        let out = probe_output(&mut cmd, self.job_token(), PROBE_LIMIT).await?;
-        gpu_decodable_stream(&String::from_utf8_lossy(&out.stderr))
+        streams.gpu_size
     }
 
     /// The token that releases the running job: its own inside a video job (`JOB_TOKEN`),
@@ -435,6 +434,7 @@ impl Engine {
             return Err(Unfinished);
         }
         let mut streams = args::Streams::parse(&listing);
+        streams.gpu_size = gpu_decodable_stream(&listing);
         if streams.hdr {
             // HDR10's static metadata travels with the frames: read from the first one.
             let mut cmd = tokio::process::Command::new(&self.ffmpeg_path);

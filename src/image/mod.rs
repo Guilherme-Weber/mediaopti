@@ -117,27 +117,60 @@ pub fn sniff_picture(path: &Path) -> Option<Kind> {
     }
 }
 
-/// Where a GIF ends (just after its trailer), following its blocks; `None` if damaged.
-fn gif_end(d: &[u8]) -> Option<usize> {
-    if d.len() < 13 || !d.starts_with(b"GIF8") {
+/// Streams a GIF from disk (never loads the full file into RAM) to check whether any
+/// non-zero data follows its trailer (`0x3B`).
+/// Returns `None` if invalid/truncated before `0x3B`, `Some(true)` if non-zero trailing
+/// bytes exist, and `Some(false)` if clean or zero-padded.
+fn gif_trailing_data(path: &Path) -> Option<bool> {
+    use std::io::{BufReader, Read, Seek, SeekFrom};
+    let mut f = BufReader::with_capacity(16 * 1024, std::fs::File::open(path).ok()?);
+    let mut head = [0u8; 13];
+    f.read_exact(&mut head).ok()?;
+    if !head.starts_with(b"GIF8") {
         return None;
     }
-    let table = |flags: u8| if flags & 0x80 != 0 { 3usize << ((flags & 7) + 1) } else { 0 };
-    let mut i = 13 + table(d[10]);
-    let skip_blocks = |mut i: usize| -> Option<usize> {
+    let table = |flags: u8| if flags & 0x80 != 0 { 3i64 << ((flags & 7) + 1) } else { 0 };
+    let gct = table(head[10]);
+    if gct > 0 {
+        f.seek(SeekFrom::Current(gct)).ok()?;
+    }
+    let skip_blocks = |r: &mut BufReader<std::fs::File>| -> Option<()> {
+        let mut len = [0u8; 1];
         loop {
-            let n = usize::from(*d.get(i)?);
-            i += 1 + n;
-            if n == 0 {
-                return Some(i);
+            r.read_exact(&mut len).ok()?;
+            if len[0] == 0 {
+                return Some(());
             }
+            r.seek(SeekFrom::Current(i64::from(len[0]))).ok()?;
         }
     };
+    let mut tag = [0u8; 1];
     loop {
-        match *d.get(i)? {
-            0x3B => return Some(i + 1),
-            0x21 => i = skip_blocks(i + 2)?,
-            0x2C => i = skip_blocks(i + 10 + table(*d.get(i + 9)?) + 1)?,
+        f.read_exact(&mut tag).ok()?;
+        match tag[0] {
+            0x3B => {
+                let mut buf = [0u8; 8192];
+                loop {
+                    let n = f.read(&mut buf).ok()?;
+                    if n == 0 {
+                        return Some(false);
+                    }
+                    if buf[..n].iter().any(|&b| b != 0) {
+                        return Some(true);
+                    }
+                }
+            }
+            0x21 => {
+                f.seek(SeekFrom::Current(1)).ok()?;
+                skip_blocks(&mut f)?;
+            }
+            0x2C => {
+                let mut desc = [0u8; 9];
+                f.read_exact(&mut desc).ok()?;
+                let skip = table(desc[8]) + 1; // local colour table + LZW minimum code size
+                f.seek(SeekFrom::Current(skip)).ok()?;
+                skip_blocks(&mut f)?;
+            }
             _ => return None,
         }
     }
@@ -146,29 +179,27 @@ fn gif_end(d: &[u8]) -> Option<usize> {
 /// Whether a picture carries data after its end: a motion photo's video, an Ultra HDR gain
 /// map, an MPO's second picture, an appended archive. Optimizers drop it and the pixel check
 /// can't see it, so such files are left alone. (Zero padding doesn't count.)
+/// Streams from disk without loading full files into RAM.
 pub fn has_data_after_end(kind: Kind, path: &Path) -> bool {
-    let Ok(d) = std::fs::read(path) else { return false };
-    let end = match kind {
-        Kind::Jpg => jpeg::end_of_image(&d),
-        Kind::Gif => gif_end(&d),
-        Kind::Png => png::end_of_image(&d),
-        _ => None,
-    };
-    end.is_some_and(|e| d.get(e..).is_some_and(|rest| rest.iter().any(|&b| b != 0)))
+    match kind {
+        Kind::Png => png::trailing_data(path) == Some(true),
+        Kind::Jpg => jpeg::trailing_data(path) == Some(true),
+        Kind::Gif => gif_trailing_data(path) == Some(true),
+        _ => false,
+    }
 }
 
 /// Whether a JPEG, PNG or GIF looks cut off: its structure can't be followed to its end
 /// marker (a download that stopped, a damaged copy). Some valid files lack the marker too,
 /// so this only explains why nothing smaller was made; it never stops a file.
+/// Streams from disk without loading full files into RAM.
 pub fn looks_cut_off(kind: Kind, path: &Path) -> bool {
-    let Ok(d) = std::fs::read(path) else { return false };
-    let end = match kind {
-        Kind::Jpg => jpeg::end_of_image(&d),
-        Kind::Gif => gif_end(&d),
-        Kind::Png => png::end_of_image(&d),
-        _ => return false,
-    };
-    end.is_none()
+    match kind {
+        Kind::Png => png::trailing_data(path).is_none(),
+        Kind::Jpg => jpeg::trailing_data(path).is_none(),
+        Kind::Gif => gif_trailing_data(path).is_none(),
+        _ => false,
+    }
 }
 
 /// The real extension of a picture by its content ("png", "jpg", "gif", "webp", "bmp"), for
@@ -399,11 +430,14 @@ pub struct Optimized {
     pub note: Option<String>,
     /// The result is another format, saved with this extension (e.g. WAV -> "flac").
     pub new_ext: Option<&'static str>,
+    /// Set when a requested lossy search didn't fit in commit memory even alone, so the file
+    /// only got the lossless pass and must be remembered as lossless.
+    pub lossless_only: bool,
 }
 
 impl Optimized {
     pub fn found(best: Option<PathBuf>, steps: Vec<String>) -> Self {
-        Self { best, steps, note: None, new_ext: None }
+        Self { best, steps, note: None, new_ext: None, lossless_only: false }
     }
 
     pub fn nothing() -> Self {
@@ -433,33 +467,158 @@ pub(crate) fn big_lossy_fits(need: u64, available: Option<u64>) -> bool {
     available.is_none_or(|a| a >= need.saturating_add(BIG_LOSSY_RESERVE))
 }
 
-/// Waits for the other big lossy search to end (one at a time). `None` on Stop.
-pub(crate) fn one_big_lossy_job(gate: &tools::Gate) -> Option<std::sync::MutexGuard<'static, ()>> {
-    static BIG_LOSSY: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    loop {
-        match BIG_LOSSY.try_lock() {
-            Ok(guard) => return Some(guard),
-            Err(std::sync::TryLockError::Poisoned(p)) => return Some(p.into_inner()),
-            Err(std::sync::TryLockError::WouldBlock) => {}
+struct BigLossyQueue {
+    next_ticket: u64,
+    waiting: std::collections::VecDeque<u64>,
+    active: usize,
+}
+
+/// Strictly-FIFO, memory-budgeted gate for big lossy searches (`need >= BIG_LOSSY_JOB`).
+///
+/// Unlike a single global mutex (which blocked all other workers even during lossless passes
+/// and starved older jobs), this lets multiple big lossy searches run concurrently whenever
+/// their combined estimated commit memory fits in `available_commit - BIG_LOSSY_RESERVE`,
+/// while keeping strict FIFO order and immediately refusing (`Ok(None)`) when no other big
+/// search is active and raw commit memory cannot fit the job even alone.
+struct BigLossyGate {
+    state: std::sync::Mutex<BigLossyQueue>,
+    changed: std::sync::Condvar,
+    promised: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+static BIG_LOSSY: std::sync::LazyLock<std::sync::Arc<BigLossyGate>> =
+    std::sync::LazyLock::new(|| std::sync::Arc::new(BigLossyGate::new(std::sync::Arc::clone(&PROMISED))));
+
+/// Active turn in [`BigLossyGate`]; releases its memory promise and wakes the next waiter on drop.
+pub(crate) struct LossyTurn {
+    promise: Option<Promise>,
+    gate: std::sync::Arc<BigLossyGate>,
+}
+
+impl Drop for LossyTurn {
+    fn drop(&mut self) {
+        // Drop the memory promise first so waiters waking up see the freed budget at once.
+        self.promise.take();
+        let mut q = self.gate.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        q.active = q.active.saturating_sub(1);
+        self.gate.changed.notify_all();
+    }
+}
+
+struct TicketGuard<'a> {
+    gate: &'a BigLossyGate,
+    ticket: Option<u64>,
+}
+
+impl Drop for TicketGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(t) = self.ticket.take() {
+            let mut q = self.gate.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            q.waiting.retain(|&id| id != t);
+            self.gate.changed.notify_all();
         }
-        if !gate.wait_while_paused() {
-            return None;
+    }
+}
+
+impl BigLossyGate {
+    fn new(promised: std::sync::Arc<std::sync::atomic::AtomicU64>) -> Self {
+        Self {
+            state: std::sync::Mutex::new(BigLossyQueue {
+                next_ticket: 0,
+                waiting: std::collections::VecDeque::new(),
+                active: 0,
+            }),
+            changed: std::sync::Condvar::new(),
+            promised,
         }
-        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    fn notify(&self) {
+        self.changed.notify_all();
+    }
+
+    fn acquire_with(
+        self: &std::sync::Arc<Self>,
+        need: u64,
+        gate: &tools::Gate,
+        available_fn: impl Fn() -> Option<u64>,
+        on_wait: impl Fn(),
+    ) -> Result<Option<LossyTurn>, RunError> {
+        let ticket = {
+            let mut q = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let t = q.next_ticket;
+            q.next_ticket += 1;
+            q.waiting.push_back(t);
+            t
+        };
+        // Declared before the mutex guard so `q` always drops before `TicketGuard`.
+        let mut guard = TicketGuard { gate: self, ticket: Some(ticket) };
+        let mut notified_wait = false;
+        let mut q = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if gate.is_cancelled() {
+                drop(q);
+                return Err(RunError::Cancelled);
+            }
+            if gate.is_paused() {
+                drop(q);
+                if !gate.wait_while_paused() {
+                    return Err(RunError::Cancelled);
+                }
+                q = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                continue;
+            }
+            if q.waiting.front() == Some(&ticket) {
+                let available = available_fn();
+                if let Some(p) = promise_on(&self.promised, need, available, BIG_LOSSY_RESERVE) {
+                    q.waiting.pop_front();
+                    guard.ticket = None;
+                    q.active += 1;
+                    self.changed.notify_all();
+                    drop(q);
+                    return Ok(Some(LossyTurn { promise: Some(p), gate: std::sync::Arc::clone(self) }));
+                }
+                if q.active == 0 && !big_lossy_fits(need, available) {
+                    q.waiting.pop_front();
+                    guard.ticket = None;
+                    self.changed.notify_all();
+                    drop(q);
+                    return Ok(None);
+                }
+            }
+            if !notified_wait {
+                notified_wait = true;
+                on_wait();
+            }
+            q = self
+                .changed
+                .wait_timeout(q, Duration::from_millis(250))
+                .map_or_else(|e| e.into_inner().0, |r| r.0);
+        }
     }
 }
 
 /// Commit memory promised to jobs for what they take beyond one thread and one search (their
-/// tools' extra threads, lossy methods side by side), until they end. Jobs starting together
-/// all see the same free memory; each counts the others' promises before taking more.
-static PROMISED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// tools' extra threads, big lossy searches, lossy methods side by side), until they end.
+/// Jobs starting together all see the same free memory; each counts the others' promises
+/// before taking more.
+static PROMISED: std::sync::LazyLock<std::sync::Arc<std::sync::atomic::AtomicU64>> =
+    std::sync::LazyLock::new(|| std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)));
 
 /// Memory promised to one job; given back when it is dropped.
-pub(crate) struct Promise(u64);
+pub(crate) struct Promise {
+    amount: u64,
+    counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
 
 impl Drop for Promise {
     fn drop(&mut self) {
-        PROMISED.fetch_sub(self.0, std::sync::atomic::Ordering::SeqCst);
+        if self.amount > 0 {
+            self.counter.fetch_sub(self.amount, std::sync::atomic::Ordering::SeqCst);
+            if std::sync::Arc::ptr_eq(&self.counter, &PROMISED) {
+                BIG_LOSSY.notify();
+            }
+        }
     }
 }
 
@@ -468,35 +627,91 @@ pub(crate) fn promised() -> u64 {
     PROMISED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// Promises `amount` when the free commit memory (`available`), less what others were
-/// promised, still leaves `keep` after it. `None` when it doesn't fit; unknown memory fits
-/// (with nothing tracked).
-pub(crate) fn promise(amount: u64, available: Option<u64>, keep: u64) -> Option<Promise> {
+/// Promises `amount` on `counter` when `available`, less what others were promised, still
+/// leaves `keep` after it. `None` when it doesn't fit; unknown memory fits (with nothing tracked).
+fn promise_on(counter: &std::sync::Arc<std::sync::atomic::AtomicU64>, amount: u64, available: Option<u64>, keep: u64) -> Option<Promise> {
     use std::sync::atomic::Ordering::SeqCst;
-    let Some(available) = available else { return Some(Promise(0)) };
-    let mut current = PROMISED.load(SeqCst);
+    let Some(available) = available else {
+        return Some(Promise { amount: 0, counter: std::sync::Arc::clone(counter) });
+    };
+    let mut current = counter.load(SeqCst);
     loop {
         if available.saturating_sub(current) < amount.saturating_add(keep) {
             return None;
         }
-        match PROMISED.compare_exchange(current, current.saturating_add(amount), SeqCst, SeqCst) {
-            Ok(_) => return Some(Promise(amount)),
+        match counter.compare_exchange(current, current.saturating_add(amount), SeqCst, SeqCst) {
+            Ok(_) => return Some(Promise { amount, counter: std::sync::Arc::clone(counter) }),
             Err(now) => current = now,
         }
     }
 }
 
-/// For a picture inside a document or comic (`pixels` of it): whether its visually lossless
-/// search may run now, holding the one-big-search turn when it is big (as for a picture on
-/// its own: a 150-megapixel comic page needs ~20 GB). `Ok((false, None))`: lossless only.
-pub(crate) fn lossy_turn(ctx: &Ctx, pixels: u64) -> Result<(bool, Option<std::sync::MutexGuard<'static, ()>>), RunError> {
+/// Promises `amount` when the free commit memory (`available`), less what others were
+/// promised, still leaves `keep` after it. `None` when it doesn't fit; unknown memory fits
+/// (with nothing tracked).
+pub(crate) fn promise(amount: u64, available: Option<u64>, keep: u64) -> Option<Promise> {
+    promise_on(&PROMISED, amount, available, keep)
+}
+
+/// oxipng's commit memory (the hungriest PNG lossless tool; ECT takes less) for a picture,
+/// measured on a 31.2 MP PNG: 0.52 GB on one thread, 1.33 GB on 16 (ECT 0.35 -> 0.80 GB;
+/// 80 -> 42 s and 114 -> 76 s). So about 17 bytes a pixel for the first thread and 1.75 for
+/// each more.
+const MT_BASE_BYTES_PER_PIXEL: u64 = 17;
+const MT_EXTRA_PER_THREAD_PER_100_PIXELS: u64 = 175;
+
+/// Commit memory a PNG's lossless tools take on `threads` threads.
+pub(crate) fn tool_memory(pixels: u64, threads: u64) -> u64 {
+    pixels
+        .saturating_mul(MT_BASE_BYTES_PER_PIXEL)
+        .saturating_add((pixels.saturating_mul(MT_EXTRA_PER_THREAD_PER_100_PIXELS) / 100).saturating_mul(threads.saturating_sub(1)))
+}
+
+/// Threads a PNG's lossless tools may use with `free` commit memory (free now, less what
+/// other jobs were promised): as many as fit past a 2 GB reserve, all cores when they all
+/// fit (a 100 MP picture with 6 GB free still gets 15). Never a cliff from all to one: one
+/// only when even one thread's base doesn't fit. 0 = every core (the tool's default).
+pub(crate) fn picture_threads(pixels: u64, cores: u64, free: Option<u64>) -> usize {
+    let Some(free) = free.map(|a| a.saturating_sub(BIG_LOSSY_RESERVE)) else { return 0 };
+    let per_thread = (pixels.saturating_mul(MT_EXTRA_PER_THREAD_PER_100_PIXELS) / 100).max(1);
+    let base = tool_memory(pixels, 1);
+    let threads = if free <= base { 1 } else { 1 + (free - base) / per_thread };
+    if threads >= cores { 0 } else { usize::try_from(threads).unwrap_or(1).max(1) }
+}
+
+/// A PNG's lossless threads, with the memory of its extra threads promised (`promise`) only
+/// for the duration of the lossless chain so it doesn't shrink the budget during lossy search.
+pub(crate) fn picture_threads_promised(pixels: u64, cores: u64) -> (usize, Option<Promise>) {
+    for _ in 0..4 {
+        let available = crate::system::memory_status().map(|m| m.available_commit);
+        let threads = picture_threads(pixels, cores, available.map(|a| a.saturating_sub(promised())));
+        let used = if threads == 0 { cores } else { threads as u64 };
+        let extra = tool_memory(pixels, used).saturating_sub(tool_memory(pixels, 1));
+        if extra == 0 {
+            return (threads, None);
+        }
+        if let Some(p) = promise(extra, available, tool_memory(pixels, 1).saturating_add(BIG_LOSSY_RESERVE)) {
+            return (threads, Some(p));
+        }
+    }
+    (1, None)
+}
+
+/// For a picture (standalone, or inside a document or comic) of `pixels` pixels: whether its
+/// lossy search may run now, acquiring a FIFO memory-budgeted [`LossyTurn`] when it is big
+/// (`pixels * LOSSY_BYTES_PER_PIXEL >= BIG_LOSSY_JOB`). `Ok((false, None))`: lossless only.
+pub(crate) fn lossy_turn(ctx: &Ctx, pixels: u64) -> Result<(bool, Option<LossyTurn>), RunError> {
     let need = pixels.saturating_mul(LOSSY_BYTES_PER_PIXEL);
     if !ctx.lossy || need < BIG_LOSSY_JOB {
         return Ok((ctx.lossy, None));
     }
-    let guard = one_big_lossy_job(&ctx.gate).ok_or(RunError::Cancelled)?;
-    let fits = big_lossy_fits(need, crate::system::memory_status().map(|m| m.available_commit));
-    Ok((fits, fits.then_some(guard)))
+    let turn = BIG_LOSSY.acquire_with(
+        need,
+        &ctx.gate,
+        || crate::system::memory_status().map(|m| m.available_commit),
+        || ctx.phase("waiting for memory", &[]),
+    )?;
+    Ok((turn.is_some(), turn))
 }
 
 /// The tool a kind can't do without, if it is missing. Without it the chain skips its steps
@@ -659,7 +874,10 @@ impl<'a> Chain<'a> {
         check: &mut dyn FnMut(&Path) -> Result<bool, RunError>,
         repair: Option<&dyn Fn(&Path)>,
     ) -> Result<(), RunError> {
-        let Some(mut s) = size(out).filter(|_| ran_ok) else { return Ok(()) };
+        let Some(mut s) = size(out).filter(|_| ran_ok) else {
+            let _ = std::fs::remove_file(out);
+            return Ok(());
+        };
         if s < self.best_size {
             if let Some(r) = repair {
                 r(out);
@@ -667,9 +885,15 @@ impl<'a> Chain<'a> {
             }
         }
         if s < self.best_size && check(out)? {
-            self.best = out.to_path_buf();
+            let prev = std::mem::replace(&mut self.best, out.to_path_buf());
+            // Remove superseded temp files inside `work` (never touch `src`).
+            if prev.starts_with(&self.work) && prev != self.best {
+                let _ = std::fs::remove_file(prev);
+            }
             self.best_size = s;
             self.steps.push(label.to_string());
+        } else {
+            let _ = std::fs::remove_file(out);
         }
         Ok(())
     }
@@ -700,33 +924,75 @@ pub fn optimize(ctx: &Ctx, kind: Kind, src: &Path, work: &Path) -> Result<Optimi
         _ => {}
     }
     ctx.phase("lossless", &[]);
-    let mut chain = match kind {
-        Kind::Png => png_chain(ctx, work, src, src, &ver)?,
-        Kind::Jpg => jpg_chain(ctx, work, src, &ver)?,
-        Kind::Gif => {
-            let mut c = Chain::new(ctx, work, src);
-            let mut check = |p: &Path| ver.ok(p);
-            let strip: &[&str] = if ctx.strip { &["--no-comments", "--no-names"] } else { &[] };
-            c.write_to("gifsicle", "gifsicle", |i, o| {
-                let mut a = crate::os_args!["-O3", "--no-warnings"];
-                a.extend(strip.iter().map(Into::into));
-                a.extend(crate::os_args!["-o", o, i]);
-                a
-            }, &mut check, None)?;
-            c
+    let mut lossless_only = false;
+    let try_lossy = ctx.lossy && ctx.tools.has("ssimulacra2") && matches!(kind, Kind::Png | Kind::Jpg);
+    let mut chain = if kind == Kind::Png && try_lossy && !ver.png.as_ref().is_some_and(png::PngInfo::is_apng) {
+        // Fast path for lossy PNGs: run only the fast lossless step (`beeim -sl=5` / `pingo`)
+        // first, then try `lossy_png`. If lossy already beats the fast lossless result by >= 18%
+        // (and `beeim`/`pingo` already compressed the input), `oxipng + ect` on the original
+        // cannot overtake it and is skipped completely — saving ~35-45% time and oxipng RAM.
+        // Borderline or non-winning cases run `oxipng + ect` on the original for the exact 3% rule.
+        let mut fast = png_chain_fast(ctx, work, src, src, &ver)?;
+        let fast_size = fast.best_size;
+        let fast_ran = !fast.steps.is_empty();
+        let (may_lossy, turn) = lossy_turn(ctx, pixel_count(src).unwrap_or(0))?;
+        if may_lossy {
+            ctx.phase("lossy search", &[]);
+            let mut lossy_chain = Chain::new(ctx, work, src);
+            lossy_chain.best.clone_from(&fast.best);
+            lossy_chain.best_size = fast_size;
+            lossy_png(ctx, work, src, &mut lossy_chain, &ver, turn)?;
+            let lossy_won = lossy_chain.steps.iter().any(|s| s.contains('='));
+            if lossy_won && fast_ran && lossy_chain.best_size <= (fast_size as f64 * 0.82) as u64 {
+                lossy_chain
+            } else {
+                // Finish `oxipng + ect` on the original for an exact lossless baseline.
+                ctx.phase("lossless", &[]);
+                png_chain_slow(ctx, src, &ver, &mut fast)?;
+                let exact_limit = (fast.best_size as f64 * (1.0 - ctx.lossy_min_gain)) as u64;
+                if lossy_won && lossy_chain.best_size <= exact_limit {
+                    lossy_chain
+                } else {
+                    fast
+                }
+            }
+        } else {
+            lossless_only = true;
+            png_chain_slow(ctx, src, &ver, &mut fast)?;
+            fast
         }
-        _ => unreachable!("handled above"),
+    } else {
+        let mut chain = match kind {
+            Kind::Png => png_chain(ctx, work, src, src, &ver)?,
+            Kind::Jpg => jpg_chain(ctx, work, src, &ver)?,
+            Kind::Gif => {
+                let mut c = Chain::new(ctx, work, src);
+                let mut check = |p: &Path| ver.ok(p);
+                let strip: &[&str] = if ctx.strip { &["--no-comments", "--no-names"] } else { &[] };
+                c.write_to("gifsicle", "gifsicle", |i, o| {
+                    let mut a = crate::os_args!["-O3", "--no-warnings"];
+                    a.extend(strip.iter().map(Into::into));
+                    a.extend(crate::os_args!["-o", o, i]);
+                    a
+                }, &mut check, None)?;
+                c
+            }
+            _ => unreachable!("handled above"),
+        };
+        if try_lossy && kind == Kind::Jpg && jpeg_lossy_eligible(ctx, src, &ver) {
+            let (may_lossy, turn) = lossy_turn(ctx, pixel_count(src).unwrap_or(0))?;
+            if may_lossy {
+                ctx.phase("lossy search", &[]);
+                lossy_jpeg(ctx, work, src, &mut chain, &ver, turn)?;
+            } else {
+                lossless_only = true;
+            }
+        }
+        chain
     };
-    if ctx.lossy && ctx.tools.has("ssimulacra2") && matches!(kind, Kind::Png | Kind::Jpg) {
-        ctx.phase("lossy search", &[]);
-        match kind {
-            Kind::Png => lossy_png(ctx, work, src, &mut chain, &ver)?,
-            Kind::Jpg => lossy_jpeg(ctx, work, src, &mut chain, &ver)?,
-            _ => {}
-        }
-    }
+    let _ = &mut chain;
     let best = (chain.best != src).then_some(chain.best);
-    Ok(Optimized::found(best, chain.steps))
+    Ok(Optimized { lossless_only, ..Optimized::found(best, chain.steps) })
 }
 
 /// BMP and TGA files bigger than this are left alone (their alpha plane is read into memory).
@@ -789,16 +1055,17 @@ fn to_png(ctx: &Ctx, kind: Kind, src: &Path, work: &Path) -> Result<Optimized, R
     }
     let r = optimize(ctx, Kind::Png, &png, work)?;
     let steps = std::iter::once("to-png".to_string()).chain(r.steps).collect();
-    Ok(Optimized { new_ext: Some("png"), ..Optimized::found(Some(r.best.unwrap_or(png)), steps) })
+    Ok(Optimized { new_ext: Some("png"), lossless_only: r.lossless_only, ..Optimized::found(Some(r.best.unwrap_or(png)), steps) })
 }
 
-/// Lossless PNG chain; `restore_from` is where dropped chunks are copied back from.
-fn png_chain<'a>(ctx: &'a Ctx, work: &Path, src: &Path, restore_from: &Path, ver: &Verifier) -> Result<Chain<'a>, RunError> {
+/// Fast lossless PNG steps (`beeim -sl=5` / `pingo`), separated so lossy PNGs can skip
+/// `oxipng + ect` on the original whenever the lossy pass already wins by a wide margin.
+fn png_chain_fast<'a>(ctx: &'a Ctx, work: &Path, src: &Path, restore_from: &Path, ver: &Verifier) -> Result<Chain<'a>, RunError> {
     let mut c = Chain::new(ctx, work, src);
     let apng = ver.png.as_ref().is_some_and(png::PngInfo::is_apng);
-    let strip = ctx.strip;
+    let restorable = png::Restorable::extract(restore_from, ctx.strip);
     let repair = |p: &Path| {
-        let _ = png::restore_chunks(restore_from, p, strip);
+        let _ = restorable.apply(p);
     };
     let mut check = |p: &Path| ver.ok(p);
     let use_beeim = ctx.tools.has("beeim") && !apng;
@@ -812,10 +1079,30 @@ fn png_chain<'a>(ctx: &'a Ctx, work: &Path, src: &Path, restore_from: &Path, ver
         let alpha = if ctx.strict_alpha { "-noalpha" } else { "-quiet" };
         c.inplace("pingo", "pingo", |o| crate::os_args!["-s4", "-lossless", "-quiet", "-nostrip", alpha, o], &mut check, Some(&repair))?;
     }
+    Ok(c)
+}
+
+/// Slow lossless PNG steps (`oxipng -o 4` + `ect -6`) applied on top of `c`.
+fn png_chain_slow(ctx: &Ctx, restore_from: &Path, ver: &Verifier, c: &mut Chain<'_>) -> Result<(), RunError> {
+    let apng = ver.png.as_ref().is_some_and(png::PngInfo::is_apng);
+    let strip = ctx.strip;
+    let restorable = png::Restorable::extract(restore_from, strip);
+    let repair = |p: &Path| {
+        let _ = restorable.apply(p);
+    };
+    let mut check = |p: &Path| ver.ok(p);
+    // Promise oxipng/ECT extra-thread memory only while they run (dropped right after), so
+    // it never eats into the budget during a subsequent lossy search or while waiting for it.
+    let (mt_threads, _mt_promise) = if ctx.threads == 0 {
+        let cores = std::thread::available_parallelism().map_or(4, |n| n.get() as u64);
+        picture_threads_promised(pixel_count(&c.best).unwrap_or(0), cores)
+    } else {
+        (ctx.threads, None)
+    };
     let mut args = crate::os_args!["-o", if ctx.max.oxipng_max { "max" } else { "4" }, "-q"];
-    if ctx.threads > 0 {
+    if mt_threads > 0 {
         // Same output whatever the thread count (checked byte for byte on a 13.7 MP PNG).
-        args.extend(crate::os_args!["-t", ctx.threads.to_string()]);
+        args.extend(crate::os_args!["-t", mt_threads.to_string()]);
     }
     if !ctx.strict_alpha {
         args.push("--alpha".into());
@@ -836,7 +1123,6 @@ fn png_chain<'a>(ctx: &'a Ctx, work: &Path, src: &Path, restore_from: &Path, ver
     )?;
     if ctx.max.png_ect && !apng {
         let strict = ctx.strict_alpha;
-        let threads = ctx.threads;
         // -6, not -9: -9 costs ~5x the time (Pictures sample: -0.50% vs -0.26% under 2 MP,
         // -0.39% vs -0.29% above), and ECT was ~38% of all tool time on a lossy image run.
         let args = |o: &Path| {
@@ -845,7 +1131,7 @@ fn png_chain<'a>(ctx: &'a Ctx, work: &Path, src: &Path, restore_from: &Path, ver
                 a.push("--strict".into()); // keeps fully transparent pixels
             }
             // Per-block threads: the same bytes, 41 s -> 20 s on a 13.7 MP PNG.
-            match threads {
+            match mt_threads {
                 1 => {}
                 0 => a.push("--mt-deflate".into()),
                 n => a.push(format!("--mt-deflate={n}").into()),
@@ -855,6 +1141,13 @@ fn png_chain<'a>(ctx: &'a Ctx, work: &Path, src: &Path, restore_from: &Path, ver
         };
         c.inplace("ect", "ect", args, &mut check, Some(&repair))?;
     }
+    Ok(())
+}
+
+/// Lossless PNG chain; `restore_from` is where dropped chunks are copied back from.
+fn png_chain<'a>(ctx: &'a Ctx, work: &Path, src: &Path, restore_from: &Path, ver: &Verifier) -> Result<Chain<'a>, RunError> {
+    let mut c = png_chain_fast(ctx, work, src, restore_from, ver)?;
+    png_chain_slow(ctx, restore_from, ver, &mut c)?;
     Ok(c)
 }
 
@@ -882,6 +1175,17 @@ fn jpg_chain<'a>(ctx: &'a Ctx, work: &Path, src: &Path, ver: &Verifier) -> Resul
 /// SSIMULACRA2 of `b` against `a`. Retries on plain RGBA copies when ssimulacra2 can't
 /// read a file (it rejects some valid PNGs).
 pub(crate) fn ssim_score(ctx: &Ctx, a: &Path, b: &Path) -> Result<Option<f64>, RunError> {
+    ssim_score_cached(ctx, a, b, None)
+}
+
+/// [`ssim_score`] that caches the normalized RGBA reference PNG across a binary search when
+/// `ref_cache` is given, and always removes temporary comparison copies.
+fn ssim_score_cached(
+    ctx: &Ctx,
+    a: &Path,
+    b: &Path,
+    ref_cache: Option<&std::sync::Mutex<Option<PathBuf>>>,
+) -> Result<Option<f64>, RunError> {
     let Some(ssim) = ctx.tools.get("ssimulacra2") else { return Ok(None) };
     let score = |x: &Path, y: &Path| -> Result<Option<f64>, RunError> {
         let ran = tools::run(ssim, crate::os_args![x, y], None, Capture::Bytes, ctx.timeout, &ctx.gate)?;
@@ -893,69 +1197,120 @@ pub(crate) fn ssim_score(ctx: &Ctx, a: &Path, b: &Path) -> Result<Option<f64>, R
     if let Some(s) = score(a, b)? {
         return Ok(Some(s));
     }
-    let (na, nb) = (b.with_extension("ref.png"), b.with_extension("cmp.png"));
-    for (from, to) in [(a, &na), (b, &nb)] {
+    let to_rgba = |from: &Path, to: &Path| -> Result<bool, RunError> {
         let args = crate::os_args!["-v", "error", "-y", "-i", from, "-frames:v", "1", "-pix_fmt", "rgba", to];
-        if !tools::run(&ctx.tools.ffmpeg, args, None, Capture::None, ctx.timeout, &ctx.gate)?.success {
+        Ok(tools::run(&ctx.tools.ffmpeg, args, None, Capture::None, ctx.timeout, &ctx.gate)?.success)
+    };
+    let (na, remove_na) = if let Some(cache) = ref_cache {
+        let mut slot = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(existing) = slot.as_ref() {
+            (existing.clone(), false)
+        } else {
+            let target = b.with_file_name("ssim-ref.png");
+            if !to_rgba(a, &target)? {
+                return Ok(None);
+            }
+            *slot = Some(target.clone());
+            (target, false)
+        }
+    } else {
+        let target = b.with_extension("ref.png");
+        if !to_rgba(a, &target)? {
             return Ok(None);
         }
-    }
-    let s = score(&na, &nb);
+        (target, true)
+    };
+    let nb = b.with_extension("cmp.png");
+    let ok = to_rgba(b, &nb)?;
+    let s = if ok { score(&na, &nb) } else { Ok(None) };
     let _ = std::fs::remove_file(&nb);
+    if remove_na {
+        let _ = std::fs::remove_file(&na);
+    }
     s
 }
 
 pub(crate) type Encoder<'e> = Box<dyn FnMut(u32) -> Result<Option<PathBuf>, RunError> + Send + 'e>;
 
 /// Binary-searches quality `n` in `lo..=hi` (higher = better) for the smallest output that
-/// still scores >= target and is below `limit` bytes, with its score. One probe at a fairly
-/// strong setting first: already-optimized images don't get smaller there, and are skipped
-/// cheaply.
-pub(crate) fn quality_search(ctx: &Ctx, reference: &Path, lo: u32, hi: u32, encode: &mut Encoder, limit: u64) -> Result<Option<(PathBuf, f64)>, RunError> {
+/// still scores >= target and is below `limit` bytes, with its score.
+///
+/// Evaluates the initial `probe` right away so its size and score immediately shrink the
+/// search range (cutting 25% on pass or 75% on fail) and tighten `limit` for sibling
+/// parallel methods, biases the next split slightly lower when the probe has large quality
+/// headroom (`>= +10`), and deletes every losing candidate file immediately to keep temp disk
+/// usage minimal.
+fn quality_search(
+    ctx: &Ctx,
+    reference: &Path,
+    lo: u32,
+    hi: u32,
+    encode: &mut Encoder,
+    limit: &std::sync::atomic::AtomicU64,
+    ref_cache: &std::sync::Mutex<Option<PathBuf>>,
+) -> Result<Option<(PathBuf, f64)>, RunError> {
+    use std::sync::atomic::Ordering::Relaxed;
     let probe = hi - (hi - lo) / 4;
     let first = encode(probe)?;
     let (mut lo, mut hi) = (i64::from(lo), i64::from(hi));
-    match first.as_deref().and_then(size) {
+    let mut best: Option<(PathBuf, u64, f64)> = None;
+    let mut bias_low = false;
+    match first.and_then(|o| size(&o).map(|s| (o, s))) {
         // The encoder failed on this picture: no search.
         None => return Ok(None),
         // At the default floor this skips already-optimized images cheaply (measured). At a
         // lower one the wins sit below the probe (a JPEG saved at q75 grows at q88): the
         // search goes on underneath it instead.
-        Some(s) if s >= limit => {
+        Some((out, s)) if s >= limit.load(Relaxed) => {
+            let _ = std::fs::remove_file(out);
             if ctx.target >= f64::from(DEFAULT_TARGET) {
                 return Ok(None);
             }
             hi = i64::from(probe) - 1;
         }
-        Some(_) => {}
-    }
-    let mut best: Option<(PathBuf, u64, f64)> = None;
-    let mut cached = Some((probe, first));
-    while lo <= hi {
-        let n = ((lo + hi) / 2) as u32;
-        let out = match cached.take() {
-            Some((p, out)) if p == n => out,
-            other => {
-                cached = other;
-                encode(n)?
+        Some((out, s)) => {
+            // Score the already-encoded probe so it immediately shrinks [lo, hi] and
+            // propagates a tighter size limit to sibling parallel methods on step 0.
+            if let Some(q) = ssim_score_cached(ctx, reference, &out, Some(ref_cache))?.filter(|q| *q >= ctx.target) {
+                limit.fetch_min(s, Relaxed);
+                bias_low = q - ctx.target >= 10.0;
+                best = Some((out, s, q));
+                hi = i64::from(probe) - 1;
+            } else {
+                let _ = std::fs::remove_file(out);
+                lo = i64::from(probe) + 1;
             }
+        }
+    }
+    while lo <= hi {
+        let n = if bias_low && hi - lo >= 6 {
+            bias_low = false;
+            (lo + (hi - lo) / 3) as u32
+        } else {
+            ((lo + hi) / 2) as u32
         };
-        let Some((out, s)) = out.and_then(|o| size(&o).map(|s| (o, s))) else {
+        let Some((out, s)) = encode(n)?.and_then(|o| size(&o).map(|s| (o, s))) else {
             lo = i64::from(n) + 1;
             continue;
         };
-        if s >= limit {
+        if s >= limit.load(Relaxed) {
+            let _ = std::fs::remove_file(out);
             hi = i64::from(n) - 1; // too big to be useful: go lower, no need to score it
             continue;
         }
-        match ssim_score(ctx, reference, &out)?.filter(|q| *q >= ctx.target) {
-            Some(q) => {
-                if best.as_ref().is_none_or(|(_, b, _)| s < *b) {
-                    best = Some((out, s, q));
+        if let Some(q) = ssim_score_cached(ctx, reference, &out, Some(ref_cache))?.filter(|q| *q >= ctx.target) {
+            limit.fetch_min(s, Relaxed);
+            if best.as_ref().is_none_or(|(_, b, _)| s < *b) {
+                if let Some((old, _, _)) = best.replace((out, s, q)) {
+                    let _ = std::fs::remove_file(old);
                 }
-                hi = i64::from(n) - 1;
+            } else {
+                let _ = std::fs::remove_file(out);
             }
-            None => lo = i64::from(n) + 1,
+            hi = i64::from(n) - 1;
+        } else {
+            let _ = std::fs::remove_file(out);
+            lo = i64::from(n) + 1;
         }
     }
     Ok(best.map(|(p, _, q)| (p, q)))
@@ -980,81 +1335,140 @@ pub fn lowest_score(steps: &[String]) -> Option<f64> {
         .min_by(f64::total_cmp)
 }
 
-/// Tries each method, each limited by the best result so far.
-pub(crate) fn search_methods(ctx: &Ctx, reference: &Path, methods: Vec<(&str, u32, u32, Encoder)>, limit: u64) -> Result<Option<(PathBuf, String)>, RunError> {
+/// Tries each method, each limited by the best result so far. `base_promised` is true when
+/// the caller already promised this picture's single-search memory (e.g. a [`LossyTurn`]),
+/// so extra parallel methods don't double-count it.
+pub(crate) fn search_methods(
+    ctx: &Ctx,
+    reference: &Path,
+    methods: Vec<(&str, u32, u32, Encoder)>,
+    limit: u64,
+    base_promised: bool,
+) -> Result<Option<(PathBuf, String)>, RunError> {
     let found = |name: &str, (c, score): (PathBuf, f64)| {
         let s = size(&c).unwrap_or(u64::MAX);
         let q: String = c.file_stem().map_or_default(|f| f.to_string_lossy().chars().filter(char::is_ascii_digit).collect());
         (c, scored_label(&format!("{name}={q}"), score), s)
     };
-    let side_by_side = if methods.len() > 1 { methods_at_once(ctx, reference, methods.len()) } else { None };
-    if let Some(_promise) = side_by_side {
-        // Each method searches against `limit` on its own thread; the smallest passing
-        // result wins, as when they ran in turn and each later one only had to beat the
-        // best so far (a candidate bigger than that one never won either way).
+    let shared_limit = std::sync::atomic::AtomicU64::new(limit);
+    let ref_cache = std::sync::Mutex::new(None::<PathBuf>);
+    let side_by_side = if methods.len() > 1 { methods_at_once(ctx, reference, methods.len(), base_promised) } else { None };
+    let result = if let Some((k, _promise)) = side_by_side {
+        // Up to `k` methods search side by side against the shared best-size limit; the
+        // smallest passing result wins.
+        let queue = std::sync::Mutex::new(std::collections::VecDeque::from(methods));
         let results: Vec<Result<Option<Found>, RunError>> = std::thread::scope(|scope| {
-            let running: Vec<_> = methods
-                .into_iter()
-                .map(|(name, lo, hi, mut enc)| scope.spawn(move || Ok(quality_search(ctx, reference, lo, hi, &mut enc, limit)?.map(|c| found(name, c)))))
+            let workers: Vec<_> = (0..k)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut local_best: Option<Found> = None;
+                        loop {
+                            let next = queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner).pop_front();
+                            let Some((name, lo, hi, mut enc)) = next else { break };
+                            if let Some(c) = quality_search(ctx, reference, lo, hi, &mut enc, &shared_limit, &ref_cache)? {
+                                let candidate = found(name, c);
+                                if local_best.as_ref().is_none_or(|b| candidate.2 < b.2) {
+                                    if let Some((old, _, _)) = local_best.replace(candidate) {
+                                        let _ = std::fs::remove_file(old);
+                                    }
+                                } else {
+                                    let _ = std::fs::remove_file(candidate.0);
+                                }
+                            }
+                        }
+                        Ok(local_best)
+                    })
+                })
                 .collect();
-            running.into_iter().map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p))).collect()
+            workers.into_iter().map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p))).collect()
         });
-        let mut best: Option<(PathBuf, String, u64)> = None;
+        let mut best: Option<Found> = None;
         for r in results {
             if let Some(c) = r? {
                 if best.as_ref().is_none_or(|b| c.2 < b.2) {
-                    best = Some(c);
+                    if let Some((old, _, _)) = best.replace(c) {
+                        let _ = std::fs::remove_file(old);
+                    }
+                } else {
+                    let _ = std::fs::remove_file(c.0);
                 }
             }
         }
-        return Ok(best.map(|(p, l, _)| (p, l)));
-    }
-    let mut best: Option<(PathBuf, String, u64)> = None;
-    for (name, lo, hi, mut enc) in methods {
-        let cap = best.as_ref().map_or(limit, |b| b.2);
-        if let Some(c) = quality_search(ctx, reference, lo, hi, &mut enc, cap)? {
-            best = Some(found(name, c));
+        Ok(best.map(|(p, l, _)| (p, l)))
+    } else {
+        let mut best: Option<Found> = None;
+        for (name, lo, hi, mut enc) in methods {
+            if let Some(c) = quality_search(ctx, reference, lo, hi, &mut enc, &shared_limit, &ref_cache)? {
+                let candidate = found(name, c);
+                if best.as_ref().is_none_or(|b| candidate.2 < b.2) {
+                    if let Some((old, _, _)) = best.replace(candidate) {
+                        let _ = std::fs::remove_file(old);
+                    }
+                } else {
+                    let _ = std::fs::remove_file(candidate.0);
+                }
+            }
         }
+        Ok(best.map(|(p, l, _)| (p, l)))
+    };
+    if let Some(cached_ref) = ref_cache.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner) {
+        let _ = std::fs::remove_file(cached_ref);
     }
-    Ok(best.map(|(p, l, _)| (p, l)))
+    result
 }
 
 /// A method's best output: its file, label (`beeim-quantizer=81`) and size.
 type Found = (PathBuf, String, u64);
 
-/// Whether `n` lossy methods may search side by side: the job runs on several threads and
-/// the memory of the `n - 1` extra searches (each scores candidates with ssimulacra2:
-/// `LOSSY_BYTES_PER_PIXEL` a pixel) can be promised, leaving the job's own search and 2 GB.
-/// The promise (held for the search) keeps other jobs from counting on the same memory.
-fn methods_at_once(ctx: &Ctx, reference: &Path, n: usize) -> Option<Promise> {
+/// How many lossy methods (`2..=n`) may search side by side: falls back smoothly from `n`
+/// down to `2` (e.g. 2 of 3 JPEG methods) instead of dropping straight to 1. The promise
+/// (held for the search) keeps other jobs from counting on the same memory.
+fn methods_at_once(ctx: &Ctx, reference: &Path, n: usize, base_promised: bool) -> Option<(usize, Promise)> {
     // A job on one thread (documents, comic pages) searches one method at a time.
-    if ctx.threads == 1 || (ctx.threads > 0 && n > ctx.threads) {
+    if ctx.threads == 1 || n <= 1 {
+        return None;
+    }
+    let max_k = if ctx.threads > 0 { n.min(ctx.threads) } else { n };
+    if max_k <= 1 {
         return None;
     }
     let pixels = pixel_count(reference)?;
     let one = pixels.saturating_mul(LOSSY_BYTES_PER_PIXEL);
     let available = crate::system::memory_status().map(|m| m.available_commit)?;
-    promise(one.saturating_mul(n as u64 - 1), Some(available), one.saturating_add(BIG_LOSSY_RESERVE))
+    let keep = if base_promised { BIG_LOSSY_RESERVE } else { one.saturating_add(BIG_LOSSY_RESERVE) };
+    for k in (2..=max_k).rev() {
+        if let Some(p) = promise(one.saturating_mul(k as u64 - 1), Some(available), keep) {
+            return Some((k, p));
+        }
+    }
+    None
 }
 
-fn lossy_png(ctx: &Ctx, work: &Path, src: &Path, chain: &mut Chain, ver: &Verifier) -> Result<(), RunError> {
+fn lossy_png(
+    ctx: &Ctx,
+    work: &Path,
+    src: &Path,
+    chain: &mut Chain,
+    ver: &Verifier,
+    turn: Option<LossyTurn>,
+) -> Result<(), RunError> {
     if ver.png.as_ref().is_some_and(png::PngInfo::is_apng) {
         return Ok(());
     }
     let lw = work.join("lossy");
     let _ = std::fs::create_dir_all(&lw);
-    let strip = ctx.strip;
+    let restorable = std::sync::Arc::new(png::Restorable::extract(src, ctx.strip));
     // beeim -quantizer won the benchmark (36% at >= 93 on photos, vs 27% for pingo).
     // -predicter is tried after it and wins on some photos (Kodak: 5 of 24, up to 5.6
     // points more); the other beeim/pingo lossy modes never beat both.
     let inplace = |tag: &'static str, tool: &'static str, args: fn(u32, &Path) -> Vec<OsString>| -> Encoder {
-        let lw = lw.clone();
+        let (lw, restorable) = (lw.clone(), std::sync::Arc::clone(&restorable));
         Box::new(move |n| {
             let out = lw.join(format!("{tag}{n}.png"));
             if std::fs::copy(src, &out).is_err() || !run(ctx, tool, args(n, &out), &lw)? {
                 return Ok(None);
             }
-            let _ = png::restore_chunks(src, &out, strip);
+            let _ = restorable.apply(&out);
             Ok(Some(out))
         })
     };
@@ -1067,11 +1481,16 @@ fn lossy_png(ctx: &Ctx, work: &Path, src: &Path, chain: &mut Chain, ver: &Verifi
         methods.push(("pingo-quality", 50, 100, inplace("pq", "pingo", |n, o| crate::os_args![format!("-quality={n}"), "-nostrip", "-quiet", o])));
     }
     let limit = (chain.best_size as f64 * (1.0 - ctx.lossy_min_gain)) as u64;
-    let Some((cand, label)) = search_methods(ctx, src, methods, limit)? else { return Ok(()) };
+    let found = search_methods(ctx, src, methods, limit, turn.is_some())?;
+    // Release the big-lossy turn before post-lossless optimization so the next big picture's
+    // search can start immediately.
+    drop(turn);
+    let Some((cand, label)) = found else { return Ok(()) };
     if !ver.meta_ok(&cand) {
         return Ok(());
     }
     // Squeeze the lossy result losslessly too (verified against itself).
+    ctx.phase("lossless", &[]);
     let post_dir = lw.join("post");
     let _ = std::fs::create_dir_all(&post_dir);
     let cand_ver = Verifier::new(ctx, Kind::Png, &cand);
@@ -1084,20 +1503,37 @@ fn lossy_png(ctx: &Ctx, work: &Path, src: &Path, chain: &mut Chain, ver: &Verifi
     Ok(())
 }
 
-fn lossy_jpeg(ctx: &Ctx, work: &Path, src: &Path, chain: &mut Chain, ver: &Verifier) -> Result<(), RunError> {
-    let Some(segs) = ver.segs.as_ref() else { return Ok(()) };
+/// Whether a JPEG is eligible for a lossy re-encode search (checked before waiting for a
+/// big-lossy turn so CMYK or already-low-quality JPEGs never queue for memory).
+fn jpeg_lossy_eligible(ctx: &Ctx, src: &Path, ver: &Verifier) -> bool {
+    if ver.segs.is_none() {
+        return false;
+    }
     // CMYK/YCCK would come back as RGB carrying the CMYK profile (wrong colours, and both
     // sides of the check decode it the same wrong way): lossless only.
     if !jpeg::head(src).is_some_and(|d| jpeg::reencodable(&d)) {
-        return Ok(());
+        return false;
     }
     // Only JPEGs saved at high quality get smaller at >= 93: on a 200-JPEG sample, q >= 90
     // kept 24 of 25 wins and skipped a third of the files. Both limits were measured at 93;
     // at a lower floor (85, 80) lower qualities pass, so the whole range is searched.
     let low_floor = ctx.target < f64::from(DEFAULT_TARGET);
-    if !ctx.max.jpg_low_q && !low_floor && jpeg::quality(src).is_some_and(|q| q < 90.0) {
+    ctx.max.jpg_low_q || low_floor || !jpeg::quality(src).is_some_and(|q| q < 90.0)
+}
+
+fn lossy_jpeg(
+    ctx: &Ctx,
+    work: &Path,
+    src: &Path,
+    chain: &mut Chain,
+    ver: &Verifier,
+    turn: Option<LossyTurn>,
+) -> Result<(), RunError> {
+    let Some(segs) = ver.segs.as_ref() else { return Ok(()) };
+    if !jpeg_lossy_eligible(ctx, src, ver) {
         return Ok(());
     }
+    let low_floor = ctx.target < f64::from(DEFAULT_TARGET);
     // Winners were q90-98 on the Pictures sample; max searches from 50.
     let wide = ctx.max.jpg_wide || low_floor;
     let lo_q = if wide { 50 } else { 84 };
@@ -1145,7 +1581,9 @@ fn lossy_jpeg(ctx: &Ctx, work: &Path, src: &Path, chain: &mut Chain, ver: &Verif
         ));
     }
     let limit = (chain.best_size as f64 * (1.0 - ctx.lossy_min_gain)) as u64;
-    let Some((cand, label)) = search_methods(ctx, src, methods, limit)? else { return Ok(()) };
+    let found = search_methods(ctx, src, methods, limit, turn.is_some())?;
+    drop(turn);
+    let Some((cand, label)) = found else { return Ok(()) };
     // Re-encoders drop the Adobe marker on purpose.
     let ok = jpeg::segments(&cand).is_some_and(|n| jpeg::meta_ok(&jpeg::without_adobe(segs), &n, ctx.strip));
     if ok {
@@ -1161,6 +1599,75 @@ fn lossy_jpeg(ctx: &Ctx, work: &Path, src: &Path, chain: &mut Chain, ver: &Verif
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Big lossy searches run concurrently when free commit memory fits them all, stay strictly
+    /// FIFO when memory is tight (no starvation), refuse immediately when alone and too big,
+    /// and clean up their queue ticket on cancel.
+    #[test]
+    fn big_lossy_gate_is_fifo_and_memory_budgeted() {
+        const GB: u64 = 1 << 30;
+        let gate = std::sync::Arc::new(BigLossyGate::new(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0))));
+        let g = tools::Gate::default();
+
+        // 1) Immediate refusal when active == 0 and raw commit cannot fit need + 2 GB reserve.
+        let refused = gate.acquire_with(20 * GB, &g, || Some(8 * GB), || {}).unwrap();
+        assert!(refused.is_none(), "20 GB job must refuse immediately on 8 GB free");
+
+        // 2) Concurrent admission: two 5 GB jobs fit in 20 GB free (5 + 5 + 2 <= 20).
+        let t1 = gate.acquire_with(5 * GB, &g, || Some(20 * GB), || {}).unwrap().expect("first fits");
+        let t2 = gate.acquire_with(5 * GB, &g, || Some(20 * GB), || {}).unwrap().expect("second fits concurrently");
+        drop((t1, t2));
+
+        // 3) Tight memory (9 GB free): one 5 GB job runs, the next two queue in strict FIFO,
+        //    and a cancelled middle waiter unblocks the one behind it.
+        let first = gate.acquire_with(5 * GB, &g, || Some(9 * GB), || {}).unwrap().expect("first runs");
+        let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u32>::new()));
+        let waited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let g_cancel = tools::Gate::new(tokio_util::sync::CancellationToken::new(), None);
+        let cancel_tok = g_cancel.cancel.clone();
+        let (gate_a, gate_b, gate_c) = (std::sync::Arc::clone(&gate), std::sync::Arc::clone(&gate), std::sync::Arc::clone(&gate));
+        let (order_a, order_c) = (std::sync::Arc::clone(&order), std::sync::Arc::clone(&order));
+        let waited_a = std::sync::Arc::clone(&waited);
+
+        let wait_until_queued = |n: usize| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while gate.state.lock().unwrap().waiting.len() < n && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(gate.state.lock().unwrap().waiting.len(), n);
+        };
+
+        let h_a = std::thread::spawn(move || {
+            let _t = gate_a
+                .acquire_with(5 * GB, &tools::Gate::default(), || Some(9 * GB), || {
+                    waited_a.store(true, std::sync::atomic::Ordering::SeqCst);
+                })
+                .unwrap()
+                .expect("a runs after first");
+            order_a.lock().unwrap().push(1);
+            std::thread::sleep(Duration::from_millis(30));
+        });
+        wait_until_queued(1);
+
+        let h_b = std::thread::spawn(move || gate_b.acquire_with(5 * GB, &g_cancel, || Some(9 * GB), || {}));
+        wait_until_queued(2);
+
+        let h_c = std::thread::spawn(move || {
+            let _t = gate_c.acquire_with(5 * GB, &tools::Gate::default(), || Some(9 * GB), || {}).unwrap().expect("c runs after a");
+            order_c.lock().unwrap().push(3);
+        });
+        wait_until_queued(3);
+
+        assert!(waited.load(std::sync::atomic::Ordering::SeqCst), "wait callback fired");
+        cancel_tok.cancel();
+        assert!(matches!(h_b.join().unwrap(), Err(RunError::Cancelled)));
+
+        drop(first);
+        h_a.join().unwrap();
+        h_c.join().unwrap();
+        assert_eq!(*order.lock().unwrap(), vec![1, 3], "strict FIFO order");
+    }
 
     /// The score rides in the label, cut (never rounded up past what was measured), and the
     /// lowest one is found inside a comic's or a cover's nested labels.

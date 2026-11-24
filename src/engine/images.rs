@@ -116,16 +116,44 @@ impl CpuCtx {
 
 /// How many CPU files of each stage run at once with `slots` CPU slots: audio half the slots
 /// (decoding is one core per file; the files are read once, sequentially), documents half the
-/// slots (a PDF's renders and qpdf use memory; comic pages borrow the idle slots), images every
-/// slot.
+/// slots (a PDF's renders and qpdf use memory; comic pages and PDF images borrow the idle
+/// slots), images every slot.
 fn stage_limits(slots: usize) -> [usize; 3] {
     let half = (slots / 2).max(2);
     [half, half, usize::MAX]
 }
 
+/// When audio or documents are the active CPU stage (and images haven't started yet), returns
+/// `(stage_limit, stage_label)` so the UI's "CPU jobs" tile can explain why fewer than all
+/// `slots` files are running at once (e.g. `7 of 7 (documents)` instead of `7 of 15 slots`).
+pub(crate) fn active_stage_limit(type_progress: &[(usize, usize, usize); 4], slots: usize) -> Option<(usize, &'static str)> {
+    // type_progress: [0]=videos, [1]=audio, [2]=documents, [3]=images -> (done, total, active).
+    if type_progress[3].2 > 0 {
+        return None;
+    }
+    let limits = stage_limits(slots);
+    if type_progress[1].0 < type_progress[1].1 && type_progress[1].2 > 0 && type_progress[2].2 == 0 {
+        return Some((limits[0].min(slots), "audio"));
+    }
+    if type_progress[2].0 < type_progress[2].1 && type_progress[2].2 > 0 {
+        return Some((limits[1].min(slots), "documents"));
+    }
+    None
+}
+
+/// Images at or above this file size are treated as heavy (likely high-megapixel / slow /
+/// memory-hungry): at most [`max_heavy_images`] run at once while smaller images are left,
+/// so the remaining workers stay busy on fast files instead of piling onto huge ones.
+const HEAVY_IMAGE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// How many heavy images run at once alongside lighter ones (`slots / 4`, in `2..=4`).
+fn max_heavy_images(slots: usize) -> usize {
+    (slots / 4).clamp(2, 4)
+}
+
 enum CpuClaim {
-    /// A file, its stage, and the log line announcing a new stage.
-    File(PathBuf, usize, Option<String>),
+    /// A file, its stage, whether it counts as a heavy image, and the log line announcing a new stage.
+    File(PathBuf, usize, bool, Option<String>),
     /// An earlier stage still has files to start, or this stage is at its limit.
     Wait,
     /// Nothing left to start.
@@ -149,6 +177,10 @@ impl Inner {
     /// The next CPU file, by stage (rolling): nothing while videos are still to be started,
     /// then audio (at most `STAGE_LIMITS[0]` at once), then documents, then images. A stage
     /// begins as soon as the one before has nothing left to start.
+    ///
+    /// In the images stage (sorted largest-first), once [`max_heavy_images`] heavy images
+    /// (>= 4 MiB) are already running, additional workers claim from the lighter end of the
+    /// queue so all cores stay productive instead of piling onto huge memory-heavy pictures.
     fn claim_cpu(&mut self) -> CpuClaim {
         let videos_waiting = self.queue_cursor < self.pending_queue.len()
             && !self.video_ids.is_empty()
@@ -156,39 +188,69 @@ impl Inner {
         if videos_waiting {
             return CpuClaim::Wait;
         }
-        let limits = stage_limits(self.cpu.as_ref().map_or(2, |c| c.slots));
+        let slots = self.cpu.as_ref().map_or(2, |c| c.slots);
+        let limits = stage_limits(slots);
+        let max_heavy = max_heavy_images(slots);
         for (stage, limit) in limits.into_iter().enumerate() {
-            let queue = &self.cpu_queues[stage];
-            let mut cursor = self.cpu_cursors[stage];
-            while cursor < queue.len() && {
-                let file = &self.files[queue[cursor] as usize];
-                self.in_progress.contains(file) || self.failed.contains(file)
-            } {
-                cursor += 1;
+            while let Some(&front) = self.cpu_queues[stage].front() {
+                let file = &self.files[front as usize];
+                if self.in_progress.contains(file) || self.failed.contains(file) {
+                    self.cpu_queues[stage].pop_front();
+                } else {
+                    break;
+                }
             }
-            self.cpu_cursors[stage] = cursor;
-            if cursor == self.cpu_queues[stage].len() {
+            if self.cpu_queues[stage].is_empty() {
                 continue;
             }
             if self.cpu_active[stage] >= limit {
                 return CpuClaim::Wait;
             }
-            let file = self.files[self.cpu_queues[stage][cursor] as usize].clone();
-            self.cpu_cursors[stage] += 1;
+            let front_heavy = stage == 2
+                && self.cpu_queues[stage]
+                    .front()
+                    .is_some_and(|&i| self.file_sizes.get(i as usize).copied().unwrap_or(0) >= HEAVY_IMAGE_BYTES);
+            let from_back = if front_heavy && self.heavy_images_active >= max_heavy {
+                while let Some(&back) = self.cpu_queues[stage].back() {
+                    let file = &self.files[back as usize];
+                    if self.in_progress.contains(file) || self.failed.contains(file) {
+                        self.cpu_queues[stage].pop_back();
+                    } else {
+                        break;
+                    }
+                }
+                self.cpu_queues[stage]
+                    .back()
+                    .is_some_and(|&i| self.file_sizes.get(i as usize).copied().unwrap_or(0) < HEAVY_IMAGE_BYTES)
+            } else {
+                false
+            };
+            let left = self.cpu_queues[stage].len();
+            let Some(idx) = (if from_back {
+                self.cpu_queues[stage].pop_back()
+            } else {
+                self.cpu_queues[stage].pop_front()
+            }) else {
+                continue;
+            };
+            let heavy = stage == 2 && self.file_sizes.get(idx as usize).copied().unwrap_or(0) >= HEAVY_IMAGE_BYTES;
+            let file = self.files[idx as usize].clone();
             self.cpu_active[stage] += 1;
+            if heavy {
+                self.heavy_images_active += 1;
+            }
             self.in_progress.insert(file.clone());
             self.cpu_started.insert(file.clone(), std::time::Instant::now());
             let announce = (!self.stage_logged[stage]).then(|| {
                 self.stage_logged[stage] = true;
-                let left = self.cpu_queues[stage].len() - cursor;
                 let (what, how) = match stage {
                     0 => ("audio files", format!("{} at a time", limits[0])),
-                    1 => ("documents", format!("{} at a time, comic pages on idle cores", limits[1])),
+                    1 => ("documents", format!("{} at a time, pages/images on idle cores", limits[1])),
                     _ => ("images", "on every free core".to_string()),
                 };
                 format!("Now processing {left} {what}, {how}")
             });
-            return CpuClaim::File(file, stage, announce);
+            return CpuClaim::File(file, stage, heavy, announce);
         }
         CpuClaim::Done
     }
@@ -328,11 +390,11 @@ impl Engine {
                 // since. A worker that only waits for its stage takes nothing.
                 let claim = if may_admit(&mut inner, memory.as_ref()) { inner.claim_cpu() } else { CpuClaim::Wait };
                 match claim {
-                    CpuClaim::File(path, stage, announce) => {
+                    CpuClaim::File(path, stage, heavy, announce) => {
                         inner.cpu_admitted.push(std::time::Instant::now());
                         inner.images_active += 1;
                         let disposal = inner.disposal_for(&path);
-                        Some((path.clone(), stage, announce, inner.lossy_for(&path), disposal, inner.job_opts()))
+                        Some((path.clone(), stage, heavy, announce, inner.lossy_for(&path), disposal, inner.job_opts()))
                     }
                     CpuClaim::Wait => None,
                     // Leaving in the same lock as the empty check: files added later start
@@ -343,7 +405,7 @@ impl Engine {
                     }
                 }
             };
-            let Some((path, stage, announce, lossy, disposal, mut opts)) = claimed else {
+            let Some((path, stage, heavy, announce, lossy, disposal, mut opts)) = claimed else {
                 tokio::select! {
                     () = tokio::time::sleep(Duration::from_millis(300)) => {}
                     () = cancel.cancelled() => {}
@@ -404,6 +466,9 @@ impl Engine {
             self.finish_image(&path, lossy && !lossless_only.load(Ordering::Relaxed), result);
             let mut inner = self.lock();
             inner.cpu_active[stage] = inner.cpu_active[stage].saturating_sub(1);
+            if heavy {
+                inner.heavy_images_active = inner.heavy_images_active.saturating_sub(1);
+            }
         }
     }
 
@@ -526,13 +591,10 @@ impl Engine {
                         // Only this kind's files not started yet leave the queue: the others'
                         // tools may work.
                         let s = kind.stage();
-                        let rest = {
-                            let cursor = inner.cpu_cursors[s];
-                            inner.cpu_queues[s].split_off(cursor)
-                        };
-                        let (dropped, kept): (Vec<u32>, Vec<u32>) =
+                        let rest = std::mem::take(&mut inner.cpu_queues[s]);
+                        let (dropped, kept): (std::collections::VecDeque<u32>, std::collections::VecDeque<u32>) =
                             rest.into_iter().partition(|&i| image::kind_of(&inner.files[i as usize]) == Some(kind));
-                        inner.cpu_queues[s].extend(kept);
+                        inner.cpu_queues[s] = kept;
                         let bytes: u64 = dropped.iter().map(|&i| inner.file_sizes.get(i as usize).copied().unwrap_or(0)).sum();
                         inner.queue_bytes[s + 1] = inner.queue_bytes[s + 1].saturating_sub(bytes);
                         inner.queue_revision += 1;
@@ -587,52 +649,9 @@ impl Engine {
     }
 }
 
-use image::{big_lossy_fits, one_big_lossy_job, BIG_LOSSY_JOB, LOSSY_BYTES_PER_PIXEL};
-
-/// oxipng's commit memory (the hungriest tool; ECT takes less) for a picture, measured on a
-/// 31.2 MP PNG: 0.52 GB on one thread, 1.33 GB on 16 (ECT 0.35 -> 0.80 GB; 80 -> 42 s and
-/// 114 -> 76 s). So about 17 bytes a pixel for the first thread and 1.75 for each more.
-const MT_BASE_BYTES_PER_PIXEL: u64 = 17;
-const MT_EXTRA_PER_THREAD_PER_100_PIXELS: u64 = 175;
-
-/// Commit memory a picture's tools take on `threads` threads.
-fn tool_memory(pixels: u64, threads: u64) -> u64 {
-    pixels
-        .saturating_mul(MT_BASE_BYTES_PER_PIXEL)
-        .saturating_add((pixels.saturating_mul(MT_EXTRA_PER_THREAD_PER_100_PIXELS) / 100).saturating_mul(threads.saturating_sub(1)))
-}
-
-/// Threads a picture's tools may use with `free` commit memory (free now, less what other
-/// jobs were promised): as many as fit past a 2 GB reserve, all cores when they all fit (a
-/// 100 MP picture with 6 GB free still gets 15). Never a cliff from all to one: one only
-/// when even one thread's base doesn't fit. 0 = every core (the tool's default).
-fn picture_threads(pixels: u64, cores: u64, free: Option<u64>) -> usize {
-    let Some(free) = free.map(|a| a.saturating_sub(IMAGE_MIN_FREE_COMMIT)) else { return 0 };
-    let per_thread = (pixels.saturating_mul(MT_EXTRA_PER_THREAD_PER_100_PIXELS) / 100).max(1);
-    let base = tool_memory(pixels, 1);
-    let threads = if free <= base { 1 } else { 1 + (free - base) / per_thread };
-    if threads >= cores { 0 } else { usize::try_from(threads).unwrap_or(1).max(1) }
-}
-
-/// A picture's threads, with the memory of its extra threads promised (`image::promise`) so
-/// pictures starting together don't all count on the same free memory.
-fn picture_threads_promised(pixels: u64, cores: u64) -> (usize, Option<image::Promise>) {
-    for _ in 0..4 {
-        let available = system::memory_status().map(|m| m.available_commit);
-        let threads = picture_threads(pixels, cores, available.map(|a| a.saturating_sub(image::promised())));
-        let used = if threads == 0 { cores } else { threads as u64 };
-        let extra = tool_memory(pixels, used).saturating_sub(tool_memory(pixels, 1));
-        if extra == 0 {
-            return (threads, None);
-        }
-        // The picture's own first thread must still fit beside the promise (as in
-        // `picture_threads`). Another job took memory meanwhile: count again.
-        if let Some(p) = image::promise(extra, available, tool_memory(pixels, 1).saturating_add(IMAGE_MIN_FREE_COMMIT)) {
-            return (threads, Some(p));
-        }
-    }
-    (1, None)
-}
+#[cfg(test)]
+use image::{big_lossy_fits, picture_threads, tool_memory, BIG_LOSSY_JOB};
+use image::LOSSY_BYTES_PER_PIXEL;
 
 /// Runs one CPU job so that a panic in it (a bug, a malformed file nobody foresaw) fails that
 /// file only, not remembered: the worker, its CPU slot and the counters carry on as for any
@@ -778,12 +797,16 @@ fn max_parts(options: &crate::args::Options) -> image::Max {
     options.max
 }
 
-/// "812 KB", "4.5 MB".
+/// "38 B", "812 KB", "4.5 MB", "1.2 GB".
 fn format_size(bytes: u64) -> String {
-    if bytes >= 1024 * 1024 {
+    if bytes >= 1024 * 1024 * 1024 {
+        format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    } else if bytes >= 1024 * 1024 {
         format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.0} KB", (bytes as f64 / 1024.0).min(1023.0))
     } else {
-        format!("{} KB", bytes.div_ceil(1024))
+        format!("{bytes} B")
     }
 }
 
@@ -823,7 +846,7 @@ fn restore_or_warn(target: &Path, attrs: &system::OriginalAttributes, opts: &Job
     }
 }
 
-pub(super) type NoteContent = Arc<dyn Fn(&Path) -> std::io::Result<()> + Send + Sync>;
+pub(super) type NoteContent = Arc<dyn Fn(&Path) -> std::io::Result<(ContentHash, u64)> + Send + Sync>;
 
 /// Whether `existing` holds the same content as the original (`src`, its private copy):
 /// the same picture with the same metadata, the same decoded audio with the same tags and
@@ -894,25 +917,20 @@ pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, dispo
     } else {
         ctx
     };
-    // A big picture's visually lossless search runs alone, and only with its memory free;
-    // otherwise this file gets the lossless pass only (and is tried again later).
     let pictured = matches!(kind, image::Kind::Png | image::Kind::Jpg | image::Kind::Bmp | image::Kind::Tga);
     // Without its tools the lossy part can't run: lossless only, noted as lossless (said once
-    // at the start of the batch, in the tools line). Decided first: no memory wait for it.
+    // at the start of the batch, in the tools line).
     let no_lossy_tools = image::has_lossy_part(ctx, kind) && !image::lossy_tools_present(ctx, kind);
-    let lossy_need = if ctx.lossy && pictured && !no_lossy_tools { image::pixel_count(path).map_or(0, |px| px.saturating_mul(LOSSY_BYTES_PER_PIXEL)) } else { 0 };
-    let _big_job = if lossy_need >= BIG_LOSSY_JOB {
-        let Some(guard) = one_big_lossy_job(&ctx.gate) else { return ImageResult::Stopped };
-        Some(guard)
+    let lossy_need = if ctx.lossy && pictured && !no_lossy_tools {
+        image::pixel_count(path).map_or(0, |px| px.saturating_mul(LOSSY_BYTES_PER_PIXEL))
     } else {
-        None
+        0
     };
     let lossless_ctx;
-    let refused = system::lossless_only_in_tests(path)
-        || lossy_need >= BIG_LOSSY_JOB && !big_lossy_fits(lossy_need, system::memory_status().map(|m| m.available_commit));
-    let ctx = if ctx.lossy && (refused || no_lossy_tools) {
+    let forced_lossless = system::lossless_only_in_tests(path);
+    let ctx = if ctx.lossy && (forced_lossless || no_lossy_tools) {
         opts.lossless_only.store(true, Ordering::Relaxed);
-        if let Some(warn) = opts.warn.as_ref().filter(|_| refused) {
+        if let Some(warn) = opts.warn.as_ref().filter(|_| forced_lossless) {
             warn(format!(
                 "{}: its visually lossless pass needs about {:.0} GB of free memory; lossless only this time",
                 path.display(),
@@ -924,31 +942,34 @@ pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, dispo
     } else {
         ctx
     };
-    // A picture's tools use every core (oxipng, ECT: the same bytes as with one thread), at
-    // below-normal priority: the files running at once fill each other's gaps (tool changes,
-    // disk) and the CPU stays busy; a few big PNGs used to leave most of it idle. Its lossy
-    // methods may then search side by side too. As many threads as its memory allows
-    // (`picture_threads`), never a drop from all to one.
+    // Standalone pictures use every core (oxipng/ECT compute and promise their thread budget
+    // only while `png_chain` runs; JPEGs don't run oxipng/ECT-mt and allow side-by-side lossy
+    // methods). Documents and comic pages keep `threads: 1`.
     let threaded_ctx;
-    let mut _threads_memory = None;
     let ctx = if pictured && ctx.threads == 1 {
-        let cores = std::thread::available_parallelism().map_or(4, |n| n.get() as u64);
-        let (threads, promise) = picture_threads_promised(image::pixel_count(path).unwrap_or(0), cores);
-        _threads_memory = promise;
-        threaded_ctx = image::Ctx { threads, ..ctx.clone() };
+        threaded_ctx = image::Ctx { threads: 0, ..ctx.clone() };
         &threaded_ctx
     } else {
         ctx
     };
+    // Pictures carrying trailing data (motion photo, Ultra HDR, MPO, appended archive) are
+    // skipped before creating a temp folder or copying the file to C:.
+    if matches!(kind, image::Kind::Png | image::Kind::Jpg | image::Kind::Gif) && image::has_data_after_end(kind, path) {
+        return ImageResult::Kept {
+            content: content_of(path),
+            note: Some("it has data after the end of the picture (a motion photo, second picture or gain map): kept as it is".into()),
+        };
+    }
     let job = NEXT_JOB.fetch_add(1, Ordering::Relaxed);
-    // FLAC, MP3 and Ogg are read where they are (nothing writes to the original): a long
-    // album isn't copied to the temp folder first. Not under a path longer than the classic
-    // 260 characters, which flac.exe can't open (it would silently skip its re-encode).
-    let in_place = matches!(kind, image::Kind::Flac | image::Kind::Mp3 | image::Kind::Ogg)
-        && path.as_os_str().len() < 248;
+    // FLAC, MP3, Ogg, and short ASCII pictures with matching extension are read directly where
+    // they are (nothing writes to `src`: in-place tools copy to `work` first, write-to tools
+    // write into `work`), saving millions of redundant temp copies on C:.
+    let ascii_short = path.as_os_str().len() < 248 && path.to_str().is_some_and(str::is_ascii);
+    let in_place = (matches!(kind, image::Kind::Flac | image::Kind::Mp3 | image::Kind::Ogg) && path.as_os_str().len() < 248)
+        || (matches!(kind, image::Kind::Png | image::Kind::Jpg | image::Kind::Gif) && kind == named && ascii_short);
     let factor = match kind {
         image::Kind::Pdf => 16,
-        _ if in_place => 2,
+        _ if matches!(kind, image::Kind::Flac | image::Kind::Mp3 | image::Kind::Ogg) && in_place => 2,
         _ => 4,
     };
     let workdir = match WorkDir::new(path, state.0, factor, &opts.temp, &format!("mediaopti-img-{}-{job}", std::process::id())) {
@@ -984,6 +1005,16 @@ pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, dispo
         Err(RunError::Failed(err)) => return ImageResult::Broken(err),
         Err(RunError::Unavailable(err)) => return ImageResult::ToolUnavailable(err),
     };
+    if result.lossless_only {
+        opts.lossless_only.store(true, Ordering::Relaxed);
+        if let Some(warn) = &opts.warn {
+            warn(format!(
+                "{}: its visually lossless pass needs about {:.0} GB of free memory; lossless only this time",
+                path.display(),
+                lossy_need as f64 / 1_073_741_824.0
+            ));
+        }
+    }
     // At least 0.5% smaller. Audio also counts 64 KiB: cover art is a small part of a
     // song, but its saving is lossless and verified, and adds up over a music library.
     let min_gain = if kind.is_audio() { (before / 200).min(crate::audio::MIN_GAIN) } else { before / 200 };
@@ -1068,7 +1099,8 @@ pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, dispo
         unclaim();
         return ImageResult::Failed(format!("could not write next to the original: {err}"));
     }
-    if let Err(err) = super::replace_original(&sibling, &target, path, disposal, &|p| note(opts, p)) {
+    let noted = std::sync::Mutex::new(None::<(ContentHash, u64)>);
+    if let Err(err) = super::replace_original(&sibling, &target, path, disposal, &|p| note(opts, p, &noted)) {
         unclaim();
         return ImageResult::Failed(err);
     }
@@ -1076,14 +1108,18 @@ pub(super) fn process_image(ctx: &image::Ctx, path: &Path, worker_id: u32, dispo
     let lossy = result.steps.iter().any(|s| s.contains('='));
     let score = image::lowest_score(&result.steps).filter(|_| lossy);
     let renamed = (target != path).then(|| target.clone());
-    ImageResult::Smaller { before, after, lossy, score, content: content_of(&target), renamed }
+    let content = noted.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner).or_else(|| content_of(&target));
+    ImageResult::Smaller { before, after, lossy, score, content, renamed }
 }
 
 /// `existing` (the new name's current file) has the same content as `path`: keeps the smaller
 /// of `existing` and the new version (`smaller`, if there is one); the original and the other
 /// copy go as `disposal` says.
-fn note(opts: &JobOpts, file: &Path) -> std::io::Result<()> {
-    opts.note.as_ref().map_or(Ok(()), |n| n(file))
+fn note(opts: &JobOpts, file: &Path, out: &std::sync::Mutex<Option<(ContentHash, u64)>>) -> std::io::Result<()> {
+    if let Some(n) = &opts.note {
+        *out.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(n(file)?);
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1102,14 +1138,16 @@ fn keep_smaller_copy(path: &Path, existing: &Path, smaller: Option<&(PathBuf, u6
                 let _ = system::remove_file_if_exists(&sibling);
                 return ImageResult::Failed(format!("could not write next to the original: {err}"));
             }
-            if let Err(err) = super::replace_original(&sibling, existing, existing, &disposal.for_sibling(existing), &|p| note(opts, p)) {
+            let noted = std::sync::Mutex::new(None::<(ContentHash, u64)>);
+            if let Err(err) = super::replace_original(&sibling, existing, existing, &disposal.for_sibling(existing), &|p| note(opts, p, &noted)) {
                 return ImageResult::Failed(err);
             }
             if let Ok(a) = attrs {
                 restore_or_warn(existing, &a, opts);
             }
+            let content = noted.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner).or_else(|| content_of(existing));
             match system::dispose(path, disposal) {
-                Ok(()) => ImageResult::Duplicate { before: before + theirs - after, kept: existing.to_path_buf(), content: content_of(existing), replaced: true },
+                Ok(()) => ImageResult::Duplicate { before: before + theirs - after, kept: existing.to_path_buf(), content, replaced: true },
                 Err(err) => ImageResult::Failed(format!("{} now has the smaller version, but the original could not be removed: {err}", existing.display())),
             }
         }
@@ -1126,6 +1164,59 @@ fn keep_smaller_copy(path: &Path, existing: &Path, smaller: Option<&(PathBuf, u6
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// When many heavy images (>= 4 MiB) sit at the front of the queue, at most
+    /// `max_heavy_images(slots)` run at once while lighter images are available at the back;
+    /// once no light images remain, workers still take remaining heavy ones.
+    #[test]
+    fn heavy_images_pair_with_light_images_in_the_queue() {
+        struct Quiet;
+        impl crate::engine::Ui for Quiet {
+            fn log(&self, _: String) {}
+            fn state(&self, _: &crate::engine::StateDto) {}
+        }
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let data = std::env::temp_dir().join(format!("mo-heavy-pair-{}", std::process::id()));
+        let engine = Engine::new(Box::new(Quiet), &data, PathBuf::from("ffmpeg.exe"), rt.handle().clone());
+        {
+            let mut inner = engine.lock();
+            let slots = 15;
+            let ctx = engine.image_ctx(&inner.options, slots, tokio_util::sync::CancellationToken::new());
+            inner.cpu = Some(Arc::new(CpuCtx::new(ctx, &inner.options, slots)));
+            // Sorted largest-first: 5 heavy (20..=16 MiB), then 4 light (500..=200 KiB).
+            for i in 0..5u64 {
+                inner.add_file(PathBuf::from(format!("heavy{i}.png")), (20 - i) * 1024 * 1024);
+            }
+            for i in 0..4u64 {
+                inner.add_file(PathBuf::from(format!("light{i}.png")), (500 - i * 100) * 1024);
+            }
+            inner.rebuild_queue();
+
+            let mut claimed = Vec::new();
+            while let CpuClaim::File(p, _, heavy, _) = inner.claim_cpu() {
+                claimed.push((p.file_name().unwrap().to_string_lossy().into_owned(), heavy));
+            }
+            // First 3 claims = max_heavy_images(15) = 3 heavy images from the front.
+            assert_eq!(claimed[..3], [
+                ("heavy0.png".into(), true),
+                ("heavy1.png".into(), true),
+                ("heavy2.png".into(), true),
+            ]);
+            // Next 4 claims = light images from the back while heavy cap is full.
+            assert_eq!(claimed[3..7], [
+                ("light3.png".into(), false),
+                ("light2.png".into(), false),
+                ("light1.png".into(), false),
+                ("light0.png".into(), false),
+            ]);
+            // Remaining 2 claims = remaining heavy images (no light files left, never idle).
+            assert_eq!(claimed[7..], [
+                ("heavy3.png".into(), true),
+                ("heavy4.png".into(), true),
+            ]);
+        }
+        let _ = std::fs::remove_dir_all(&data);
+    }
 
     /// Threads by memory, never a drop from all to one: the 31 MP picture measured runs on
     /// every core; a 100 MP one gets as many as fit; only a real shortage leaves one.
@@ -1211,5 +1302,17 @@ mod tests {
         assert!(WorkDir::new(file, d_free / 4, 4, &std::env::temp_dir(), "mediaopti-img-test-1").is_err());
         drop(w);
         assert!(!Path::new(r"D:\.mediaopti-temp").exists(), "removed when empty");
+    }
+
+    #[test]
+    fn format_size_scales_down_to_bytes() {
+        assert_eq!(format_size(0), "0 B");
+        assert_eq!(format_size(38), "38 B");
+        assert_eq!(format_size(1023), "1023 B");
+        assert_eq!(format_size(1024), "1 KB");
+        assert_eq!(format_size(831_488), "812 KB");
+        assert_eq!(format_size(1024 * 1024 - 1), "1023 KB");
+        assert_eq!(format_size(1024 * 1024), "1.0 MB");
+        assert_eq!(format_size(1024 * 1024 * 1024), "1.0 GB");
     }
 }

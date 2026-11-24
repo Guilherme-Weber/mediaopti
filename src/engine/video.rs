@@ -292,7 +292,7 @@ impl Engine {
         let gpu = match primary_done {
             Some((_, _, _, gpu)) => gpu,
             None if too_small_for_nvenc => None,
-            None => self.gpu_decodable(&input).await,
+            None => self.gpu_decode_for(&streams, &input),
         };
         let mut attempt = match primary_done {
             Some((_, duration, _, _)) => {
@@ -710,7 +710,7 @@ impl Engine {
         let replaced = self
             .blocking({
                 let engine = Arc::clone(self);
-                move || replace_original(&tmp_c, &target_c, &input_c, &disposal, &|p| engine.note_content_now(p, history::VIDEO_MODE))
+                move || replace_original(&tmp_c, &target_c, &input_c, &disposal, &|p| engine.note_content_now(p, history::VIDEO_MODE).map(|_| ()))
             })
             .await;
         if let Err(err) = replaced {
@@ -727,8 +727,9 @@ impl Engine {
             return Outcome::Failed;
         }
 
-        // By content, remember the new file: that is what will be found on disk next time.
-        self.remember(&input, &final_target).await;
+        // Content was already hashed and recorded durably in `replace_original` (`note_content_now`);
+        // only record the file location now (avoids hashing multi-GB videos a second time).
+        self.add_processed(&input);
         {
             let mut inner = self.lock();
             if final_target != input {
@@ -818,7 +819,9 @@ impl Engine {
                 let replaced = ours < theirs && !linked;
                 if replaced {
                     let attrs = std::fs::metadata(&input_c).map(|m| OriginalAttributes::from_metadata(&m));
-                    replace_original(&tmp_c, &existing_c, &existing_c, &disposal.for_sibling(&existing_c), &|p| engine.note_content_now(p, history::VIDEO_MODE))?;
+                    replace_original(&tmp_c, &existing_c, &existing_c, &disposal.for_sibling(&existing_c), &|p| {
+                        engine.note_content_now(p, history::VIDEO_MODE).map(|_| ())
+                    })?;
                     if let Err(err) = attrs.and_then(|a| system::restore_attributes(&existing_c, &a)) {
                         engine.log(format!("Could not restore the dates and attributes of {}: {err}", existing_c.display()));
                     }
@@ -834,7 +837,10 @@ impl Engine {
         match result {
             Ok((replaced, linked, freed, size)) => {
                 // A hard-linked copy left bigger than it could be is not done: not remembered.
-                if !linked {
+                // When `replaced` is true, `note_content_now` already hashed and recorded it.
+                if replaced {
+                    self.add_processed(existing);
+                } else if !linked {
                     self.remember(existing, existing).await;
                 }
                 {

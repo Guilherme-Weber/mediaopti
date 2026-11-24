@@ -72,13 +72,20 @@ pub(super) struct Controller {
     pub(super) clock: RunClock,
 }
 
-/// Elapsed processing time of the current batch, not counting time spent paused.
+/// Elapsed processing time of the current batch, not counting time spent paused, plus a
+/// 5-minute rolling window of `(elapsed, completed)` samples for responsive `files/min`
+/// rates (reset when transitioning from videos to the CPU stages so hours of video encoding
+/// don't drag down the image throughput rate).
 #[derive(Default)]
 pub(super) struct RunClock {
     pub(super) banked: std::time::Duration,
     pub(super) running_since: Option<std::time::Instant>,
     pub(super) active: bool,
+    pub(super) was_video_stage: bool,
+    pub(super) samples: std::collections::VecDeque<(std::time::Duration, usize)>,
 }
+
+const RATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
 
 impl RunClock {
     pub(super) fn update(&mut self, status: Status) {
@@ -102,6 +109,32 @@ impl RunClock {
 
     pub(super) fn elapsed(&self) -> std::time::Duration {
         self.banked + self.running_since.map_or_default(|t| t.elapsed())
+    }
+
+    /// Records progress for the rolling `files/min` rate and returns the formatted rate once
+    /// at least 30 seconds of samples exist in the current stage.
+    pub(super) fn sample_rate(&mut self, video_stage: bool, completed: usize) -> Option<String> {
+        let now = self.elapsed();
+        if self.was_video_stage && !video_stage {
+            self.samples.clear();
+        }
+        self.was_video_stage = video_stage;
+        if video_stage {
+            return None;
+        }
+        if self.samples.back().is_none_or(|(t, _)| now.saturating_sub(*t) >= std::time::Duration::from_secs(1)) {
+            self.samples.push_back((now, completed));
+        }
+        while self.samples.len() > 2 && self.samples.front().is_some_and(|(t, _)| now.saturating_sub(*t) > RATE_WINDOW) {
+            self.samples.pop_front();
+        }
+        if let Some(&(t0, c0)) = self.samples.front() {
+            let dt = now.saturating_sub(t0);
+            if dt >= std::time::Duration::from_secs(30) {
+                return files_per_minute_over(completed.saturating_sub(c0), dt);
+            }
+        }
+        files_per_minute(completed, now)
     }
 }
 
@@ -261,15 +294,18 @@ impl Controller {
         } else if video_stage {
             ("Starting…".into(), String::new())
         } else if processing {
-            files_per_minute(s.completed_this_run, self.clock.elapsed()).map_or_else(none, |rate| (rate, "files/min".into()))
+            self.clock.sample_rate(false, s.completed_this_run).map_or_else(none, |rate| (rate, "files/min".into()))
         } else {
             none()
         };
+        if video_stage {
+            let _ = self.clock.sample_rate(true, s.completed_this_run);
+        }
         let (gpu_label, gpu) = if video_stage {
             ("NVENC / VRAM", (format!("{}%", t.nvenc_util), format!("{} GB VRAM", t.vram_gb)))
         } else if processing {
             let slots = crate::engine::cpu_slot_count();
-            ("CPU jobs", (group_thousands(s.cpu_jobs.len()), format!("of {slots} slots")))
+            ("CPU jobs", cpu_jobs_metric(s, slots))
         } else {
             ("NVENC / VRAM", none())
         };
@@ -454,14 +490,40 @@ pub(super) fn split_display_path(path: &str) -> (String, &str) {
     (folder, name)
 }
 
-/// Files finished per minute this run ("91", "2.5"); `None` in the first minute (too few to say).
-pub(super) fn files_per_minute(done: usize, elapsed: std::time::Duration) -> Option<String> {
+/// Formats the "CPU jobs" metric tile so it explains why fewer than all `slots` files may be
+/// running: stage limit (audio/documents run half the slots), memory admission limit, or jobs
+/// waiting for memory inside `BigLossyGate`.
+pub(super) fn cpu_jobs_metric(s: &StateDto, slots: usize) -> (String, String) {
+    let running = s.cpu_jobs.len();
+    let waiting_gate = s.cpu_jobs.iter().filter(|j| j.phase.is_some_and(|(p, _)| p == "waiting for memory")).count();
+    let detail = if s.cpu_waiting_memory {
+        format!("of {slots} · memory limit")
+    } else if let Some((limit, stage)) = crate::engine::active_stage_limit(&s.type_progress, slots).filter(|&(l, _)| running <= l) {
+        format!("of {limit} ({stage})")
+    } else if waiting_gate > 0 {
+        format!("of {slots} · {waiting_gate} waiting")
+    } else {
+        format!("of {slots} slots")
+    };
+    (group_thousands(running), detail)
+}
+
+/// Files finished per minute over a duration ("91", "2.5").
+fn files_per_minute_over(done: usize, elapsed: std::time::Duration) -> Option<String> {
     let minutes = elapsed.as_secs_f64() / 60.0;
-    if minutes < 1.0 || done == 0 {
+    if minutes <= 0.0 || done == 0 {
         return None;
     }
     let rate = done as f64 / minutes;
     Some(if rate >= 10.0 { group_thousands(rate.round() as usize) } else { format!("{rate:.1}") })
+}
+
+/// Files finished per minute this run ("91", "2.5"); `None` in the first minute (too few to say).
+pub(super) fn files_per_minute(done: usize, elapsed: std::time::Duration) -> Option<String> {
+    if elapsed.as_secs() < 60 {
+        return None;
+    }
+    files_per_minute_over(done, elapsed)
 }
 
 /// Adds log lines, keeping the last `MAX_LOG_LINES`: past the limit, in one change (removing
@@ -566,27 +628,37 @@ pub(super) fn format_mb(value: f64) -> String {
     }
 }
 
-/// Bytes as "812 KB", "45.2 MB", "1.3 GB".
+/// Bytes as "38 B", "812 KB", "45.2 MB", "1.3 GB".
 pub(super) fn format_bytes(b: u64) -> String {
-    let b = b as f64;
-    if b >= 1024.0 * 1024.0 * 1024.0 {
-        format!("{:.1} GB", b / (1024.0 * 1024.0 * 1024.0))
-    } else if b >= 1024.0 * 1024.0 {
-        format!("{:.1} MB", b / (1024.0 * 1024.0))
+    if b >= 1024 * 1024 * 1024 {
+        format!("{:.1} GB", b as f64 / (1024.0 * 1024.0 * 1024.0))
+    } else if b >= 1024 * 1024 {
+        format!("{:.1} MB", b as f64 / (1024.0 * 1024.0))
+    } else if b >= 1024 {
+        format!("{:.0} KB", (b as f64 / 1024.0).min(1023.0))
     } else {
-        format!("{:.0} KB", (b / 1024.0).ceil())
+        format!("{b} B")
     }
 }
 
 /// Files shown in the queue list (more would slow the window down).
 pub(super) const QUEUE_LIST_MAX: usize = 5000;
 
-/// Space saved: MB below 1 GB, otherwise GB with one decimal.
+/// Space saved: B below 1 KB, KB below 1 MB, MB below 1 GB, otherwise GB with one decimal.
 pub(super) fn format_saved(mb: f64) -> String {
-    if mb >= 1024.0 {
+    if mb <= 0.0 {
+        "0 MB".into()
+    } else if mb >= 1024.0 {
         format!("{:.1} GB", mb / 1024.0)
-    } else {
+    } else if mb >= 1.0 {
         format!("{} MB", format_mb(mb))
+    } else {
+        let bytes = (mb * 1024.0 * 1024.0).round() as u64;
+        if bytes >= 1024 {
+            format!("{:.0} KB", (bytes as f64 / 1024.0).min(1023.0))
+        } else {
+            format!("{bytes} B")
+        }
     }
 }
 
@@ -605,7 +677,7 @@ pub(super) fn file_count_text(s: &StateDto) -> String {
         parts.push(format!("{} already processed", group_thousands(s.skipped_known)));
     }
     if s.skipped_small_gifs > 0 {
-        parts.push(format!("{} small GIFs kept as GIF", group_thousands(s.skipped_small_gifs)));
+        parts.push(format!("{} kept as GIF", plural(s.skipped_small_gifs, "GIF", "GIFs")));
     }
     if s.skipped_generated > 0 {
         parts.push(format!("{} ignored", group_thousands(s.skipped_generated)));

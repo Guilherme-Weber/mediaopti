@@ -151,18 +151,54 @@ fn parse_content_line(line: &str) -> Option<(ContentHash, u64, u8)> {
 
 impl History {
     /// `path` is the location history; the content history sits next to it.
+    /// Streams both files line-by-line with pre-allocated table capacities (avoids reading
+    /// tens of megabytes twice into memory and repeated rehashes on 1M+ entries).
     pub fn load(path: PathBuf) -> Self {
-        // Read as bytes: a write cut off by a crash or power loss can leave bytes that are
-        // not text; only those lines are lost, never the whole history.
-        let read = |p: &Path| std::fs::read(p).map(|b| String::from_utf8_lossy(&b).into_owned());
-        let hashes = read(&path)
-            .map_or_default(|data| data.split('\n').filter_map(|l| parse_hex::<32>(l.trim())).collect());
+        use std::io::BufRead;
+        let mut hashes = HashSet::new();
+        if let Ok(file) = std::fs::File::open(&path) {
+            if let Ok(meta) = file.metadata() {
+                hashes.reserve((meta.len() / 65) as usize);
+            }
+            let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
+            let mut buf = Vec::with_capacity(128);
+            loop {
+                buf.clear();
+                match reader.read_until(b'\n', &mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        if let Ok(line) = std::str::from_utf8(&buf) {
+                            if let Some(h) = parse_hex::<32>(line.trim()) {
+                                hashes.insert(h);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let content_path = path.with_file_name("processed-content.tsv");
         let (mut content, mut sizes) = (HashMap::new(), HashMap::new());
-        if let Ok(data) = read(&content_path) {
-            for (hash, size, flag) in data.lines().filter_map(parse_content_line) {
-                *content.entry(hash).or_insert(0) |= flag;
-                *sizes.entry(size).or_insert(0) |= flag;
+        if let Ok(file) = std::fs::File::open(&content_path) {
+            if let Ok(meta) = file.metadata() {
+                let est = (meta.len() / 48) as usize;
+                content.reserve(est);
+                sizes.reserve(est / 2);
+            }
+            let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
+            let mut buf = Vec::with_capacity(128);
+            loop {
+                buf.clear();
+                match reader.read_until(b'\n', &mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        if let Ok(line) = std::str::from_utf8(&buf) {
+                            if let Some((hash, size, flag)) = parse_content_line(line) {
+                                *content.entry(hash).or_insert(0) |= flag;
+                                *sizes.entry(size).or_insert(0) |= flag;
+                            }
+                        }
+                    }
+                }
             }
         }
         Self {

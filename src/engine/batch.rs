@@ -63,6 +63,18 @@ impl Engine {
     /// [`Self::apply_options`]; with `generation`, only if no newer settings were sent
     /// since, checked under the lock: two changes waiting for it may get it in any order.
     fn apply_options_of(self: &Arc<Self>, raw: RawOptions, generation: Option<u64>) {
+        // If Videos was turned on after a scan done with Videos off, inspect GIF headers now
+        // (outside the engine lock) so still GIFs stay out of the video queue.
+        let opts = Options::normalize(raw);
+        let need_gifs = {
+            let inner = self.lock();
+            if generation.is_some_and(|g| self.options_generation.load(Ordering::SeqCst) != g) || inner.working {
+                return;
+            }
+            (opts.videos && !inner.gifs_checked && inner.dir.is_some())
+                .then(|| inner.files.iter().filter(|f| args::is_gif(f)).cloned().collect::<Vec<_>>())
+        };
+        let checked_gifs = need_gifs.map(|gifs| super::scan::find_static_gifs(&gifs, None));
         {
             let mut inner = self.lock();
             if generation.is_some_and(|g| self.options_generation.load(Ordering::SeqCst) != g) {
@@ -71,7 +83,11 @@ impl Engine {
             if inner.working {
                 return;
             }
-            inner.options = Options::normalize(raw);
+            inner.options = opts;
+            if let Some(statics) = checked_gifs {
+                inner.static_gifs = statics;
+                inner.gifs_checked = true;
+            }
             if inner.dir.is_some() {
                 inner.rebuild_queue();
             }
@@ -85,6 +101,17 @@ impl Engine {
     }
 
     pub async fn run_batch(self: Arc<Self>, raw: RawOptions) {
+        // Ensure GIF headers are checked if Videos was enabled since the scan.
+        let opts = Options::normalize(raw);
+        let lazy_gifs = {
+            let inner = self.lock();
+            (!inner.working && inner.dir.is_some() && opts.videos && !inner.gifs_checked)
+                .then(|| inner.files.iter().filter(|f| args::is_gif(f)).cloned().collect::<Vec<_>>())
+        };
+        let checked_gifs = match lazy_gifs {
+            Some(gifs) => Some(self.blocking(move || super::scan::find_static_gifs(&gifs, None)).await),
+            None => None,
+        };
         let (total, options) = {
             let mut inner = self.lock();
             if inner.dir.is_none() {
@@ -99,7 +126,11 @@ impl Engine {
                 self.send_state(true);
                 return;
             }
-            inner.options = Options::normalize(raw);
+            if let Some(statics) = checked_gifs {
+                inner.static_gifs = statics;
+                inner.gifs_checked = true;
+            }
+            inner.options = opts;
             inner.reset_run_tracking();
             inner.rebuild_queue();
             inner.stop_requested = false;
@@ -166,6 +197,7 @@ impl Engine {
             inner.fatal = Arc::new(AtomicBool::new(false));
             inner.cpu = None;
             inner.cpu_active = [0; 3];
+            inner.heavy_images_active = 0;
             inner.stage_logged = [false; 3];
             self.spawn_workers(&mut inner);
         }
@@ -401,11 +433,11 @@ impl Engine {
     }
 
     /// Called when the app exits: stops ffmpeg and saves history.
-    /// Whether closing now would have to wait: a batch runs, an encoder is quitting, or an
-    /// original is being replaced.
+    /// Whether closing now would have to wait: a batch runs, an encoder or CPU job is
+    /// stopping, or an original is being replaced.
     pub fn busy(&self) -> bool {
         let inner = self.lock();
-        inner.working || inner.running_processes > 0 || REPLACING.load(Ordering::SeqCst) > 0
+        inner.working || inner.running_processes > 0 || inner.images_active > 0 || REPLACING.load(Ordering::SeqCst) > 0
     }
 
     pub fn shutdown(&self) {
@@ -416,9 +448,14 @@ impl Engine {
             inner.power = None;
         }
         // Encoders were asked to quit (see `ask_to_quit`); killing them outright when the app
-        // exits can make the NVIDIA driver reset the GPU.
+        // exits can make the NVIDIA driver reset the GPU. CPU jobs also exit cleanly and
+        // remove their temp work folders once cancelled.
         let until = Instant::now() + Duration::from_secs(12);
-        while self.lock().running_processes > 0 && Instant::now() < until {
+        while {
+            let inner = self.lock();
+            inner.running_processes > 0 || inner.images_active > 0
+        } && Instant::now() < until
+        {
             std::thread::sleep(Duration::from_millis(50));
         }
         // A file being replaced finishes first (a few seconds at most), so quitting never

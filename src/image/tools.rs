@@ -423,8 +423,12 @@ pub fn run(
     if gate.is_cancelled() {
         return Err(RunError::Cancelled);
     }
+    let capture_stdout = !matches!(capture, Capture::None);
     let mut cmd = Command::new(program);
-    cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(if capture_stdout { Stdio::piped() } else { Stdio::null() })
+        .stderr(Stdio::piped());
     if let Some(d) = cwd {
         cmd.current_dir(d);
     }
@@ -444,34 +448,36 @@ pub fn run(
     })?;
     crate::system::assign_std_child_to_job(&child);
 
-    let mut out = child.stdout.take().expect("piped");
     let mut err = child.stderr.take().expect("piped");
     let overflow = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let overflowed = std::sync::Arc::clone(&overflow);
-    let out_thread = std::thread::spawn(move || {
-        let mut buf = vec![0u8; 1 << 16];
-        let (mut bytes, mut hasher, mut len) = (Vec::new(), Sha256::new(), 0u64);
-        loop {
-            match out.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    len += n as u64;
-                    match capture {
-                        Capture::None => {}
-                        Capture::Bytes => bytes.extend_from_slice(&buf[..n]),
-                        Capture::BytesUpTo(limit) if bytes.len() + n > limit => {
-                            overflowed.store(true, std::sync::atomic::Ordering::Relaxed);
-                            bytes = Vec::new();
-                            break; // the pipe closes: the tool stops writing
+    let out_thread = capture_stdout.then(|| {
+        let mut out = child.stdout.take().expect("piped");
+        let overflowed = std::sync::Arc::clone(&overflow);
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; 1 << 16];
+            let (mut bytes, mut hasher, mut len) = (Vec::new(), Sha256::new(), 0u64);
+            loop {
+                match out.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        len += n as u64;
+                        match capture {
+                            Capture::None => {}
+                            Capture::Bytes => bytes.extend_from_slice(&buf[..n]),
+                            Capture::BytesUpTo(limit) if bytes.len() + n > limit => {
+                                overflowed.store(true, std::sync::atomic::Ordering::Relaxed);
+                                bytes = Vec::new();
+                                break; // the pipe closes: the tool stops writing
+                            }
+                            Capture::BytesUpTo(_) => bytes.extend_from_slice(&buf[..n]),
+                            Capture::Hash => hasher.update(&buf[..n]),
                         }
-                        Capture::BytesUpTo(_) => bytes.extend_from_slice(&buf[..n]),
-                        Capture::Hash => hasher.update(&buf[..n]),
                     }
                 }
             }
-        }
-        let hash = matches!(capture, Capture::Hash).then(|| hasher.finalize().into());
-        (bytes, hash, len)
+            let hash = matches!(capture, Capture::Hash).then(|| hasher.finalize().into());
+            (bytes, hash, len)
+        })
     });
     // Drained so a chatty tool never blocks on a full pipe.
     let err_thread = std::thread::spawn(move || {
@@ -512,14 +518,18 @@ pub fn run(
         if overflow.load(std::sync::atomic::Ordering::Relaxed) {
             let _ = child.kill();
             let _ = child.wait();
-            let _ = out_thread.join();
+            if let Some(t) = out_thread {
+                let _ = t.join();
+            }
             let _ = err_thread.join();
             return Ok(Ran { success: false, stdout: Vec::new(), hash: None, stdout_len: 0, code: None, stderr: Vec::new() });
         }
         if gate.is_cancelled() || active > timeout {
             let _ = child.kill();
             let _ = child.wait();
-            let _ = out_thread.join();
+            if let Some(t) = out_thread {
+                let _ = t.join();
+            }
             let _ = err_thread.join();
             return if gate.is_cancelled() {
                 Err(RunError::Cancelled)
@@ -527,9 +537,9 @@ pub fn run(
                 Err(RunError::Unavailable(format!("{} timed out", program.display())))
             };
         }
-        std::thread::sleep(Duration::from_millis(15));
+        wait_child(&child, 50);
     };
-    let (stdout, hash, stdout_len) = out_thread.join().unwrap_or_default();
+    let (stdout, hash, stdout_len) = out_thread.and_then(|t| t.join().ok()).unwrap_or_default();
     let stderr = err_thread.join().unwrap_or_default();
     let success = status.is_some_and(|s| s.success()) && !overflow.load(std::sync::atomic::Ordering::Relaxed);
     let code = status.and_then(|s| s.code());
@@ -537,6 +547,21 @@ pub fn run(
         gate.short_of_memory.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     Ok(Ran { success, stdout, hash, stdout_len, code, stderr })
+}
+
+/// Waits up to `ms` milliseconds for `child` to exit, waking immediately when it does
+/// (instead of sleeping a fixed interval after every short tool).
+fn wait_child(child: &std::process::Child, ms: u32) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        // SAFETY: `child` owns a live process handle for the duration of this call.
+        unsafe {
+            windows_sys::Win32::System::Threading::WaitForSingleObject(child.as_raw_handle(), ms);
+        }
+    }
+    #[cfg(not(windows))]
+    std::thread::sleep(Duration::from_millis(u64::from(ms)));
 }
 
 /// Whether a tool's run was spoiled by a lack of memory: its own message (ffmpeg's decoders

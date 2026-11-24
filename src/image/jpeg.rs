@@ -6,10 +6,65 @@ use std::path::Path;
 /// `(marker, payload)` of the APPn (0xE0-0xEF) and COM (0xFE) segments before the scan.
 pub type Segments = Vec<(u8, Vec<u8>)>;
 
+/// Safety cap on total APPn/COM header bytes read from a single JPEG (covers multi-MB
+/// XMP/EXIF/ICC blocks without allowing a malformed file to exhaust memory).
+const MAX_HEADER_BYTES: usize = 16 << 20;
+
+/// Streams all APPn (0xE0-0xEF) and COM (0xFE) segments before the first scan (`SOS`),
+/// seeking past other segments so large headers past 1 MB are never truncated.
 pub fn segments(path: &Path) -> Option<Segments> {
-    // The header segments are near the start; 1 MB covers even large EXIF/ICC blocks.
-    let data = read_head(path, 1 << 20)?;
-    parse_segments(&data)
+    use std::io::{BufReader, Read, Seek, SeekFrom};
+    let mut f = BufReader::new(std::fs::File::open(path).ok()?);
+    let mut soi = [0u8; 2];
+    f.read_exact(&mut soi).ok()?;
+    if soi != [0xFF, 0xD8] {
+        return None;
+    }
+    let mut segs = Vec::new();
+    let mut total = 0usize;
+    let mut byte = [0u8; 1];
+    loop {
+        if f.read_exact(&mut byte).is_err() {
+            break;
+        }
+        if byte[0] != 0xFF {
+            continue;
+        }
+        let mut m = 0xFFu8;
+        while m == 0xFF {
+            if f.read_exact(&mut byte).is_err() {
+                return Some(segs);
+            }
+            m = byte[0];
+        }
+        if m == 0xD8 || m == 0x01 || (0xD0..=0xD7).contains(&m) {
+            continue;
+        }
+        if m == 0xDA || m == 0xD9 {
+            break;
+        }
+        let mut len_bytes = [0u8; 2];
+        if f.read_exact(&mut len_bytes).is_err() {
+            break;
+        }
+        let len = u16::from_be_bytes(len_bytes) as usize;
+        if len < 2 {
+            return None;
+        }
+        let payload_len = len - 2;
+        if (0xE0..=0xEF).contains(&m) || m == 0xFE {
+            total = total.saturating_add(payload_len);
+            if total > MAX_HEADER_BYTES {
+                return None;
+            }
+            let mut payload = vec![0u8; payload_len];
+            f.read_exact(&mut payload).ok()?;
+            segs.push((m, payload));
+        } else if f.seek(SeekFrom::Current(payload_len as i64)).is_err() {
+            break;
+        }
+    }
+    Some(segs)
 }
 
 fn read_head(path: &Path, max: usize) -> Option<Vec<u8>> {
@@ -20,6 +75,7 @@ fn read_head(path: &Path, max: usize) -> Option<Vec<u8>> {
     Some(data)
 }
 
+#[cfg(test)]
 fn parse_segments(data: &[u8]) -> Option<Segments> {
     if !data.starts_with(&[0xFF, 0xD8]) {
         return None;
@@ -238,6 +294,7 @@ pub fn with_segments(jpg: &[u8], segs: &Segments) -> Vec<u8> {
 
 /// Where the first image of a JPEG ends (just after its EOI marker), following the segments
 /// and the entropy-coded data. `None` if it can't be followed (damaged, truncated).
+#[cfg(test)]
 pub fn end_of_image(d: &[u8]) -> Option<usize> {
     if !d.starts_with(&[0xFF, 0xD8]) {
         return None;
@@ -267,6 +324,91 @@ pub fn end_of_image(d: &[u8]) -> Option<usize> {
                 }
             }
             _ => i += 2 + be16(i + 2)?,
+        }
+    }
+}
+
+/// Streams a JPEG from disk (64 KiB buffer, never loads the full file into RAM) to check
+/// whether any non-zero data follows its first `EOI` (`FF D9`).
+/// Returns `None` if invalid/truncated before `EOI`, `Some(true)` if non-zero trailing data
+/// exists (MPO, motion photo, Ultra HDR), and `Some(false)` if clean or zero-padded.
+pub fn trailing_data(path: &Path) -> Option<bool> {
+    use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+    let mut f = BufReader::with_capacity(64 * 1024, std::fs::File::open(path).ok()?);
+    let mut soi = [0u8; 2];
+    f.read_exact(&mut soi).ok()?;
+    if soi != [0xFF, 0xD8] {
+        return None;
+    }
+    let read_u8 = |r: &mut BufReader<std::fs::File>| -> Option<u8> {
+        let mut b = [0u8; 1];
+        r.read_exact(&mut b).ok()?;
+        Some(b[0])
+    };
+    let read_len = |r: &mut BufReader<std::fs::File>| -> Option<i64> {
+        let mut b = [0u8; 2];
+        r.read_exact(&mut b).ok()?;
+        let len = u16::from_be_bytes(b);
+        (len >= 2).then(|| i64::from(len - 2))
+    };
+    let mut pending_marker: Option<u8> = None;
+    loop {
+        let m = if let Some(m) = pending_marker.take() {
+            m
+        } else {
+            if read_u8(&mut f)? != 0xFF {
+                return None;
+            }
+            let mut m = read_u8(&mut f)?;
+            while m == 0xFF {
+                m = read_u8(&mut f)?;
+            }
+            m
+        };
+        match m {
+            0xD9 => {
+                // EOI reached: check if any non-zero byte remains.
+                let mut buf = [0u8; 8192];
+                loop {
+                    let n = f.read(&mut buf).ok()?;
+                    if n == 0 {
+                        return Some(false);
+                    }
+                    if buf[..n].iter().any(|&b| b != 0) {
+                        return Some(true);
+                    }
+                }
+            }
+            0x01 | 0xD0..=0xD7 => {}
+            0xDA => {
+                let skip = read_len(&mut f)?;
+                f.seek(SeekFrom::Current(skip)).ok()?;
+                // Scan entropy-coded bytes efficiently via BufRead::fill_buf.
+                loop {
+                    let buf = f.fill_buf().ok()?;
+                    if buf.is_empty() {
+                        return None;
+                    }
+                    if let Some(pos) = buf.iter().position(|&b| b == 0xFF) {
+                        f.consume(pos + 1);
+                        let mut next = read_u8(&mut f)?;
+                        while next == 0xFF {
+                            next = read_u8(&mut f)?;
+                        }
+                        if next == 0x00 || (0xD0..=0xD7).contains(&next) {
+                            continue;
+                        }
+                        pending_marker = Some(next);
+                        break;
+                    }
+                    let n = buf.len();
+                    f.consume(n);
+                }
+            }
+            _ => {
+                let skip = read_len(&mut f)?;
+                f.seek(SeekFrom::Current(skip)).ok()?;
+            }
         }
     }
 }
@@ -404,6 +546,22 @@ mod tests {
         j.extend([0xFF, 0xD8, 0xFF, 0xD9]);
         assert_eq!(end_of_image(&j), Some(end));
         assert_eq!(end_of_image(&j[..end - 1]), None, "truncated");
+
+        // Streaming `trailing_data` matches `end_of_image` without loading the file into RAM.
+        let dir = std::env::temp_dir().join(format!("mo-jpeg-trail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, bytes: &[u8]| {
+            let p = dir.join(name);
+            std::fs::write(&p, bytes).unwrap();
+            p
+        };
+        assert_eq!(trailing_data(&write("clean.jpg", &j[..end])), Some(false));
+        let mut padded = j[..end].to_vec();
+        padded.extend(std::iter::repeat_n(0u8, 64));
+        assert_eq!(trailing_data(&write("padded.jpg", &padded)), Some(false));
+        assert_eq!(trailing_data(&write("mpo.jpg", &j)), Some(true));
+        assert_eq!(trailing_data(&write("cut.jpg", &j[..end - 1])), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -414,5 +572,28 @@ mod tests {
         assert_eq!(segs.len(), 1);
         assert_eq!(exif_orientation(&segs), Some(3));
         assert!(out.ends_with(&[0xFF, 0xDA, 0, 2, 1, 2, 3, 0xFF, 0xD9]));
+    }
+
+    /// Segments located past the first 1 MB of JPEG headers (e.g., after huge XMP/Photoshop blocks)
+    /// are streamed without truncation.
+    #[test]
+    fn segments_stream_past_one_megabyte() {
+        let dir = std::env::temp_dir().join(format!("mo-jpeg-big-hdr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("big-hdr.jpg");
+        let mut raw = vec![0xFF, 0xD8];
+        // 20 x 60 KB APP13 segments (~1.2 MB) before an ICC_PROFILE APP2 segment.
+        let big = vec![b'X'; 60_000];
+        for _ in 0..20 {
+            raw.extend(seg(0xED, &big));
+        }
+        raw.extend(seg(0xE2, b"ICC_PROFILE\0tail-icc"));
+        raw.extend(seg(0xDB, &[0; 65]));
+        raw.extend([0xFF, 0xDA, 0, 2, 1, 2, 3, 0xFF, 0xD9]);
+        std::fs::write(&path, raw).unwrap();
+        let segs = segments(&path).unwrap();
+        assert_eq!(segs.len(), 21);
+        assert!(segs.last().is_some_and(|(m, d)| *m == 0xE2 && d == b"ICC_PROFILE\0tail-icc"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

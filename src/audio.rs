@@ -569,13 +569,18 @@ fn lossless_to_flac(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, Aud
     if !before.zip(after).is_some_and(|(b, a)| b.is_subset(&a)) {
         return skip("not every tag could be kept in FLAC: kept");
     }
-    // The cover art is optimized like any FLAC's (the audio frames are copied as they are).
-    let art_work = work.join("art");
-    std::fs::create_dir_all(&art_work)?;
-    let art = flac(ctx, &out, &art_work)?;
-    let (best, extra) = match art.best {
-        Some(b) => (b, art.steps),
-        None => (out, Vec::new()),
+    // The cover art is optimized (and padding stripped when asked) without re-encoding the
+    // audio frames a second time.
+    let (best, extra) = if info.pictures > 0 || ctx.strip {
+        let art_work = work.join("art");
+        std::fs::create_dir_all(&art_work)?;
+        let art = flac_cover_only(ctx, &out, &art_work)?;
+        match art.best {
+            Some(b) => (b, art.steps),
+            None => (out, Vec::new()),
+        }
+    } else {
+        (out, Vec::new())
     };
     let steps = std::iter::once(format!("{}->flac", info.codec)).chain(extra).collect();
     Ok(Optimized { new_ext: Some("flac"), ..Optimized::found(Some(best), steps) })
@@ -698,17 +703,10 @@ fn wav(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, AudioError> {
     Ok(Optimized { new_ext: Some("flac"), ..Optimized::found(Some(out), vec!["wav->flac".into()]) })
 }
 
-fn flac(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, AudioError> {
-    let Some(orig) = flac_read(src)? else {
-        return skip("not a native FLAC (Ogg FLAC, an ID3 header or damaged): skipped");
-    };
-    // Decoding is the slow part: done only once a candidate exists.
-    let mut orig_audio = None;
-    let mut best = src.to_path_buf();
-    let mut best_size = std::fs::metadata(src)?.len();
-    let mut steps = Vec::new();
-
-    // 1) cover art; the audio frames are copied byte for byte.
+/// Cover-art and padding pass on a native FLAC: the audio frames are copied byte for byte
+/// and verified byte-identically (`flac_art_same_layout` + `same_tail`), so the audio stream
+/// does not need to be decoded twice.
+fn flac_cover_pass(ctx: &Ctx, orig: &Flac, src: &Path, work: &Path, best_size: u64) -> Result<Option<(std::path::PathBuf, u64, String)>, AudioError> {
     let (mut new_blocks, mut n_art, mut art_steps) = (Vec::new(), 0, BTreeSet::new());
     for (i, (typ, body)) in orig.blocks.iter().enumerate() {
         if *typ == PADDING && ctx.strip {
@@ -727,14 +725,44 @@ fn flac(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, AudioError> {
         new_blocks.push((*typ, body));
     }
     let unpadded = new_blocks.len() < orig.blocks.len();
-    if n_art > 0 || unpadded {
-        let out = work.join("art.flac");
-        write_with_tail(&out, &flac_header(&new_blocks), src, orig.audio_at)?;
-        let size = std::fs::metadata(&out)?.len();
-        if worth_keeping(best_size, size) && flac_art_same_layout(&orig, src, &out, ctx.strip)? && same_audio(ctx, src, &mut orig_audio, &out)? {
-            (best, best_size) = (out, size);
-            steps.push(if n_art > 0 { art_label(n_art, &art_steps) } else { "no-padding".into() });
-        }
+    if n_art == 0 && !unpadded {
+        return Ok(None);
+    }
+    let out = work.join("art.flac");
+    write_with_tail(&out, &flac_header(&new_blocks), src, orig.audio_at)?;
+    let size = std::fs::metadata(&out)?.len();
+    if worth_keeping(best_size, size) && flac_art_same_layout(orig, src, &out, ctx.strip)? {
+        let step = if n_art > 0 { art_label(n_art, &art_steps) } else { "no-padding".into() };
+        return Ok(Some((out, size, step)));
+    }
+    Ok(None)
+}
+
+/// Cover-art-only pass for a freshly converted FLAC (`lossless_to_flac`), never re-encoding
+/// the audio frames a second time.
+fn flac_cover_only(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, AudioError> {
+    let Some(orig) = flac_read(src)? else { return Ok(Optimized::nothing()) };
+    let before = std::fs::metadata(src)?.len();
+    Ok(match flac_cover_pass(ctx, &orig, src, work, before)? {
+        Some((out, _, step)) => Optimized::found(Some(out), vec![step]),
+        None => Optimized::nothing(),
+    })
+}
+
+fn flac(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, AudioError> {
+    let Some(orig) = flac_read(src)? else {
+        return skip("not a native FLAC (Ogg FLAC, an ID3 header or damaged): skipped");
+    };
+    // Decoding is the slow part: done only if step 2 re-encodes the audio frames.
+    let mut orig_audio = None;
+    let mut best = src.to_path_buf();
+    let mut best_size = std::fs::metadata(src)?.len();
+    let mut steps = Vec::new();
+
+    // 1) cover art / padding; the audio frames are copied byte for byte and verified via `same_tail`.
+    if let Some((out, size, step)) = flac_cover_pass(ctx, &orig, src, work, best_size)? {
+        (best, best_size) = (out, size);
+        steps.push(step);
     }
 
     // 2) re-encoding: worthwhile only for files from older or other encoders (any at max).

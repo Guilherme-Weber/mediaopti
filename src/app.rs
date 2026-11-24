@@ -319,6 +319,10 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
     }
     {
         let engine = engine.clone();
+        window.on_cancel_scan(move || engine.cancel_scan());
+    }
+    {
+        let engine = engine.clone();
         window.on_toggle_pause(move || engine.in_background(Engine::toggle_pause));
     }
     {
@@ -330,7 +334,7 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
             w.set_confirm_title("Forget the processed history?".into());
             w.set_confirm_text(
                 "Every file will be processed again at the next run, as if it were new. Nothing changes on disk now. \
-                 Pictures already made smaller with a visually lossless pass would be compressed again on top of it."
+                 Videos and lossy pictures already made smaller would be compressed again on top of the previous pass."
                     .into(),
             );
             w.set_confirm_yes("Forget history".into());
@@ -703,6 +707,7 @@ mod tests {
     #[test]
     fn log_lines_get_a_tone() {
         let cases = [
+            ("[Images] Saved 38 B (18%) from a.png", "saved"),
             ("[Images] Saved 22 KB (1%) from a.png", "saved"),
             ("[Worker 1] Saved 1.4 MB (5%) from v.mp4", "saved"),
             ("[Images] Converted x.bmp to x.png, saved 1 MB (6%)", "saved"),
@@ -749,13 +754,68 @@ mod tests {
     }
 
     #[test]
+    fn cpu_jobs_metric_explains_limits() {
+        let mut s = StateDto {
+            status: Status::Running,
+            dir: None,
+            total_files: 0,
+            pending_files: 0,
+            skipped_known: 0,
+            skipped_generated: 0,
+            skipped_small_gifs: 0,
+            history_count: 0,
+            run_total: 100,
+            completed_this_run: 0,
+            compressed_this_run: 0,
+            kept_this_run: 0,
+            skipped_this_run: 0,
+            failed_this_run: 0,
+            space_saved_mb: 0.0,
+            queue_counts: [(0, 0); 4],
+            queue_revision: 0,
+            cpu_jobs: (0..7)
+                .map(|i| crate::engine::CpuJob { name: format!("doc{i}.pdf"), secs: 5, parts: None, phase: Some(("pictures", None)) })
+                .collect(),
+            type_progress: [(0, 0, 0), (0, 0, 0), (1, 20, 7), (0, 50, 0)],
+            cpu_waiting_memory: false,
+            scan_found: 0,
+            telemetry: crate::engine::TelemetryDto {
+                total_fps: 0,
+                total_speed: 0.0,
+                active_progress_sum: 0.0,
+                nvenc_util: 0.0,
+                vram_gb: 0.0,
+                workers: Vec::new(),
+            },
+        };
+        assert_eq!(cpu_jobs_metric(&s, 15), ("7".into(), "of 7 (documents)".into()));
+        s.cpu_waiting_memory = true;
+        assert_eq!(cpu_jobs_metric(&s, 15), ("7".into(), "of 15 · memory limit".into()));
+        s.cpu_waiting_memory = false;
+        s.type_progress = [(0, 0, 0), (0, 0, 0), (20, 20, 0), (10, 50, 7)];
+        s.cpu_jobs[0].phase = Some(("waiting for memory", None));
+        s.cpu_jobs[1].phase = Some(("waiting for memory", None));
+        assert_eq!(cpu_jobs_metric(&s, 15), ("7".into(), "of 15 · 2 waiting".into()));
+        s.cpu_jobs[0].phase = Some(("lossless", None));
+        s.cpu_jobs[1].phase = Some(("lossless", None));
+        assert_eq!(cpu_jobs_metric(&s, 15), ("7".into(), "of 15 slots".into()));
+    }
+
+    #[test]
     fn formats_megabytes_like_the_old_ui() {
         assert_eq!(format_mb(0.0), "0");
         assert_eq!(format_mb(3.04), "3");
         assert_eq!(format_mb(3.46), "3.5");
         assert_eq!(format_mb(192.4), "192");
+        assert_eq!(format_saved(0.0), "0 MB");
+        assert_eq!(format_saved(512.0 / (1024.0 * 1024.0)), "512 B");
+        assert_eq!(format_saved(0.5), "512 KB");
         assert_eq!(format_saved(192.4), "192 MB");
         assert_eq!(format_saved(1611.1), "1.6 GB");
+        assert_eq!(format_bytes(174), "174 B");
+        assert_eq!(format_bytes(1023), "1023 B");
+        assert_eq!(format_bytes(1024), "1 KB");
+        assert_eq!(format_bytes(1024 * 1024), "1.0 MB");
     }
 
     #[test]

@@ -74,15 +74,16 @@ impl Engine {
     /// Remembers a finished file: `file` by location, `content_of` (the file now on disk)
     /// by content hash, so it is still recognised after being moved or renamed.
     /// Records `file`'s content in the history on the disk now (before it replaces an
-    /// original: see `replace_original`).
-    pub(super) fn note_content_now(&self, file: &Path, mode: &'static str) -> std::io::Result<()> {
+    /// original: see `replace_original`). Returns `(hash, size)` so callers don't hash the
+    /// same file a second time after replacing.
+    pub(super) fn note_content_now(&self, file: &Path, mode: &'static str) -> std::io::Result<(ContentHash, u64)> {
         let size = std::fs::metadata(file)?.len();
         let hash = history::hash_file(file)?;
         let line = self.lock().history.add_content_now(hash, size, mode);
-        match line {
-            Some((path, line)) => history::append_lines(&path, &line, true),
-            None => Ok(()),
+        if let Some((path, line)) = line {
+            history::append_lines(&path, &line, true)?;
         }
+        Ok((hash, size))
     }
 
     pub(super) async fn remember(self: &Arc<Self>, file: &Path, content_of: &Path) {

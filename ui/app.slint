@@ -113,6 +113,7 @@ export component AppWindow inherits Window {
     in property <bool> repaint-all;
 
     callback choose-folder();
+    callback cancel-scan();
     callback start();
     callback stop();
     callback toggle-pause();
@@ -240,9 +241,13 @@ export component AppWindow inherits Window {
                                     clicked => { root.choose-folder(); }
                                 }
                             }
-                            if root.has-folder && !root.processing: VerticalLayout {
+                            if root.has-folder && !root.processing && !root.scanning: VerticalLayout {
                                 alignment: center;
                                 Button { text: "Clear queue"; enabled: !root.busy; clicked => { root.clear-queue(); } }
+                            }
+                            if root.scanning && !root.processing: VerticalLayout {
+                                alignment: center;
+                                Button { text: "Cancel"; clicked => { root.cancel-scan(); } }
                             }
                             if root.processing: VerticalLayout {
                                 alignment: center;

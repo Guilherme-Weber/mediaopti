@@ -113,6 +113,9 @@ pub struct Streams {
     pub dolby_vision: bool,
     /// The main picture's size.
     pub size: Option<(u32, u32)>,
+    /// Even-rounded frame size if the main video stream may be decoded on the GPU
+    /// (H.264/HEVC/AV1/VP9 at 4:2:0, not rotated), parsed from the same `ffmpeg -i` listing.
+    pub gpu_size: Option<(u32, u32)>,
     /// The container's own tags (recording date, place, camera, title...), keys in lower
     /// case; the format's bookkeeping (`major_brand`, `encoder`...) is left out.
     pub tags: Vec<(String, String)>,

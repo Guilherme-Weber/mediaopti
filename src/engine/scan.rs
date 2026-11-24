@@ -44,6 +44,8 @@ pub(super) struct ScanResult {
     /// Empty (0-byte) media files: nothing to optimize, left out of the queue.
     pub(super) empty: usize,
     pub(super) messages: Vec<String>,
+    /// True if cancelled by the user while walking or checking GIFs.
+    pub(super) cancelled: bool,
 }
 
 /// Recursively finds videos (skipping hidden folders like the old glob did), deletes leftover
@@ -105,9 +107,48 @@ fn is_system_folder(e: &walkdir::DirEntry) -> bool {
     e.file_type().is_dir() && e.metadata().is_ok_and(|m| m.file_attributes() & HIDDEN_AND_SYSTEM == HIDDEN_AND_SYSTEM)
 }
 
+/// Checks which GIFs in `files` are static/non-animated (in parallel across up to 8 threads).
+pub(super) fn find_static_gifs(files: &[PathBuf], cancel: Option<&AtomicBool>) -> HashSet<PathBuf> {
+    let gifs: Vec<&PathBuf> = files.iter().filter(|p| args::is_gif(p)).collect();
+    if gifs.is_empty() {
+        return HashSet::new();
+    }
+    let mut static_gifs = HashSet::new();
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = gifs
+            .chunks(gifs.len().div_ceil(threads).max(1))
+            .map(|part| {
+                scope.spawn(move || {
+                    part.iter()
+                        .take_while(|_| cancel.is_none_or(|c| !c.load(Ordering::Relaxed)))
+                        .filter(|p| !std::fs::File::open(p).is_ok_and(|f| system::is_animated_and_valid_gif(std::io::BufReader::new(f))))
+                        .map(|p| (*p).clone())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        for h in handles {
+            static_gifs.extend(h.join().unwrap_or_default());
+        }
+    });
+    static_gifs
+}
+
 /// `settle_temps`: leftover temp files are settled (`settle_orphan_temp`); off while a batch
 /// runs, whose workers' temps are not leftovers. `exclude`: backup folders (never scanned).
-pub(super) fn scan_folder(roots: &[PathBuf], exclude: &[PathBuf], temp: Option<&Path>, found: &std::sync::atomic::AtomicUsize, ffmpeg: &Path, settle_temps: bool) -> ScanResult {
+/// `check_gifs`: when false (Videos switched off), skips opening every GIF's header on disk.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn scan_folder(
+    roots: &[PathBuf],
+    exclude: &[PathBuf],
+    temp: Option<&Path>,
+    found: &std::sync::atomic::AtomicUsize,
+    cancel: &AtomicBool,
+    ffmpeg: &Path,
+    settle_temps: bool,
+    check_gifs: bool,
+) -> ScanResult {
     let mut messages = Vec::new();
     let mut cleaned_orphans = 0;
     // Work folders of runs that were killed or crashed.
@@ -143,6 +184,18 @@ pub(super) fn scan_folder(roots: &[PathBuf], exclude: &[PathBuf], temp: Option<&
     let mut seen = HashSet::new();
 
     for entry in walker {
+        if cancel.load(Ordering::Relaxed) {
+            return ScanResult {
+                files: Vec::new(),
+                static_gifs: HashSet::new(),
+                sizes: Vec::new(),
+                cleaned_orphans,
+                unreadable,
+                empty,
+                messages,
+                cancelled: true,
+            };
+        }
         let Ok(entry) = entry else {
             unreadable += 1;
             continue;
@@ -184,26 +237,24 @@ pub(super) fn scan_folder(roots: &[PathBuf], exclude: &[PathBuf], temp: Option<&
         }
     }
 
-    // Still or animated: each GIF's header is read, on several threads (a library can hold
-    // tens of thousands of GIFs, and one at a time is slow on a hard disk).
-    let gifs: Vec<&PathBuf> = with_sizes.iter().map(|(p, _)| p).filter(|p| args::is_gif(p)).collect();
-    let threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
-    std::thread::scope(|scope| {
-        let handles: Vec<_> = gifs
-            .chunks(gifs.len().div_ceil(threads).max(1))
-            .map(|part| {
-                scope.spawn(move || {
-                    part.iter()
-                        .filter(|p| !std::fs::File::open(p).is_ok_and(|f| system::is_animated_and_valid_gif(std::io::BufReader::new(f))))
-                        .map(|p| (*p).clone())
-                        .collect::<Vec<_>>()
-                })
-            })
-            .collect();
-        for h in handles {
-            static_gifs.extend(h.join().unwrap_or_default());
-        }
-    });
+    // Still or animated: read GIF headers only when Videos is enabled (when Videos is off,
+    // every GIF goes to images either way — skipping this avoids opening 65k+ GIFs on an HDD).
+    if check_gifs {
+        let gif_paths: Vec<PathBuf> = with_sizes.iter().map(|(p, _)| p).filter(|p| args::is_gif(p)).cloned().collect();
+        static_gifs = find_static_gifs(&gif_paths, Some(cancel));
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return ScanResult {
+            files: Vec::new(),
+            static_gifs: HashSet::new(),
+            sizes: Vec::new(),
+            cleaned_orphans,
+            unreadable,
+            empty,
+            messages,
+            cancelled: true,
+        };
+    }
 
     with_sizes.sort_by_key(|&(_, size)| std::cmp::Reverse(size));
     let (files, sizes) = with_sizes.into_iter().unzip();
@@ -215,6 +266,7 @@ pub(super) fn scan_folder(roots: &[PathBuf], exclude: &[PathBuf], temp: Option<&
         unreadable,
         empty,
         messages,
+        cancelled: false,
     }
 }
 
@@ -275,12 +327,12 @@ impl Engine {
             if !add {
                 inner.files.clear();
                 inner.file_sizes.clear();
+                inner.file_index = None;
                 inner.static_gifs.clear();
             }
             inner.pending_queue.clear();
             inner.queue_cursor = 0;
             inner.cpu_queues = Default::default();
-            inner.cpu_cursors = [0; 3];
             inner.reset_run_tracking();
             inner.run = RunStats::default();
             inner.status = Status::Scanning;
@@ -294,16 +346,18 @@ impl Engine {
 
         // A backup folder inside the scanned folder must not be scanned (or optimized again):
         // the current one and every one used before.
-        let (exclude, temp) = {
+        let (exclude, temp, check_gifs) = {
             let inner = self.lock();
             let mut exclude = known_backup_folders(&self.data_dir);
             exclude.extend(inner.backup_root());
-            (exclude, inner.options.temp_dir.clone())
+            (exclude, inner.options.temp_dir.clone(), inner.options.videos)
         };
         let roots = items.clone();
         // The window shows the count as it grows (nothing else updates it during a scan).
         let found = Arc::clone(&self.scan_found);
         found.store(0, Ordering::Relaxed);
+        let scan_cancel = Arc::clone(&self.scan_cancel);
+        scan_cancel.store(false, Ordering::SeqCst);
         let ticker = {
             let engine = Arc::clone(self);
             self.rt.spawn(async move {
@@ -314,7 +368,10 @@ impl Engine {
             })
         };
         let ffmpeg = self.ffmpeg_path.clone();
-        let scan = self.rt.spawn_blocking(move || scan_folder(&roots, &exclude, temp.as_deref(), &found, &ffmpeg, !working)).await;
+        let scan = self
+            .rt
+            .spawn_blocking(move || scan_folder(&roots, &exclude, temp.as_deref(), &found, &scan_cancel, &ffmpeg, !working, check_gifs))
+            .await;
         ticker.abort();
         let result = match scan {
             Ok(r) => r,
@@ -327,6 +384,26 @@ impl Engine {
                 return;
             }
         };
+        if result.cancelled {
+            if !working {
+                let mut inner = self.lock();
+                if add && !inner.files.is_empty() {
+                    inner.dir = old_dir;
+                    inner.rebuild_queue();
+                    inner.status = Status::Ready;
+                } else {
+                    inner.dir = None;
+                    inner.files.clear();
+                    inner.file_sizes.clear();
+                    inner.file_index = None;
+                    inner.static_gifs.clear();
+                    inner.status = Status::Idle;
+                }
+            }
+            self.log("Scan cancelled");
+            self.send_state(true);
+            return;
+        }
         for msg in &result.messages {
             self.log(msg.clone());
         }
@@ -395,10 +472,13 @@ impl Engine {
                     inner.add_file(file, size);
                 }
                 inner.static_gifs.extend(result.static_gifs);
+                inner.gifs_checked = inner.gifs_checked && check_gifs;
             } else {
                 inner.files = result.files;
                 inner.file_sizes = result.sizes;
+                inner.file_index = None;
                 inner.static_gifs = result.static_gifs;
+                inner.gifs_checked = check_gifs;
             }
             inner.reset_run_tracking();
             inner.rebuild_queue();
@@ -415,7 +495,7 @@ impl Engine {
             self.log(format!("{known} files are already in the processed history"));
         }
         if small_gifs > 0 {
-            self.log(format!("{small_gifs} animated GIFs are under the size limit and will stay GIFs"));
+            self.log(format!("{small_gifs} GIF(s) kept as GIF (still, or under the size limit)"));
         }
         if generated > 0 {
             self.log(format!("{generated} generated or temporary files will be ignored"));
