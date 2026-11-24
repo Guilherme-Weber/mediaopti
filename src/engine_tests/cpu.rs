@@ -39,7 +39,7 @@ fn images_and_videos_in_one_batch() {
 
     let rt = runtime();
     let (engine, rec) = new_engine(&rt, &root, ff.clone());
-    let raw = || RawOptions { images: Some(1), ..opts("av1_nvenc", 1.0) };
+    let raw = || Options { images: ImageMode::Lossless, ..opts("av1_nvenc", 1) };
     rt.block_on(async {
         engine.apply_options(raw());
         engine.load_dir(media.clone()).await;
@@ -72,28 +72,28 @@ fn images_and_videos_in_one_batch() {
 
     // Lossless history doesn't cover a lossy run: the optimized images are queued again.
     let (engine3, _) = new_engine(&rt, &root, ff.clone());
-    engine3.apply_options(RawOptions { images: Some(2), ..opts("av1_nvenc", 1.0) });
+    engine3.apply_options(Options { images: ImageMode::Lossy, ..opts("av1_nvenc", 1) });
     rt.block_on(engine3.load_dir(media.clone()));
     assert_eq!(engine3.snapshot().pending_files, 3);
 
     // Removing metadata doesn't redo processed files, unless asked to.
-    let strip = |redo: u32| RawOptions { strip: Some(1), redo_stripped: Some(redo), ..raw() };
+    let strip = |redo: bool| Options { strip: true, redo_stripped: redo, ..raw() };
     let (engine5, _) = new_engine(&rt, &root, ff.clone());
-    engine5.apply_options(strip(0));
+    engine5.apply_options(strip(false));
     rt.block_on(engine5.load_dir(media.clone()));
     assert_eq!(engine5.snapshot().pending_files, 1, "only the hard link");
     let (engine6, _) = new_engine(&rt, &root, ff.clone());
-    engine6.apply_options(strip(1));
+    engine6.apply_options(strip(true));
     rt.block_on(engine6.load_dir(media.clone()));
     assert_eq!(engine6.snapshot().pending_files, 3, "processed without stripping: redone");
-    rt.block_on(engine6.run_batch(strip(1)));
+    rt.block_on(engine6.run_batch(strip(true)));
     let (engine8, _) = new_engine(&rt, &root, ff.clone());
-    engine8.apply_options(strip(1));
+    engine8.apply_options(strip(true));
     rt.block_on(engine8.load_dir(media.clone()));
     assert_eq!(engine8.snapshot().pending_files, 1, "done once with stripping: not again");
     // The redo option alone (metadata kept) changes nothing.
     let (engine7, _) = new_engine(&rt, &root, ff.clone());
-    engine7.apply_options(RawOptions { redo_stripped: Some(1), ..raw() });
+    engine7.apply_options(Options { redo_stripped: true, ..raw() });
     rt.block_on(engine7.load_dir(media));
     assert_eq!(engine7.snapshot().pending_files, 1);
 
@@ -131,24 +131,24 @@ fn a_lower_quality_floor_redoes_pictures_done_at_a_higher_one() {
     let png = media.join("photo.png");
     make(&ff, &["-f", "lavfi", "-i", "mandelbrot=s=320x240", "-frames:v", "1", "-compression_level", "1"], &png);
     let rt = runtime();
-    let at = |images: u32| RawOptions { images: Some(images), ..opts("av1_nvenc", 1.0) };
-    let run = |images: u32| {
+    let at = |target: u32| Options { images: ImageMode::Lossy, image_target: target, ..opts("av1_nvenc", 1) };
+    let run = |target: u32| {
         let (engine, rec) = new_engine(&rt, &root, ff.clone());
         rt.block_on(async {
-            engine.apply_options(at(images));
+            engine.apply_options(at(target));
             engine.load_dir(media.clone()).await;
             let pending = engine.snapshot().pending_files;
-            engine.clone().run_batch(at(images)).await;
+            engine.clone().run_batch(at(target)).await;
             (pending, rec.logs.lock().unwrap().join("\n"))
         })
     };
-    let (pending, logs) = run(2);
+    let (pending, logs) = run(93);
     assert_eq!(pending, 1, "{logs}");
     // Moved: only its content can say it was done.
     let moved = media.join("sub");
     std::fs::create_dir_all(&moved).unwrap();
     std::fs::rename(&png, moved.join("photo.png")).unwrap();
-    let (pending, logs) = run(4);
+    let (pending, logs) = run(80);
     assert_eq!(pending, 1, "done at 93, redone at 80: {logs}");
     // The "Saved" line gives the score the lossy result was measured at.
     let score: f64 = logs
@@ -158,7 +158,7 @@ fn a_lower_quality_floor_redoes_pictures_done_at_a_higher_one() {
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| panic!("no score in the log: {logs}"));
     assert!((80.0..100.0).contains(&score), "{score}: {logs}");
-    let (pending, logs) = run(2);
+    let (pending, logs) = run(93);
     assert_eq!(pending, 0, "done at 80, known at 93: {logs}");
     // Moved again and scanned at 93, then 80 chosen before Start (no new scan): it was
     // remembered as done at 93 only, and 80 would have compressed it again.
@@ -166,9 +166,9 @@ fn a_lower_quality_floor_redoes_pictures_done_at_a_higher_one() {
     std::fs::create_dir_all(&again).unwrap();
     std::fs::rename(moved.join("photo.png"), again.join("photo.png")).unwrap();
     let (engine, _) = new_engine(&rt, &root, ff.clone());
-    engine.apply_options(at(2));
+    engine.apply_options(at(93));
     rt.block_on(engine.load_dir(media.clone()));
-    engine.apply_options(at(4));
+    engine.apply_options(at(80));
     assert_eq!(engine.snapshot().pending_files, 0, "known for the 80 pass its content had");
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -197,29 +197,35 @@ fn cover_art_follows_the_picture_quality_floor() {
     make(&ff, &["-f", "lavfi", "-i", "sine=duration=2", "-i", art.to_str().unwrap(), "-map", "0", "-map", "1", "-c:a", "flac",
         "-c:v", "png", "-disposition:v", "attached_pic"], &media.join("song.flac"));
     let rt = runtime();
-    let at = |images: u32| RawOptions { images: Some(images), audio: Some(2), conversions: Some(1), ..opts("av1_nvenc", 1.0) };
-    let run = |images: u32| {
+    let at = |target: u32| Options {
+        images: ImageMode::Lossy,
+        image_target: target,
+        audio: ImageMode::Lossy,
+        convert: Conversions { wav: true, ..Conversions::NONE },
+        ..opts("av1_nvenc", 1)
+    };
+    let run = |target: u32| {
         let (engine, rec) = new_engine(&rt, &root, ff.clone());
         rt.block_on(async {
-            engine.apply_options(at(images));
+            engine.apply_options(at(target));
             engine.load_dir(media.clone()).await;
             let pending = engine.snapshot().pending_files;
-            engine.clone().run_batch(at(images)).await;
+            engine.clone().run_batch(at(target)).await;
             (pending, rec.logs.lock().unwrap().join("\n"))
         })
     };
-    let (pending, logs) = run(2);
+    let (pending, logs) = run(93);
     assert_eq!(pending, 1, "{logs}");
     // A WAV made into FLAC at 80 is remembered at FLAC's floor, not WAV's (93): it isn't
     // queued again.
     make(&ff, &["-f", "lavfi", "-i", "sine=duration=2", "-c:a", "pcm_s16le"], &media.join("tone.wav"));
-    let (pending, logs) = run(4);
+    let (pending, logs) = run(80);
     assert_eq!(pending, 2, "done at 93, redone at 80, and the new WAV: {logs}");
     assert!(logs.contains("audio lossy (SSIMULACRA2 >= 80)"), "{logs}");
     assert!(media.join("tone.flac").exists(), "{logs}");
-    let (pending, logs) = run(4);
+    let (pending, logs) = run(80);
     assert_eq!(pending, 0, "both known at 80: {logs}");
-    let (pending, logs) = run(2);
+    let (pending, logs) = run(93);
     assert_eq!(pending, 0, "done at 80, known at 93: {logs}");
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -247,7 +253,7 @@ fn a_lossless_only_picture_is_redone_lossy_later() {
     crate::system::LOSSLESS_ONLY_ON.lock().unwrap().push("toobig.png".to_string());
 
     let rt = runtime();
-    let lossy = || RawOptions { images: Some(2), ..opts("av1_nvenc", 1.0) };
+    let lossy = || Options { images: ImageMode::Lossy, ..opts("av1_nvenc", 1) };
     let (engine, rec) = new_engine(&rt, &root, ff.clone());
     rt.block_on(async {
         engine.apply_options(lossy());
@@ -302,12 +308,12 @@ fn wav_becomes_flac_only_when_safe() {
 
     let rt = runtime();
     let (off, _) = new_engine(&rt, &root, ff.clone());
-    off.apply_options(opts("av1_nvenc", 1.0));
+    off.apply_options(opts("av1_nvenc", 1));
     rt.block_on(off.load_dir(media.clone()));
     assert_eq!(off.snapshot().pending_files, 0, "conversions off: no WAV queued");
 
     let (engine, rec) = new_engine(&rt, &root, ff.clone());
-    let raw = || RawOptions { originals: Some(2), convert: Some(1), audio: Some(1), ..opts("av1_nvenc", 1.0) };
+    let raw = || Options { originals: Originals::BackupFolder(None), convert: Conversions::ALL, audio: ImageMode::Lossless, ..opts("av1_nvenc", 1) };
     // Twice: same.wav and same.flac may run at the same time, and then the duplicate is left
     // for the next run (one copy must never be replaced while the other is processed).
     let mut made_smaller = 0;
@@ -369,7 +375,7 @@ fn empty_cut_off_and_skipped_files_are_told_apart() {
 
     let rt = runtime();
     let (engine, rec) = new_engine(&rt, &root, ff);
-    let raw = || RawOptions { images: Some(1), ..opts("libx264", 1.0) };
+    let raw = || Options { images: ImageMode::Lossless, ..opts("libx264", 1) };
     rt.block_on(async {
         engine.apply_options(raw());
         engine.load_dir(media.clone()).await;
@@ -418,7 +424,7 @@ fn tools_that_cannot_start_do_not_mark_files_broken() {
 
     let rt = runtime();
     let (engine, rec) = new_engine(&rt, &root, ff);
-    let raw = || RawOptions { images: Some(1), ..opts("libx264", 1.0) };
+    let raw = || Options { images: ImageMode::Lossless, ..opts("libx264", 1) };
     rt.block_on(async {
         engine.apply_options(raw());
         engine.load_dir(media.clone()).await;
@@ -469,7 +475,7 @@ fn same_content_keeps_what_the_original_has() {
 
     let rt = runtime();
     let (engine, rec) = new_engine(&rt, &root, ff);
-    let raw = || RawOptions { originals: Some(2), images: Some(1), fix_ext: Some(1), ..opts("libx264", 1.0) };
+    let raw = || Options { originals: Originals::BackupFolder(None), images: ImageMode::Lossless, fix_ext: true, ..opts("libx264", 1) };
     rt.block_on(async {
         engine.apply_options(raw());
         engine.load_dir(media.clone()).await;
@@ -529,7 +535,7 @@ fn same_names_and_wrong_extensions() {
 
     let rt = runtime();
     let (engine, rec) = new_engine(&rt, &root, ff.clone());
-    let raw = || RawOptions { originals: Some(2), convert: Some(1), images: Some(1), fix_ext: Some(1), ..opts("av1_nvenc", 1.0) };
+    let raw = || Options { originals: Originals::BackupFolder(None), convert: Conversions::ALL, images: ImageMode::Lossless, fix_ext: true, ..opts("av1_nvenc", 1) };
     rt.block_on(async {
         engine.apply_options(raw());
         engine.load_dir(media.clone()).await;

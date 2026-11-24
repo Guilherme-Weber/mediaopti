@@ -27,7 +27,7 @@ fn originals_go_to_a_mirrored_backup_folder() {
 
     let rt = runtime();
     let (engine, rec) = new_engine(&rt, &root, ff.clone());
-    let raw = || RawOptions { originals: Some(2), images: Some(1), ..opts("av1_nvenc", 1.0) };
+    let raw = || Options { originals: Originals::BackupFolder(None), images: ImageMode::Lossless, ..opts("av1_nvenc", 1) };
     rt.block_on(async {
         engine.apply_options(raw());
         engine.load_dir(media.clone()).await;
@@ -48,8 +48,8 @@ fn originals_go_to_a_mirrored_backup_folder() {
     std::fs::create_dir_all(&inside).unwrap();
     std::fs::copy(&png_backup, inside.join("x.png")).unwrap();
     let (engine2, _) = new_engine(&rt, &root, ff.clone());
-    engine2.apply_options(RawOptions {
-        backup_dir: Some(inside.to_string_lossy().into_owned()),
+    engine2.apply_options(Options {
+        originals: Originals::BackupFolder(Some(inside.clone())),
         ..raw()
     });
     rt.block_on(engine2.load_dir(media.clone()));
@@ -64,7 +64,7 @@ fn originals_go_to_a_mirrored_backup_folder() {
     std::fs::copy(&png_backup, bin.join("$R1A2B3C.png")).unwrap();
     assert!(Command::new("attrib").args(["+h", "+s"]).arg(&bin).status().unwrap().success());
     let (engine3, _) = new_engine(&rt, &root, ff);
-    engine3.apply_options(opts("av1_nvenc", 1.0));
+    engine3.apply_options(opts("av1_nvenc", 1));
     rt.block_on(engine3.load_dir(root.clone()));
     let total = engine3.snapshot().total_files;
     let _ = Command::new("attrib").args(["-h", "-s"]).arg(&bin).status();
@@ -105,7 +105,7 @@ fn files_under_long_paths_are_processed() {
 
     let rt = runtime();
     let (engine, rec) = new_engine(&rt, &root, ff);
-    let raw = || RawOptions { images: Some(1), audio: Some(1), originals: Some(2), ..opts("libx264", 1.0) };
+    let raw = || Options { images: ImageMode::Lossless, audio: ImageMode::Lossless, originals: Originals::BackupFolder(None), ..opts("libx264", 1) };
     rt.block_on(async {
         engine.apply_options(raw());
         engine.load_dir(root.join("media")).await;
@@ -148,7 +148,7 @@ fn a_panic_fails_only_its_own_file() {
 
     let rt = runtime();
     let (engine, rec) = new_engine(&rt, &root, ff);
-    let raw = || RawOptions { images: Some(1), ..opts("libx264", 1.0) };
+    let raw = || Options { images: ImageMode::Lossless, ..opts("libx264", 1) };
     let finished = rt.block_on(async {
         engine.apply_options(raw());
         engine.load_dir(media.clone()).await;

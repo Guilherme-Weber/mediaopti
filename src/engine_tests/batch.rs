@@ -38,7 +38,7 @@ fn full_batch_handles_every_file_kind() {
     let (engine, rec) = new_engine(&rt, &root, ff.clone());
     rt.block_on(async {
         // Like the app at startup: saved settings are applied before the folder is scanned.
-        engine.apply_options(opts("av1_nvenc", 2.0));
+        engine.apply_options(opts("av1_nvenc", 2));
         engine.load_dir(videos.clone()).await;
         let s = engine.snapshot();
         assert_eq!(s.total_files, 7, "logs: {:#?}", rec.logs.lock().unwrap());
@@ -48,7 +48,7 @@ fn full_batch_handles_every_file_kind() {
         assert_eq!(s.skipped_small_gifs, 1);
         assert!(!videos.join("old.mediaopti.w1.mp4").exists(), "orphan temp not removed");
 
-        engine.clone().run_batch(opts("av1_nvenc", 2.0)).await;
+        engine.clone().run_batch(opts("av1_nvenc", 2)).await;
     });
 
     let logs = rec.logs.lock().unwrap().join("\n");
@@ -76,7 +76,7 @@ fn full_batch_handles_every_file_kind() {
     let history = std::fs::read_to_string(root.join("appdata").join("processedFiles.txt")).unwrap();
     assert!(history.lines().count() >= 6);
     let (engine2, _) = new_engine(&rt, &root, ff.clone());
-    engine2.apply_options(opts("av1_nvenc", 2.0)); // same settings as the run
+    engine2.apply_options(opts("av1_nvenc", 2)); // same settings as the run
     rt.block_on(engine2.load_dir(videos.clone()));
     assert_eq!(engine2.snapshot().pending_files, 0);
 
@@ -126,7 +126,7 @@ fn dropped_items_join_the_queue() {
 
     let rt = runtime();
     let (engine, rec) = new_engine(&rt, &root, ff.clone());
-    let raw = || RawOptions { images: Some(1), ..opts("av1_nvenc", 1.0) };
+    let raw = || Options { images: ImageMode::Lossless, ..opts("av1_nvenc", 1) };
     engine.apply_options(raw());
     rt.block_on(async {
         engine.load_dir(a.clone()).await;
@@ -178,7 +178,13 @@ fn queue_runs_in_stages_and_types_can_be_skipped() {
     let rt = runtime();
     // Switches: videos off, BMP -> PNG off (WAV -> FLAC on): only audio and the PNG queue.
     let (engine, _) = new_engine(&rt, &root, ff.clone());
-    let off = RawOptions { images: Some(1), audio: Some(1), videos: Some(0), conversions: Some(1), ..opts("av1_nvenc", 1.0) };
+    let off = Options {
+        images: ImageMode::Lossless,
+        audio: ImageMode::Lossless,
+        videos: false,
+        convert: Conversions { wav: true, ..Conversions::NONE },
+        ..opts("av1_nvenc", 1)
+    };
     engine.apply_options(off);
     rt.block_on(engine.load_dir(media.clone()));
     let s = engine.snapshot();
@@ -191,7 +197,7 @@ fn queue_runs_in_stages_and_types_can_be_skipped() {
     // Everything on: audio first, images after (the CPU stages start once no video is left to
     // start; the video worker logs its file a moment after claiming it).
     let (engine, rec) = new_engine(&rt, &root, ff);
-    let all = || RawOptions { images: Some(1), audio: Some(1), convert: Some(1), ..opts("av1_nvenc", 1.0) };
+    let all = || Options { images: ImageMode::Lossless, audio: ImageMode::Lossless, convert: Conversions::ALL, ..opts("av1_nvenc", 1) };
     rt.block_on(async {
         engine.apply_options(all());
         engine.load_dir(media.clone()).await;
@@ -222,7 +228,7 @@ fn several_chosen_folders_replace_the_queue() {
     }
     let rt = runtime();
     let (engine, _) = new_engine(&rt, &root, ff);
-    engine.apply_options(RawOptions { images: Some(1), ..opts("av1_nvenc", 1.0) });
+    engine.apply_options(Options { images: ImageMode::Lossless, ..opts("av1_nvenc", 1) });
     rt.block_on(async {
         engine.load_dir(a.clone()).await;
         engine.load_items(vec![b.clone(), c.clone()], false).await;

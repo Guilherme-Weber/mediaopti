@@ -52,7 +52,7 @@ fn historical_problem_files_are_handled() {
     let (engine, rec) = new_engine(&rt, &root, ff.clone());
     rt.block_on(async {
         engine.load_dir(videos.clone()).await;
-        engine.clone().run_batch(opts("av1_nvenc", 2.0)).await;
+        engine.clone().run_batch(opts("av1_nvenc", 2)).await;
     });
     let logs = rec.logs.lock().unwrap().join("\n");
     println!("{logs}");
@@ -86,7 +86,7 @@ fn historical_problem_files_are_handled() {
 
     // Everything is remembered: a second scan finds nothing new.
     let (engine2, _) = new_engine(&rt, &root, ff);
-    engine2.apply_options(opts("av1_nvenc", 2.0)); // same settings as the run
+    engine2.apply_options(opts("av1_nvenc", 2)); // same settings as the run
     rt.block_on(engine2.load_dir(videos));
     assert_eq!(engine2.snapshot().pending_files, 0, "{logs}");
 
@@ -125,9 +125,9 @@ fn videos_keep_audio_tracks_subtitles_attachments_and_chapters() {
     let rt = runtime();
     let (engine, rec) = new_engine(&rt, &root, ff.clone());
     rt.block_on(async {
-        engine.apply_options(opts("av1_nvenc", 2.0));
+        engine.apply_options(opts("av1_nvenc", 2));
         engine.load_dir(media.clone()).await;
-        engine.clone().run_batch(opts("av1_nvenc", 2.0)).await;
+        engine.clone().run_batch(opts("av1_nvenc", 2)).await;
     });
     let logs = rec.logs.lock().unwrap().join("\n");
     println!("{logs}");
@@ -175,9 +175,9 @@ fn unfinished_probes_never_decide() {
     let rt = runtime();
     let (engine, rec) = new_engine(&rt, &root, ff.clone());
     rt.block_on(async {
-        engine.apply_options(opts("libx264", 2.0));
+        engine.apply_options(opts("libx264", 2));
         engine.load_dir(media.clone()).await;
-        engine.clone().run_batch(opts("libx264", 2.0)).await;
+        engine.clone().run_batch(opts("libx264", 2)).await;
     });
     crate::system::PROBE_FAILS_ON.lock().unwrap().retain(|n| n != "infail." && n != "outfail.mediaopti.");
     let logs = rec.logs.lock().unwrap().join("\n");
@@ -190,7 +190,7 @@ fn unfinished_probes_never_decide() {
     assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
     // Not remembered: a new run tries both again.
     let (engine2, _) = new_engine(&rt, &root, ff);
-    engine2.apply_options(opts("libx264", 2.0));
+    engine2.apply_options(opts("libx264", 2));
     rt.block_on(engine2.load_dir(media));
     assert_eq!(engine2.snapshot().pending_files, 2, "{logs}");
     let _ = std::fs::remove_dir_all(&root);
@@ -215,7 +215,7 @@ fn a_new_version_kept_after_a_failed_rename_survives() {
 
     let rt = runtime();
     let (engine, rec) = new_engine(&rt, &root, ff.clone());
-    let raw = || RawOptions { originals: Some(2), ..opts("av1_nvenc", 1.0) };
+    let raw = || Options { originals: Originals::BackupFolder(None), ..opts("av1_nvenc", 1) };
     rt.block_on(async {
         engine.apply_options(raw());
         engine.load_dir(media.clone()).await;
@@ -260,9 +260,9 @@ fn a_second_video_track_is_never_dropped() {
     let rt = runtime();
     let (engine, rec) = new_engine(&rt, &root, ff);
     rt.block_on(async {
-        engine.apply_options(opts("av1_nvenc", 1.0));
+        engine.apply_options(opts("av1_nvenc", 1));
         engine.load_dir(media.clone()).await;
-        engine.clone().run_batch(opts("av1_nvenc", 1.0)).await;
+        engine.clone().run_batch(opts("av1_nvenc", 1)).await;
     });
     let logs = rec.logs.lock().unwrap().join("\n");
     println!("{logs}");
@@ -289,9 +289,9 @@ fn a_camera_timecode_survives_as_an_mkv_tag() {
     let rt = runtime();
     let (engine, rec) = new_engine(&rt, &root, ff.clone());
     rt.block_on(async {
-        engine.apply_options(opts("av1_nvenc", 1.0));
+        engine.apply_options(opts("av1_nvenc", 1));
         engine.load_dir(media.clone()).await;
-        engine.clone().run_batch(opts("av1_nvenc", 1.0)).await;
+        engine.clone().run_batch(opts("av1_nvenc", 1)).await;
     });
     let logs = rec.logs.lock().unwrap().join("\n");
     println!("{logs}");
@@ -332,9 +332,9 @@ fn videos_keep_their_tags() {
     let rt = runtime();
     let (engine, rec) = new_engine(&rt, &root, ff.clone());
     rt.block_on(async {
-        engine.apply_options(opts("av1_nvenc", 2.0));
+        engine.apply_options(opts("av1_nvenc", 2));
         engine.load_dir(media.clone()).await;
-        engine.clone().run_batch(opts("av1_nvenc", 2.0)).await;
+        engine.clone().run_batch(opts("av1_nvenc", 2)).await;
     });
     let logs = rec.logs.lock().unwrap().join("\n");
     println!("{logs}");
@@ -371,9 +371,9 @@ fn audio_is_kept_or_made_flac_and_hdr10_is_kept() {
     let rt = runtime();
     let (engine, rec) = new_engine(&rt, &root, ff.clone());
     rt.block_on(async {
-        engine.apply_options(opts("av1_nvenc", 2.0));
+        engine.apply_options(opts("av1_nvenc", 2));
         engine.load_dir(media.clone()).await;
-        engine.clone().run_batch(opts("av1_nvenc", 2.0)).await;
+        engine.clone().run_batch(opts("av1_nvenc", 2)).await;
     });
     let logs = rec.logs.lock().unwrap().join("\n");
     println!("{logs}");
@@ -422,7 +422,7 @@ fn pause_during_quality_retry_resumes_from_the_last_step() {
         let file = dir.join("light.mp4");
         std::fs::copy(&src, &file).unwrap();
         let (engine, rec) = new_engine(&rt, &root.join(format!("{name}-data")), ff.clone());
-        let raw = || RawOptions { crf: Some(20.0), vmaf_floor: Some(93), ..opts("av1_nvenc", 1.0) };
+        let raw = || Options { crf: 20, vmaf_floor: Some(93.0), ..opts("av1_nvenc", 1) };
         rt.block_on(async {
             engine.apply_options(raw());
             engine.load_dir(dir.clone()).await;
@@ -484,9 +484,9 @@ fn quality_retry_accepts_only_above_the_vmaf_floor() {
     let (g_before, b_before) = (std::fs::metadata(&g).unwrap().len(), std::fs::metadata(&b).unwrap().len());
 
     let rt = runtime();
-    let run = |dir: &Path, crf: f64| {
+    let run = |dir: &Path, crf: u32| {
         let (engine, rec) = new_engine(&rt, &root.join(dir.file_name().unwrap()), ff.clone());
-        let raw = || RawOptions { crf: Some(crf), vmaf_floor: Some(93), ..opts("av1_nvenc", 1.0) };
+        let raw = || Options { crf, vmaf_floor: Some(93.0), ..opts("av1_nvenc", 1) };
         rt.block_on(async {
             engine.apply_options(raw());
             engine.load_dir(dir.to_path_buf()).await;
@@ -497,13 +497,13 @@ fn quality_retry_accepts_only_above_the_vmaf_floor() {
         (engine.snapshot(), logs)
     };
 
-    let (s, logs) = run(&good, 20.0);
+    let (s, logs) = run(&good, 20);
     assert_eq!(s.compressed_this_run, 1, "{logs}");
     assert!(logs.contains("Quality retry for light.mp4"), "{logs}");
     let after = std::fs::metadata(&g).unwrap().len();
     assert!(after < g_before, "not smaller: {after} vs {g_before}");
 
-    let (s, logs) = run(&bad, 23.0);
+    let (s, logs) = run(&bad, 23);
     assert_eq!(s.compressed_this_run, 0, "{logs}");
     assert!(logs.contains("is below 93"), "{logs}");
     assert_eq!(std::fs::metadata(&b).unwrap().len(), b_before, "original changed");

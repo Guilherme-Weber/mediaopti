@@ -80,6 +80,7 @@ fn inner_ctx(ctx: &Ctx, kind: Kind) -> Ctx {
         gate: ctx.gate.clone(),
         max: ctx.max,
         slots: ctx.slots.clone(),
+        budget: std::sync::Arc::clone(&ctx.budget),
         // Pages count on the archive's own progress (see `optimize_pages`).
         progress: None,
     }
@@ -116,8 +117,6 @@ fn optimize_entry(ictx: &Ctx, kind: Kind, data: &[u8], work: &Path) -> Result<Op
 /// Pictures read ahead and optimized together: at most this many, or this many bytes.
 const BATCH_IMAGES: usize = 32;
 const BATCH_BYTES: u64 = 256 * 1024 * 1024;
-/// Free commit needed per extra page optimized in parallel.
-const PAGE_COMMIT: u64 = 1024 * 1024 * 1024;
 
 /// One picture of a batch: its index in the archive, kind and bytes.
 type Page = (usize, Kind, Vec<u8>);
@@ -130,22 +129,8 @@ type Done = (usize, Vec<u8>, Vec<String>);
 /// memory-checked) like standalone pictures. Returns, per page, its index, bytes (optimized
 /// or not) and steps.
 fn optimize_pages(ictx: &Ctx, pages: Vec<Page>, work: &Path, progress: Option<&image::tools::Progress>) -> Result<Vec<Done>, RunError> {
-    /// Gives the borrowed slots back however the pages end, a panic included.
-    struct Borrowed<'a>(Option<&'a image::tools::Slots>, usize);
-    impl Drop for Borrowed<'_> {
-        fn drop(&mut self) {
-            if let Some(slots) = self.0 {
-                slots.release(self.1);
-            }
-        }
-    }
-    let mut extra = 0;
-    if let Some(slots) = &ictx.slots {
-        let commit = crate::system::memory_status().map_or(u64::MAX, |m| m.available_commit);
-        let affordable = usize::try_from(commit.saturating_sub(2 * PAGE_COMMIT) / PAGE_COMMIT).unwrap_or(usize::MAX);
-        extra = slots.borrow_idle(pages.len().saturating_sub(1).min(affordable));
-    }
-    let _borrowed = Borrowed(ictx.slots.as_deref(), extra);
+    let borrowed = ictx.budget.borrow_slots(ictx.slots.as_ref(), pages.len(), crate::budget::PAGE_COMMIT);
+    let extra = borrowed.extra();
     // Running one page at a time: let oxipng/ECT and lossy methods use every thread
     // (memory-checked inside `image`). Running pages in parallel: one thread per page.
     let page_ctx = if extra == 0 {
@@ -185,7 +170,7 @@ fn optimize_pages(ictx: &Ctx, pages: Vec<Page>, work: &Path, progress: Option<&i
             });
         }
     });
-    drop(_borrowed);
+    drop(borrowed);
     if let Some(e) = failure.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner) {
         return Err(e);
     }
@@ -596,6 +581,7 @@ mod tests {
             gate: crate::image::tools::Gate::default(),
             max: crate::image::Max::default(),
             slots: None,
+            budget: crate::budget::ResourceBudget::os(),
             progress: None,
         })
     }

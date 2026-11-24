@@ -313,32 +313,68 @@ impl Prefs {
         v
     }
 
-    pub(super) fn to_raw(&self) -> RawOptions {
-        RawOptions {
-            crf: Some(self.crf as f64),
-            preset: Some(self.preset.clone()),
-            encoder: Some(self.encoder.clone()),
-            concurrency: Some(self.concurrency as f64),
-            originals: Some(self.originals),
-            backup_dir: Some(self.backup_dir.clone()),
-            gif_min_mb: Some(self.gif_min_mb),
-            vmaf_floor: Some(self.vmaf_floor),
-            images: Some(if self.images_on { self.images } else { 0 }),
-            image_level: Some(self.images),
-            convert: None,
-            conversions: Some(u32::from(self.conv_wav) | u32::from(self.conv_img) << 1 | u32::from(self.conv_cbr) << 2),
-            videos: Some(u32::from(self.videos)),
-            docs: Some(u32::from(self.docs)),
-            lossy_docs: Some(self.lossy_docs),
-            audio: Some(if self.audio_on { self.audio } else { 0 }),
-            temp_dir: Some(self.temp_dir.clone()),
-            fix_ext: Some(self.fix_ext),
-            gpu_decoding: Some(u32::from(self.gpu_decoding)),
-            max_parts: Some(self.max_parts.clone()),
-            drop_data: Some(u32::from(self.drop_data)),
-            strip: Some(u32::from(self.strip)),
-            redo_stripped: Some(u32::from(self.redo_stripped)),
+    pub(super) fn to_options(&self) -> Options {
+        let d = Options::default();
+        let non_empty = |s: &str| (!s.trim().is_empty()).then(|| PathBuf::from(s));
+        let gif_min_bytes = match self.gif_min_mb {
+            NO_GIFS => u64::MAX,
+            mb if ALLOWED_GIF_MIN_MB.contains(&mb) => u64::from(mb) * 1024 * 1024,
+            _ => d.gif_min_bytes,
+        };
+        let vmaf_floor = match self.vmaf_floor {
+            0 => None,
+            v if ALLOWED_VMAF_FLOOR.contains(&v) => Some(f64::from(v)),
+            _ => d.vmaf_floor,
+        };
+        Options {
+            crf: self.crf,
+            preset: self.preset.clone(),
+            encoder: self.encoder.clone(),
+            concurrency: self.concurrency,
+            originals: match self.originals {
+                0 => Originals::Delete,
+                2 => Originals::BackupFolder(non_empty(&self.backup_dir)),
+                1 => Originals::RecycleBin,
+                _ => d.originals,
+            },
+            gif_min_bytes,
+            vmaf_floor,
+            images: if self.images_on {
+                match self.images {
+                    1 => ImageMode::Lossless,
+                    2..=4 => ImageMode::Lossy,
+                    _ => d.images,
+                }
+            } else {
+                ImageMode::Off
+            },
+            image_target: match self.images {
+                3 => 85,
+                4 => 80,
+                _ => d.image_target,
+            },
+            convert: Conversions { wav: self.conv_wav, images: self.conv_img, cbr: self.conv_cbr },
+            videos: self.videos,
+            docs: self.docs,
+            lossy_docs: self.lossy_docs != 0,
+            audio: if self.audio_on {
+                match self.audio {
+                    1 => ImageMode::Lossless,
+                    2 => ImageMode::Lossy,
+                    _ => d.audio,
+                }
+            } else {
+                ImageMode::Off
+            },
+            temp_dir: non_empty(&self.temp_dir),
+            fix_ext: self.fix_ext != 0,
+            gpu_decoding: self.gpu_decoding,
+            max: crate::image::Max::from_names(&self.max_parts.iter().map(String::as_str).collect::<Vec<_>>()),
+            drop_data: self.drop_data,
+            strip: self.strip,
+            redo_stripped: self.redo_stripped,
         }
+        .validated()
     }
 }
 
@@ -409,15 +445,28 @@ mod tests {
         let old: Prefs = serde_json::from_str(r#"{"encoder":"av1_nvenc","concurrency":2}"#).unwrap();
         assert!(old.gpu_decoding);
         assert_eq!(old.max_parts, ["png_ect"]);
-        let o = crate::args::Options::normalize(old.to_raw());
+        let o = old.to_options();
         assert!(o.gpu_decoding);
         assert!(!old.drop_data && !o.drop_data && !old.strip && !o.strip);
         assert_eq!(o.max, crate::image::Max::chosen());
         // Chosen parts reach the engine; unknown names are ignored.
         let p = Prefs { gpu_decoding: false, drop_data: true, strip: true, max_parts: vec!["flac_e".into(), "bogus".into()], ..Prefs::default() };
-        let o = crate::args::Options::normalize(p.to_raw());
+        let o = p.to_options();
         assert!(!o.gpu_decoding && o.drop_data && o.strip);
         assert_eq!(o.max, crate::image::Max { flac_e: true, ..crate::image::Max::default() });
+        // Quality floors and off-states map straight to Options.
+        for (v, t) in [(2, 93), (3, 85), (4, 80)] {
+            let o = Prefs { images: v, ..Prefs::default() }.to_options();
+            assert_eq!((o.images, o.image_target), (ImageMode::Lossy, t));
+        }
+        for (level, t) in [(4, 80), (1, 93)] {
+            let o = Prefs { images_on: false, images: level, ..Prefs::default() }.to_options();
+            assert_eq!((o.images, o.image_target), (ImageMode::Off, t));
+        }
+        let o = Prefs { originals: 2, backup_dir: r"D:\old".into(), gif_min_mb: NO_GIFS, vmaf_floor: 0, ..Prefs::default() }.to_options();
+        assert_eq!(o.originals, Originals::BackupFolder(Some(PathBuf::from(r"D:\old"))));
+        assert_eq!(o.gif_min_bytes, u64::MAX);
+        assert_eq!(o.vmaf_floor, None);
         // Every part has a name that round-trips.
         for (name, _, _) in crate::image::Max::PARTS {
             assert_eq!(crate::image::Max::from_names(&[name]).names(), [*name]);

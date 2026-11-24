@@ -1368,6 +1368,7 @@ mod tests {
             gate: crate::image::tools::Gate::default(),
             max: crate::image::Max::default(),
             slots: None,
+            budget: crate::budget::ResourceBudget::os(),
             progress: None,
         })
     }

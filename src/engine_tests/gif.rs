@@ -21,14 +21,14 @@ fn hard_links_are_left_alone_and_small_gifs_stay_gifs() {
     let rt = runtime();
     let (engine, rec) = new_engine(&rt, &root, ff);
     // Default GIF limit (1 MB): the small animated GIF must not be queued.
-    let raw = RawOptions { gif_min_mb: None, ..opts("av1_nvenc", 1.0) };
+    let raw = Options { gif_min_bytes: 1024 * 1024, ..opts("av1_nvenc", 1) };
     rt.block_on(async {
         engine.apply_options(raw);
         engine.load_dir(videos.clone()).await;
         let s = engine.snapshot();
         assert_eq!(s.skipped_small_gifs, 1);
         assert_eq!(s.pending_files, 2);
-        engine.clone().run_batch(RawOptions { gif_min_mb: None, ..opts("av1_nvenc", 1.0) }).await;
+        engine.clone().run_batch(Options { gif_min_bytes: 1024 * 1024, ..opts("av1_nvenc", 1) }).await;
     });
     let logs = rec.logs.lock().unwrap().join("\n");
     println!("{logs}");
@@ -65,7 +65,7 @@ fn gifs_the_video_path_fails_on_are_left_alone() {
     let rt = runtime();
     let (engine, rec) = new_engine(&rt, &root, ff.clone());
     // Every GIF is a video job (limit 0); images on, so the GIF optimizer could run.
-    let raw = || RawOptions { images: Some(1), ..opts("av1_nvenc", 1.0) };
+    let raw = || Options { images: ImageMode::Lossless, ..opts("av1_nvenc", 1) };
     rt.block_on(async {
         engine.apply_options(raw());
         engine.load_dir(media.clone()).await;
@@ -124,10 +124,10 @@ fn a_gif_with_data_after_its_last_frame_becomes_a_video() {
     let rt = runtime();
     let (engine, rec) = new_engine(&rt, &root, ff);
     rt.block_on(async {
-        engine.apply_options(opts("av1_nvenc", 1.0));
+        engine.apply_options(opts("av1_nvenc", 1));
         engine.load_dir(media.clone()).await;
         assert_eq!(engine.snapshot().pending_files, 1);
-        engine.clone().run_batch(opts("av1_nvenc", 1.0)).await;
+        engine.clone().run_batch(opts("av1_nvenc", 1)).await;
     });
     let logs = rec.logs.lock().unwrap().join("\n");
     println!("{logs}");
@@ -152,9 +152,9 @@ fn a_gif_remembered_as_video_gets_the_gif_optimizer_later() {
     // A few hundred bytes of flat colour: no MP4 is that small.
     make(&ff, &["-f", "lavfi", "-i", "color=c=red:size=320x240:rate=2:duration=2"], &gif);
     let rt = runtime();
-    let run = |images: u32| {
+    let run = |images: ImageMode| {
         let (engine, rec) = new_engine(&rt, &root, ff.clone());
-        let raw = || RawOptions { images: Some(images), ..opts("av1_nvenc", 1.0) };
+        let raw = || Options { images, ..opts("av1_nvenc", 1) };
         rt.block_on(async {
             engine.apply_options(raw());
             engine.load_dir(media.clone()).await;
@@ -164,23 +164,23 @@ fn a_gif_remembered_as_video_gets_the_gif_optimizer_later() {
         })
     };
     // Images off: not smaller as a video, remembered as one.
-    let (pending, logs) = run(0);
+    let (pending, logs) = run(ImageMode::Off);
     println!("{logs}");
     assert_eq!(pending, 1, "{logs}");
     assert!(logs.contains("Video was not smaller for anim.gif"), "{logs}");
     // Images on: straight to the GIF optimizer, no encode.
-    let (pending, logs) = run(1);
+    let (pending, logs) = run(ImageMode::Lossless);
     println!("{logs}");
     assert_eq!(pending, 1, "{logs}");
     assert!(!logs.contains("Processing: anim.gif"), "no second video encode: {logs}");
     assert!(logs.contains("[Images]") && logs.contains("anim.gif"), "{logs}");
     // Done now.
-    let (pending, logs) = run(1);
+    let (pending, logs) = run(ImageMode::Lossless);
     assert_eq!(pending, 0, "{logs}");
     // Renamed, it is known by its content for both passes: neither encoded nor optimized
     // again (it was known only as a video, so it went back to the GIF optimizer).
     std::fs::rename(&gif, media.join("renamed.gif")).unwrap();
-    let (pending, logs) = run(1);
+    let (pending, logs) = run(ImageMode::Lossless);
     assert_eq!(pending, 0, "{logs}");
     let _ = std::fs::remove_dir_all(&root);
 }

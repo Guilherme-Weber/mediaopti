@@ -51,13 +51,6 @@ pub(super) struct ScanResult {
 /// Recursively finds videos (skipping hidden folders like the old glob did), deletes leftover
 /// temp files and sorts the queue by size, largest first. File sizes come from the directory
 /// listing itself (on Windows `DirEntry::metadata` needs no extra system call).
-/// The scanned files not already in `loaded` (compared by reference: no copy of the
-/// library's paths is made under the engine's lock).
-fn only_new(loaded: &[PathBuf], files: Vec<PathBuf>, sizes: Vec<u64>) -> Vec<(PathBuf, u64)> {
-    let known: HashSet<&Path> = loaded.iter().map(PathBuf::as_path).collect();
-    files.into_iter().zip(sizes).filter(|(f, _)| !known.contains(f.as_path())).collect()
-}
-
 /// Whether ffmpeg can read `path` as media (a half-written encode, e.g. an MP4 without its
 /// index, can't). `None` when ffmpeg couldn't tell: it didn't start (missing, out of memory)
 /// or ran out of time.
@@ -164,7 +157,7 @@ pub(super) fn scan_folder(
     let mut stale = vec![std::env::temp_dir()];
     stale.extend(temp.map(Path::to_path_buf));
     for root in roots {
-        stale.extend(images::volume_root(root).map(|r| r.join(images::DRIVE_WORK_DIR)));
+        stale.extend(crate::budget::volume_root(root).map(|r| r.join(crate::budget::DRIVE_WORK_DIR)));
     }
     stale.sort();
     stale.dedup();
@@ -209,7 +202,7 @@ pub(super) fn scan_folder(
             unreadable += 1;
             continue;
         };
-        if !entry.file_type().is_file() || !(args::is_video_file(entry.path()) || image::kind_of(entry.path()).is_some()) {
+        if !entry.file_type().is_file() || !crate::format::is_scanned_media(entry.path()) {
             continue;
         }
         if !seen.insert(entry.path().to_path_buf()) {
@@ -313,7 +306,7 @@ impl Engine {
         }
         let (working, old_dir) = {
             let inner = self.lock();
-            (inner.working, inner.dir.clone())
+            (inner.working, inner.queue.dir().map(Path::to_path_buf))
         };
         if working && !add {
             self.log("Stop processing before choosing another folder");
@@ -332,16 +325,7 @@ impl Engine {
         let root = if working { old_dir.clone().unwrap_or_else(|| common_root(&items)) } else { common_root(&all) };
         if !working {
             let mut inner = self.lock();
-            inner.dir = Some(root.clone());
-            if !add {
-                inner.files.clear();
-                inner.file_sizes.clear();
-                inner.file_index = None;
-                inner.static_gifs.clear();
-            }
-            inner.pending_queue.clear();
-            inner.queue_cursor = 0;
-            inner.cpu_queues = Default::default();
+            inner.queue.begin_scan(root.clone(), add);
             inner.reset_run_tracking();
             inner.run = RunStats::default();
             inner.status = Status::Scanning;
@@ -396,18 +380,12 @@ impl Engine {
         if result.cancelled {
             if !working {
                 let mut inner = self.lock();
-                if add && !inner.files.is_empty() {
-                    inner.dir = old_dir;
-                    inner.rebuild_queue();
-                    inner.status = Status::Ready;
+                let Inner { queue, options, history, .. } = &mut *inner;
+                inner.status = if queue.cancel_scan(old_dir, add, options, history) {
+                    Status::Ready
                 } else {
-                    inner.dir = None;
-                    inner.files.clear();
-                    inner.file_sizes.clear();
-                    inner.file_index = None;
-                    inner.static_gifs.clear();
-                    inner.status = Status::Idle;
-                }
+                    Status::Idle
+                };
             }
             self.log("Scan cancelled");
             self.send_state(true);
@@ -434,29 +412,13 @@ impl Engine {
             // Appended to the running batch; more workers start if the queues need them.
             let (videos, cpu) = {
                 let mut inner = self.lock();
-                let new = only_new(&inner.files, result.files, result.sizes);
-                let (mut videos, mut cpu) = (0, 0);
-                for (file, size) in new {
-                    if result.static_gifs.contains(&file) {
-                        inner.static_gifs.insert(file.clone());
-                    }
-                    let place = inner.place(&file, size);
-                    let stage = cpu_stage(&file);
-                    let i = inner.add_file(file, size);
-                    match place {
-                        Place::Video => {
-                            inner.pending_queue.push(i);
-                            inner.queue_bytes[0] += size;
-                            inner.queue_revision += 1;
-                            videos += 1;
-                        }
-                        Place::Cpu => {
-                            inner.run.stage_total[stage] += 1;
-                            inner.queue_cpu(i, size);
-                            cpu += 1;
-                        }
-                        _ => {}
-                    }
+                let (videos, stages) = {
+                    let Inner { queue, options, history, .. } = &mut *inner;
+                    queue.append_during_run(result.files, result.sizes, &result.static_gifs, options, history)
+                };
+                let cpu: usize = stages.iter().sum();
+                for (s, n) in stages.into_iter().enumerate() {
+                    inner.run.stage_total[s] += n;
                 }
                 inner.run.total += videos + cpu;
                 inner.run.images_total += cpu;
@@ -476,24 +438,21 @@ impl Engine {
 
         let (known, generated, small_gifs, videos, cpu, total) = {
             let mut inner = self.lock();
-            if add {
-                for (file, size) in only_new(&inner.files, result.files, result.sizes) {
-                    inner.add_file(file, size);
-                }
-                inner.static_gifs.extend(result.static_gifs);
-                inner.gifs_checked = inner.gifs_checked && check_gifs;
-            } else {
-                inner.files = result.files;
-                inner.file_sizes = result.sizes;
-                inner.file_index = None;
-                inner.static_gifs = result.static_gifs;
-                inner.gifs_checked = check_gifs;
-            }
             inner.reset_run_tracking();
-            inner.rebuild_queue();
+            {
+                let Inner { queue, options, history, .. } = &mut *inner;
+                queue.apply_scan(result.files, result.sizes, result.static_gifs, check_gifs, add, options, history);
+            }
             inner.run = RunStats::default();
             inner.status = Status::Ready;
-            (inner.skipped_known, inner.skipped_generated, inner.skipped_small_gifs, inner.pending_queue.len(), inner.cpu_total(), inner.files.len())
+            (
+                inner.queue.skipped_known(),
+                inner.queue.skipped_generated(),
+                inner.queue.skipped_small_gifs(),
+                inner.queue.videos_waiting(),
+                inner.queue.cpu_waiting(),
+                inner.queue.total_files(),
+            )
         };
         self.log(format!(
             "{} {total} files in {} ({videos} videos and {cpu} images, audio or documents to process)",

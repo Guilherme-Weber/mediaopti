@@ -21,9 +21,11 @@ mod app;
 mod archive;
 mod args;
 mod audio;
+mod budget;
 mod engine;
 #[cfg(test)]
 mod engine_tests;
+mod format;
 mod history;
 mod image;
 mod logfile;

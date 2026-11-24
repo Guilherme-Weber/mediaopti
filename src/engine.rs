@@ -1,7 +1,7 @@
 //! Batch engine: folder scanning, the work queue, parallel ffmpeg workers with retries
 //! and fallbacks, GPU telemetry and state broadcasting to the UI.
 
-use crate::args::{self, ImageMode, Mode, Options, Originals, RawOptions};
+use crate::args::{self, ImageMode, Mode, Options, Originals};
 use crate::image;
 use crate::history::{self, ContentHash, History};
 use crate::progress::{self, Diagnostics, WorkerProgress};
@@ -34,31 +34,10 @@ use vmaf::*;
 
 pub use batch::cpu_slot_count;
 pub use ffmpeg::locate_ffmpeg;
-pub(crate) use images::active_stage_limit;
+pub(crate) use queue::active_stage_limit;
 
 const STATE_THROTTLE: Duration = Duration::from_millis(250);
-/// Kept free on a video's drive besides room for its new version.
-const VIDEO_DISK_RESERVE: u64 = 4 * 1024 * 1024 * 1024;
 const HISTORY_SAVE_DELAY: Duration = Duration::from_secs(2);
-
-/// Memory needed before starting another ffmpeg while others run. A single 4K AV1 encode
-/// (multipass + 32-frame lookahead) was measured at up to ~5.3 GB of commit; running several
-/// in parallel once exhausted the system commit limit and crashed every process. Measured
-/// again 2026-11-16 (peak commit): 4K 4.9 GB (CPU decode) / 4.1 GB (GPU decode), 1440p AV1
-/// 3.4 / 2.6 GB, 1080p 1.4 GB.
-const MIN_FREE_COMMIT: u64 = 6 * 1024 * 1024 * 1024;
-const MIN_FREE_PHYSICAL: u64 = 2 * 1024 * 1024 * 1024;
-/// How long a newly started ffmpeg is given to allocate its buffers before the next
-/// worker re-checks free memory (only when memory is not plentiful: enough for every job
-/// to start at once, `MIN_FREE_COMMIT` and `MIN_FREE_VRAM_MB` per job).
-const ADMISSION_WARMUP: Duration = Duration::from_secs(4);
-/// Free commit needed before starting a VMAF measurement while other work runs (a 4K
-/// measurement peaked at ~2.5 GB).
-const VMAF_MIN_FREE_COMMIT: u64 = 4 * 1024 * 1024 * 1024;
-/// Free GPU memory needed before starting another NVENC encode. One 4K AV1 encode with GPU
-/// decoding was measured at ~2.5 GB (1080p: ~0.9 GB); 6-8 parallel 4K encodes ran a 16 GB
-/// RTX 5070 Ti out of memory.
-const MIN_FREE_VRAM_MB: u64 = 3 * 1024;
 
 /// Where the engine sends logs and state (the window, or a recorder in tests).
 pub trait Ui: Send + Sync + 'static {
@@ -94,9 +73,9 @@ struct RunStats {
     /// CPU files by stage (audio, documents, images): queued this run, and finished.
     stage_total: [usize; 3],
     stage_done: [usize; 3],
-    /// Files of each kind (`image::Kind as usize`) in a row whose tools could not run
+    /// Files of each kind (`format::Kind::index`) in a row whose tools could not run
     /// (`ImageResult::ToolUnavailable`): a missing qpdf leaves the PDFs, not the pictures.
-    tools_failing: [usize; 16],
+    tools_failing: [usize; crate::format::Kind::COUNT],
 }
 
 #[derive(Clone, Debug)]
@@ -165,53 +144,14 @@ pub struct CpuJob {
 }
 
 struct Inner {
-    dir: Option<PathBuf>,
-    files: Vec<PathBuf>,
-    /// Size of each entry of `files` at scan time, same order.
-    file_sizes: Vec<u64>,
-    /// Lazy O(1) lookup from path hash to `files` index (`None` until first `index_of`/`moved`/`gone`,
-    /// so runs without conversions/renames/pauses take zero extra memory).
-    file_index: Option<std::collections::HashMap<u64, u32>>,
-    /// Videos to do, as indices into `files` (a queued file costs 4 bytes, not a second copy
-    /// of its path: a library holds about a million files).
-    pending_queue: Vec<u32>,
-    queue_cursor: usize,
-    /// Single-frame GIFs found by the scan: always images, whatever their size.
-    static_gifs: HashSet<PathBuf>,
-    /// Whether `static_gifs` has been populated for the current `files` (skipped during
-    /// scan when Videos is off to avoid opening tens of thousands of GIFs on an HDD, and
-    /// computed lazily if Videos is later turned on).
-    gifs_checked: bool,
-    /// PNG/JPEG and small GIFs, processed by the CPU image workers.
-    /// CPU files by stage (audio, documents, images: see `Kind::stage`), sorted largest-first.
-    /// `VecDeque` lets the images stage claim heavy files from the front and normal files from
-    /// the back (preventing all workers from piling onto huge memory-heavy pictures at once)
-    /// and requeue paused files at the front in O(1).
-    cpu_queues: [VecDeque<u32>; 3],
-    cpu_active: [usize; 3],
-    /// Heavy images (front-of-queue, >= `HEAVY_IMAGE_BYTES`) currently running.
-    heavy_images_active: usize,
-    /// The stages announced in the log this batch.
-    stage_logged: [bool; 3],
-    /// Bytes waiting by type (videos, audio, documents, images).
-    queue_bytes: [u64; 4],
-    queue_revision: u64,
-    images_active: usize,
+    queue: WorkQueue,
     /// When each CPU file being processed was started.
     cpu_started: std::collections::HashMap<PathBuf, Instant>,
     /// The progress of the CPU files that report it (comics, PDFs).
     cpu_progress: std::collections::HashMap<PathBuf, Arc<image::tools::Progress>>,
     cpu_waiting_memory: bool,
-    /// When CPU jobs were let in lately (`wait_for_image_memory`): each counts as using its
-    /// share of memory until it has had time to take it.
-    cpu_admitted: Vec<std::time::Instant>,
-    skipped_known: usize,
-    skipped_generated: usize,
-    skipped_small_gifs: usize,
     history: History,
     history_save_pending: bool,
-    failed: HashSet<PathBuf>,
-    in_progress: HashSet<PathBuf>,
     workers: BTreeMap<u32, WorkerProgress>,
     /// Each video worker's file and when it started it (kept while its row comes and goes).
     worker_files: BTreeMap<u32, (String, Instant)>,
@@ -230,9 +170,6 @@ struct Inner {
     release: CancellationToken,
     /// Video jobs that Pause ended, with what they had finished (taken up on Resume).
     resume: std::collections::HashMap<PathBuf, vmaf::VideoResume>,
-    /// What each video being encoded holds besides its picture (`args::Streams`), read once
-    /// per job: every attempt carries it over and the result is checked against it.
-    job_streams: std::collections::HashMap<PathBuf, args::Streams>,
     power: Option<PowerGuard>,
     /// Workers of the running batch, awaited by `run_batch` (files added during a run can
     /// start more).
@@ -265,6 +202,8 @@ pub struct Engine {
     /// Set by `cancel_scan` to stop an in-progress folder scan cleanly.
     scan_cancel: Arc<AtomicBool>,
     inner: Mutex<Inner>,
+    budget: Arc<crate::budget::ResourceBudget>,
+    video_runner: Arc<dyn ffmpeg::VideoRunner>,
     emit: Mutex<EmitThrottle>,
     /// Serializes encoder start-up so memory checks see the previous encoder's usage.
     admission: Arc<tokio::sync::Mutex<()>>,
@@ -294,6 +233,16 @@ impl Engine {
         ffmpeg_path: PathBuf,
         rt: tokio::runtime::Handle,
     ) -> Arc<Self> {
+        Self::new_with_runner(ui, data_dir, ffmpeg_path, rt, Arc::new(ffmpeg::FfmpegAdapter))
+    }
+
+    fn new_with_runner(
+        ui: Box<dyn Ui>,
+        data_dir: &Path,
+        ffmpeg_path: PathBuf,
+        rt: tokio::runtime::Handle,
+        video_runner: Arc<dyn ffmpeg::VideoRunner>,
+    ) -> Arc<Self> {
         system::put_app_in_kill_on_exit_job();
         let history = History::load(data_dir.join("processedFiles.txt"));
         let placeholders = system::init_claims_journal(&data_dir.join("claimed-names.txt"));
@@ -311,32 +260,12 @@ impl Engine {
             scan_found: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             scan_cancel: Arc::new(AtomicBool::new(false)),
             inner: Mutex::new(Inner {
-                dir: None,
-                files: Vec::new(),
-                file_sizes: Vec::new(),
-                file_index: None,
-                pending_queue: Vec::new(),
-                queue_cursor: 0,
-                static_gifs: HashSet::new(),
-                gifs_checked: true,
-                cpu_queues: Default::default(),
-                cpu_active: [0; 3],
-                heavy_images_active: 0,
-                stage_logged: [false; 3],
-                queue_bytes: [0; 4],
-                queue_revision: 0,
-                images_active: 0,
+                queue: WorkQueue::new(),
                 cpu_started: std::collections::HashMap::new(),
                 cpu_progress: std::collections::HashMap::new(),
                 cpu_waiting_memory: false,
-                cpu_admitted: Vec::new(),
-                skipped_known: 0,
-                skipped_generated: 0,
-                skipped_small_gifs: 0,
                 history,
                 history_save_pending: false,
-                failed: HashSet::new(),
-                in_progress: HashSet::new(),
                 workers: BTreeMap::new(),
                 worker_files: BTreeMap::new(),
                 running_processes: 0,
@@ -351,7 +280,6 @@ impl Engine {
                 cancel: CancellationToken::new(),
                 release: CancellationToken::new(),
                 resume: std::collections::HashMap::new(),
-                job_streams: std::collections::HashMap::new(),
                 power: None,
                 handles: Vec::new(),
                 video_ids: std::collections::BTreeSet::new(),
@@ -360,6 +288,8 @@ impl Engine {
                 fatal: Arc::new(AtomicBool::new(false)),
                 gpu_polling: false,
             }),
+            budget: crate::budget::ResourceBudget::os(),
+            video_runner,
             emit: Mutex::new(EmitThrottle {
                 last_sent: None,
                 pending: false,

@@ -104,13 +104,7 @@ fn free_target(target: &Path) -> std::io::Result<PathBuf> {
 
 /// Whether `file` could be the original the job writing `temp` started from.
 fn could_be_source(file: &Path, temp: &Path, video_temp: bool) -> bool {
-    if video_temp {
-        return args::is_video_file(file) || image::kind_of(file) == Some(image::Kind::Gif);
-    }
-    let family = |p: &Path| {
-        image::kind_of(p).map(|k| if k.is_audio() { 1 } else if k.is_document() { 2 } else { 3 })
-    };
-    family(file).is_some() && family(file) == family(temp)
+    crate::format::could_be_source(file, temp, video_temp)
 }
 
 /// A replacement that had started (its new version verified, flushed and noted) and had not
@@ -196,7 +190,7 @@ impl Journal {
 /// Whether the volume/drive holding `path` is currently mounted (if a removable drive is
 /// unplugged, we must NOT drop its pending journal entry on startup).
 fn volume_mounted(path: &Path) -> bool {
-    match super::images::volume_root(path) {
+    match crate::budget::volume_root(path) {
         Some(root) => root.is_dir(),
         None => true,
     }
@@ -356,6 +350,304 @@ impl Engine {
             ));
         }
     }
+}
+
+// ------------------------------------------------------------------- commit transaction
+
+/// The candidate file produced by an optimization pass, ready to commit.
+pub(super) enum Candidate<'a> {
+    /// Already sits next to the original on the same volume (videos: ffmpeg wrote directly).
+    /// Removed on abort/discard unless kept in the pending journal for crash recovery.
+    SiblingTemp { path: &'a Path, size: u64 },
+    /// Sits in a private work folder (images/audio/docs); copied next to the target right
+    /// before [`replace_original`].
+    WorkFile { path: &'a Path, size: u64, worker_id: u32 },
+}
+
+impl Candidate<'_> {
+    fn size(&self) -> u64 {
+        match *self {
+            Self::SiblingTemp { size, .. } | Self::WorkFile { size, .. } => size,
+        }
+    }
+
+    fn discard_temp(&self, warn: &dyn Fn(String)) {
+        if let Self::SiblingTemp { path, .. } = *self {
+            if !kept_for_its_name(path) {
+                if let Err(err) = system::remove_file_if_exists(path) {
+                    let when = if err.raw_os_error() == Some(32) { "still open by another process" } else { "error" };
+                    warn(format!(
+                        "Could not remove temporary file {} ({when}: {err}); the next scan removes it",
+                        path.display()
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// First step of claiming a new target name (when `desired_target != original`).
+pub(super) enum ClaimStep {
+    /// Target name is ready (`claimed`: true when an empty placeholder was created at `target`).
+    Ready { target: PathBuf, claimed: bool },
+    /// `desired_target` already exists: caller should check whether it holds the same content.
+    Collision(PathBuf),
+}
+
+/// Outcome of committing an optimization candidate to disk.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum CommitOutcome {
+    /// Replaced original (in place or at a newly claimed target name).
+    Replaced { target: PathBuf, renamed: bool, size: u64 },
+    /// Extension-fix rename only (no smaller candidate was produced).
+    Renamed(PathBuf),
+    /// Existing file at target had the same content and our candidate replaced it; original disposed.
+    DuplicateReplaced { existing: PathBuf, saved_bytes: u64, final_size: u64 },
+    /// Existing file at target had the same content and was already smaller/equal; original disposed.
+    DuplicateKeptExisting { existing: PathBuf, saved_bytes: u64, final_size: u64 },
+    /// Existing file at target had the same content, was bigger than ours, and could not be replaced
+    /// (hard link, or no smaller candidate): both files kept untouched (Option A).
+    DuplicateKeptBoth { existing: PathBuf, hard_linked: bool },
+    /// Existing file at target has the same content and another worker is processing it now.
+    BusyDuplicate(PathBuf),
+    /// Original changed on disk while being processed (or during same-content check).
+    OriginalChanged,
+    /// Could not find an unused numbered name after 20 attempts.
+    NoFreeName,
+    /// I/O or replacement error (original untouched unless message notes otherwise).
+    Failed(String),
+}
+
+/// Phase 1: if `desired_target == original`, returns `Ready { claimed: false }`; otherwise tries
+/// to atomically claim `desired_target`, returning `Collision` if a file already holds that name.
+pub(super) fn try_claim_first(original: &Path, desired_target: &Path) -> ClaimStep {
+    if desired_target == original {
+        return ClaimStep::Ready { target: original.to_path_buf(), claimed: false };
+    }
+    if system::claim_new_name(desired_target).is_ok() {
+        ClaimStep::Ready { target: desired_target.to_path_buf(), claimed: true }
+    } else {
+        ClaimStep::Collision(desired_target.to_path_buf())
+    }
+}
+
+/// Phase 1b (after a collision was confirmed NOT to be the same content): claims the first free
+/// numbered variant `"stem (2).ext"` .. up to 20 tries.
+pub(super) fn claim_numbered(initial_target: &Path) -> Option<PathBuf> {
+    let mut target = system::unused_name(initial_target);
+    for _ in 0..20 {
+        if system::claim_new_name(&target).is_ok() {
+            return Some(target);
+        }
+        target = system::unused_name(&target);
+    }
+    None
+}
+
+/// Phase 2a: commits a candidate to a claimed (or in-place) target after re-checking `file_state`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn commit_claimed(
+    original: &Path,
+    target: &Path,
+    claimed: bool,
+    initial_state: Option<(u64, Option<std::time::SystemTime>)>,
+    candidate: Option<Candidate<'_>>,
+    disposal: &system::Disposal,
+    note: &dyn Fn(&Path) -> std::io::Result<()>,
+    warn: &dyn Fn(String),
+) -> CommitOutcome {
+    let unclaim = || {
+        if claimed {
+            system::release_claim(target);
+        }
+    };
+    if file_state(original) != initial_state {
+        unclaim();
+        if let Some(c) = &candidate {
+            c.discard_temp(warn);
+        }
+        return CommitOutcome::OriginalChanged;
+    }
+    let Some(cand) = candidate else {
+        return match std::fs::rename(original, target) {
+            Ok(()) => CommitOutcome::Renamed(target.to_path_buf()),
+            Err(err) => {
+                unclaim();
+                CommitOutcome::Failed(format!("could not rename it: {err}"))
+            }
+        };
+    };
+    let attrs = match std::fs::metadata(original) {
+        Ok(m) => OriginalAttributes::from_metadata(&m),
+        Err(err) => {
+            unclaim();
+            cand.discard_temp(warn);
+            return CommitOutcome::Failed(err.to_string());
+        }
+    };
+    let sibling = match cand {
+        Candidate::SiblingTemp { path, .. } => path.to_path_buf(),
+        Candidate::WorkFile { path, worker_id, .. } => {
+            let stem = original.file_stem().map_or_default(|s| s.to_string_lossy().into_owned());
+            let out_ext = args::ext_lower(target);
+            let s = unclaimed_temp(|n| original.with_file_name(format!("{stem}.mediaopti.i{n}.{out_ext}")), worker_id);
+            if let Err(err) = std::fs::copy(path, &s) {
+                let _ = system::remove_file_if_exists(&s);
+                unclaim();
+                return CommitOutcome::Failed(format!("could not write next to the original: {err}"));
+            }
+            s
+        }
+    };
+    if let Err(err) = replace_original(&sibling, target, original, disposal, note) {
+        unclaim();
+        if !kept_for_its_name(&sibling) {
+            let _ = system::remove_file_if_exists(&sibling);
+        }
+        return CommitOutcome::Failed(err);
+    }
+    if let Err(err) = system::restore_attributes(target, &attrs) {
+        warn(format!("Could not restore the dates and attributes of {}: {err}", target.display()));
+    }
+    CommitOutcome::Replaced { target: target.to_path_buf(), renamed: claimed, size: cand.size() }
+}
+
+/// Phase 2b: resolves a collision where `existing` holds the same content as `original`.
+///
+/// Always re-checks `file_state(original)` after the (potentially slow) content comparison,
+/// respects `is_busy(existing)`, and applies Option A: when `existing` is a hard link bigger
+/// than our candidate, keeps BOTH files untouched rather than deleting the original.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn commit_same_content(
+    original: &Path,
+    existing: &Path,
+    initial_state: Option<(u64, Option<std::time::SystemTime>)>,
+    before_size: u64,
+    candidate: Option<Candidate<'_>>,
+    disposal: &system::Disposal,
+    is_busy: &dyn Fn(&Path) -> bool,
+    note: &dyn Fn(&Path) -> std::io::Result<()>,
+    warn: &dyn Fn(String),
+) -> CommitOutcome {
+    if is_busy(existing) {
+        if let Some(c) = &candidate {
+            c.discard_temp(warn);
+        }
+        return CommitOutcome::BusyDuplicate(existing.to_path_buf());
+    }
+    if file_state(original) != initial_state {
+        if let Some(c) = &candidate {
+            c.discard_temp(warn);
+        }
+        return CommitOutcome::OriginalChanged;
+    }
+    let theirs = match std::fs::metadata(existing) {
+        Ok(m) => m.len(),
+        Err(err) => {
+            if let Some(c) = &candidate {
+                c.discard_temp(warn);
+            }
+            return CommitOutcome::Failed(err.to_string());
+        }
+    };
+    let replaceable = system::hard_link_count(existing).unwrap_or(1) <= 1;
+    match candidate {
+        Some(cand) if cand.size() < theirs && replaceable => {
+            let attrs = std::fs::metadata(original).map(|m| OriginalAttributes::from_metadata(&m));
+            let sibling = match cand {
+                Candidate::SiblingTemp { path, .. } => path.to_path_buf(),
+                Candidate::WorkFile { path, worker_id, .. } => {
+                    let stem = existing.file_stem().map_or_default(|s| s.to_string_lossy().into_owned());
+                    let ext = args::ext_lower(existing);
+                    let s = unclaimed_temp(|n| existing.with_file_name(format!("{stem}.mediaopti.i{n}.{ext}")), worker_id);
+                    if let Err(err) = std::fs::copy(path, &s) {
+                        let _ = system::remove_file_if_exists(&s);
+                        return CommitOutcome::Failed(format!("could not write next to the original: {err}"));
+                    }
+                    s
+                }
+            };
+            if let Err(err) = replace_original(&sibling, existing, existing, &disposal.for_sibling(existing), note) {
+                if !kept_for_its_name(&sibling) {
+                    let _ = system::remove_file_if_exists(&sibling);
+                }
+                return CommitOutcome::Failed(err);
+            }
+            if let Err(err) = attrs.and_then(|a| system::restore_attributes(existing, &a)) {
+                warn(format!("Could not restore the dates and attributes of {}: {err}", existing.display()));
+            }
+            match system::dispose(original, disposal) {
+                Ok(()) => CommitOutcome::DuplicateReplaced {
+                    existing: existing.to_path_buf(),
+                    saved_bytes: before_size + theirs - cand.size(),
+                    final_size: cand.size(),
+                },
+                Err(err) => CommitOutcome::Failed(format!(
+                    "{} now has the smaller version, but the original could not be removed: {err}",
+                    existing.display()
+                )),
+            }
+        }
+        cand if theirs <= cand.as_ref().map_or(before_size, Candidate::size) => {
+            if let Some(c) = &cand {
+                c.discard_temp(warn);
+            }
+            match system::dispose(original, disposal) {
+                Ok(()) => CommitOutcome::DuplicateKeptExisting {
+                    existing: existing.to_path_buf(),
+                    saved_bytes: before_size,
+                    final_size: theirs,
+                },
+                Err(err) => CommitOutcome::Failed(format!("could not remove it (same content as {}): {err}", existing.display())),
+            }
+        }
+        cand => {
+            // Option A: existing copy is bigger and either hard-linked (replacing would break
+            // its other names) or no smaller candidate was produced -> keep both untouched.
+            if let Some(c) = &cand {
+                c.discard_temp(warn);
+            }
+            CommitOutcome::DuplicateKeptBoth { existing: existing.to_path_buf(), hard_linked: !replaceable }
+        }
+    }
+}
+
+/// Synchronous all-in-one commit transaction (used by CPU workers and unit tests).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn commit_candidate<E>(
+    original: &Path,
+    desired_target: &Path,
+    initial_state: Option<(u64, Option<std::time::SystemTime>)>,
+    before_size: u64,
+    candidate: Option<Candidate<'_>>,
+    disposal: &system::Disposal,
+    is_busy: &dyn Fn(&Path) -> bool,
+    mut same_content: impl FnMut(&Path) -> Result<bool, E>,
+    note: &dyn Fn(&Path) -> std::io::Result<()>,
+    warn: &dyn Fn(String),
+) -> Result<CommitOutcome, E> {
+    if file_state(original) != initial_state {
+        if let Some(c) = &candidate {
+            c.discard_temp(warn);
+        }
+        return Ok(CommitOutcome::OriginalChanged);
+    }
+    let (target, claimed) = match try_claim_first(original, desired_target) {
+        ClaimStep::Ready { target, claimed } => (target, claimed),
+        ClaimStep::Collision(existing) => {
+            if same_content(&existing)? {
+                return Ok(commit_same_content(original, &existing, initial_state, before_size, candidate, disposal, is_busy, note, warn));
+            }
+            let Some(numbered) = claim_numbered(&existing) else {
+                if let Some(c) = &candidate {
+                    c.discard_temp(warn);
+                }
+                return Ok(CommitOutcome::NoFreeName);
+            };
+            (numbered, true)
+        }
+    };
+    Ok(commit_claimed(original, &target, claimed, initial_state, candidate, disposal, note, warn))
 }
 
 #[cfg(test)]
@@ -547,5 +839,191 @@ mod tests {
     fn volume_mounted_distinguishes_unplugged_drives() {
         assert!(volume_mounted(&std::env::temp_dir().join("x.tmp")));
         assert!(!volume_mounted(Path::new(r"Q:\unplugged-drive-test\a.mediaopti.i1.png")));
+    }
+
+    #[test]
+    fn commit_candidate_handles_replace_collision_duplicates_option_a_freshness_and_busy() {
+        let dir = std::env::temp_dir().join(format!("mo-commit-tx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let no_busy = |_: &Path| false;
+        let ok_note = |_: &Path| Ok(());
+        let quiet_warn = |_: String| {};
+
+        // 1) In-place replacement via SiblingTemp.
+        let orig = dir.join("a.mp4");
+        let tmp = dir.join("a.mediaopti.w1.mp4");
+        std::fs::write(&orig, b"original-100-bytes-long").unwrap();
+        std::fs::write(&tmp, b"small").unwrap();
+        let st = file_state(&orig);
+        let r = commit_candidate::<()>(
+            &orig,
+            &orig,
+            st,
+            23,
+            Some(Candidate::SiblingTemp { path: &tmp, size: 5 }),
+            &system::Disposal::Delete,
+            &no_busy,
+            |_| Ok(false),
+            &ok_note,
+            &quiet_warn,
+        )
+        .unwrap();
+        assert_eq!(r, CommitOutcome::Replaced { target: orig.clone(), renamed: false, size: 5 });
+        assert_eq!(std::fs::read(&orig).unwrap(), b"small");
+        assert!(!tmp.exists());
+
+        // 2) Collision with different content -> numbered "b (2).png".
+        let b_bmp = dir.join("b.bmp");
+        let b_png = dir.join("b.png");
+        let b_work = dir.join("b_out.png");
+        std::fs::write(&b_bmp, b"bmp-original-data").unwrap();
+        std::fs::write(&b_png, b"unrelated-png").unwrap();
+        std::fs::write(&b_work, b"newpng").unwrap();
+        let r = commit_candidate::<()>(
+            &b_bmp,
+            &b_png,
+            file_state(&b_bmp),
+            17,
+            Some(Candidate::WorkFile { path: &b_work, size: 6, worker_id: 1 }),
+            &system::Disposal::Delete,
+            &no_busy,
+            |_| Ok(false),
+            &ok_note,
+            &quiet_warn,
+        )
+        .unwrap();
+        assert_eq!(r, CommitOutcome::Replaced { target: dir.join("b (2).png"), renamed: true, size: 6 });
+        assert!(!b_bmp.exists());
+        assert_eq!(std::fs::read(&b_png).unwrap(), b"unrelated-png");
+        assert_eq!(std::fs::read(dir.join("b (2).png")).unwrap(), b"newpng");
+
+        // 3) Same-content smaller candidate replaces sibling and disposes original.
+        let c_mov = dir.join("c.mov");
+        let c_mp4 = dir.join("c.mp4");
+        let c_tmp = dir.join("c.mediaopti.w1.mp4");
+        std::fs::write(&c_mov, b"big-original-video-data").unwrap();
+        std::fs::write(&c_mp4, b"bigger-sibling-mp4").unwrap();
+        std::fs::write(&c_tmp, b"tiny").unwrap();
+        let r = commit_candidate::<()>(
+            &c_mov,
+            &c_mp4,
+            file_state(&c_mov),
+            23,
+            Some(Candidate::SiblingTemp { path: &c_tmp, size: 4 }),
+            &system::Disposal::Delete,
+            &no_busy,
+            |_| Ok(true),
+            &ok_note,
+            &quiet_warn,
+        )
+        .unwrap();
+        assert_eq!(r, CommitOutcome::DuplicateReplaced { existing: c_mp4.clone(), saved_bytes: 23 + 18 - 4, final_size: 4 });
+        assert!(!c_mov.exists());
+        assert_eq!(std::fs::read(&c_mp4).unwrap(), b"tiny");
+
+        // 4) Same-content existing copy already smaller -> discards temp and disposes original.
+        let d_mov = dir.join("d.mov");
+        let d_mp4 = dir.join("d.mp4");
+        let d_tmp = dir.join("d.mediaopti.w1.mp4");
+        std::fs::write(&d_mov, b"original-video-data").unwrap();
+        std::fs::write(&d_mp4, b"ok").unwrap();
+        std::fs::write(&d_tmp, b"bigger-tmp").unwrap();
+        let r = commit_candidate::<()>(
+            &d_mov,
+            &d_mp4,
+            file_state(&d_mov),
+            19,
+            Some(Candidate::SiblingTemp { path: &d_tmp, size: 10 }),
+            &system::Disposal::Delete,
+            &no_busy,
+            |_| Ok(true),
+            &ok_note,
+            &quiet_warn,
+        )
+        .unwrap();
+        assert_eq!(r, CommitOutcome::DuplicateKeptExisting { existing: d_mp4.clone(), saved_bytes: 19, final_size: 2 });
+        assert!(!d_mov.exists() && !d_tmp.exists());
+        assert_eq!(std::fs::read(&d_mp4).unwrap(), b"ok");
+
+        // 5) Option A: same-content existing copy is a BIGGER hard link -> keep BOTH untouched.
+        let e_mov = dir.join("e.mov");
+        let e_mp4 = dir.join("e.mp4");
+        let e_link = dir.join("e-link.mp4");
+        let e_tmp = dir.join("e.mediaopti.w1.mp4");
+        std::fs::write(&e_mov, b"original-mov-bytes").unwrap();
+        std::fs::write(&e_mp4, b"large-hard-linked-existing").unwrap();
+        std::fs::hard_link(&e_mp4, &e_link).unwrap();
+        std::fs::write(&e_tmp, b"tiny").unwrap();
+        let r = commit_candidate::<()>(
+            &e_mov,
+            &e_mp4,
+            file_state(&e_mov),
+            18,
+            Some(Candidate::SiblingTemp { path: &e_tmp, size: 4 }),
+            &system::Disposal::Delete,
+            &no_busy,
+            |_| Ok(true),
+            &ok_note,
+            &quiet_warn,
+        )
+        .unwrap();
+        assert_eq!(r, CommitOutcome::DuplicateKeptBoth { existing: e_mp4.clone(), hard_linked: true });
+        assert!(e_mov.exists(), "Option A: original must not be deleted when hard-linked duplicate is bigger");
+        assert!(!e_tmp.exists(), "candidate temp discarded");
+        assert_eq!(std::fs::read(&e_mp4).unwrap(), b"large-hard-linked-existing");
+        assert_eq!(system::hard_link_count(&e_link).ok(), Some(2));
+
+        // 6) Original modified during same_content check -> aborts safely.
+        let f_bmp = dir.join("f.bmp");
+        let f_png = dir.join("f.png");
+        let f_tmp = dir.join("f.mediaopti.w1.png");
+        std::fs::write(&f_bmp, b"before-edit").unwrap();
+        std::fs::write(&f_png, b"x").unwrap();
+        std::fs::write(&f_tmp, b"cand").unwrap();
+        let f_st = file_state(&f_bmp);
+        let r = commit_candidate::<()>(
+            &f_bmp,
+            &f_png,
+            f_st,
+            11,
+            Some(Candidate::SiblingTemp { path: &f_tmp, size: 4 }),
+            &system::Disposal::Delete,
+            &no_busy,
+            |_| {
+                std::fs::write(&f_bmp, b"edited-while-checking-same-content").unwrap();
+                Ok(true)
+            },
+            &ok_note,
+            &quiet_warn,
+        )
+        .unwrap();
+        assert_eq!(r, CommitOutcome::OriginalChanged);
+        assert!(f_bmp.exists() && !f_tmp.exists());
+
+        // 7) Busy duplicate -> skips safely without touching either file.
+        let g_mov = dir.join("g.mov");
+        let g_mp4 = dir.join("g.mp4");
+        let g_tmp = dir.join("g.mediaopti.w1.mp4");
+        std::fs::write(&g_mov, b"mov").unwrap();
+        std::fs::write(&g_mp4, b"mp4").unwrap();
+        std::fs::write(&g_tmp, b"tmp").unwrap();
+        let r = commit_candidate::<()>(
+            &g_mov,
+            &g_mp4,
+            file_state(&g_mov),
+            3,
+            Some(Candidate::SiblingTemp { path: &g_tmp, size: 3 }),
+            &system::Disposal::Delete,
+            &|p| p == g_mp4,
+            |_| Ok(true),
+            &ok_note,
+            &quiet_warn,
+        )
+        .unwrap();
+        assert_eq!(r, CommitOutcome::BusyDuplicate(g_mp4.clone()));
+        assert!(g_mov.exists() && g_mp4.exists() && !g_tmp.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

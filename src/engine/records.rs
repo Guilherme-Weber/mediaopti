@@ -62,7 +62,7 @@ impl Engine {
             let mut inner = self.lock();
             let added = inner.history.add(file);
             if added {
-                inner.skipped_known += 1;
+                inner.queue.note_skipped_known();
             }
             added
         };
@@ -76,10 +76,10 @@ impl Engine {
     /// Records `file`'s content in the history on the disk now (before it replaces an
     /// original: see `replace_original`). Returns `(hash, size)` so callers don't hash the
     /// same file a second time after replacing.
-    pub(super) fn note_content_now(&self, file: &Path, mode: &'static str) -> std::io::Result<(ContentHash, u64)> {
+    pub(super) fn note_content_now(&self, file: &Path, done: history::Pass) -> std::io::Result<(ContentHash, u64)> {
         let size = std::fs::metadata(file)?.len();
         let hash = history::hash_file(file)?;
-        let line = self.lock().history.add_content_now(hash, size, mode);
+        let line = self.lock().history.add_content_now(hash, size, done);
         if let Some((path, line)) = line {
             history::append_lines(&path, &line, true)?;
         }
@@ -96,7 +96,7 @@ impl Engine {
             })
             .await;
         if let Ok((hash, size)) = hashed {
-            self.lock().history.add_content(hash, size, history::VIDEO_MODE);
+            self.lock().history.add_content(hash, size, history::Pass::Video);
             self.schedule_history_save();
         }
     }
@@ -105,7 +105,7 @@ impl Engine {
     /// before (moved, renamed or copied), and adds them to the location history.
     /// Only files whose size matches a remembered size are hashed.
     pub(super) async fn recognise_by_content(self: &Arc<Self>, files: &[PathBuf], sizes: &[u64]) -> usize {
-        let (candidates, wants): (Vec<PathBuf>, Vec<history::Want>) = {
+        let (candidates, wants): (Vec<PathBuf>, Vec<history::Pass>) = {
             let inner = self.lock();
             files
                 .iter()
@@ -115,10 +115,7 @@ impl Engine {
                     let want = match inner.want(f, *s) {
                         // A big GIF known here as a video lacks only its GIF pass (`place` sends
                         // it to the optimizer): that is what its content may already have.
-                        history::Want::Video if args::is_gif(f) && inner.history.contains(f) => {
-                            let strip = inner.redo_stripped();
-                            if inner.lossy_for(f) { history::Want::ImageLossy { strip, target: inner.target_for(f) } } else { history::Want::ImageLossless { strip } }
-                        }
+                        history::Pass::Video if args::is_gif(f) && inner.history.contains(f) => inner.image_pass_for(f),
                         w => w,
                     };
                     (f, *s, want)
@@ -127,10 +124,7 @@ impl Engine {
                 // checked too: switched on before Start, their moved files are known.
                 .filter(|(_, s, want)| inner.history.has_size(*s, *want))
                 .map(|(f, _, want)| (f, want))
-                .filter(|(f, want)| match want {
-                    history::Want::Video => !inner.history.contains(f),
-                    _ => !inner.history.contains_image(f, inner.lossy_for(f), inner.redo_stripped(), inner.target_for(f)),
-                })
+                .filter(|(f, want)| !inner.history.contains_pass(f, *want))
                 .map(|(f, want)| (f.clone(), want))
                 .unzip()
         };
@@ -143,33 +137,9 @@ impl Engine {
             let mut inner = self.lock();
             let mut hits = 0;
             for ((file, hash), want) in hashed.into_iter().zip(wants) {
-                if let Some(h) = hash.filter(|h| inner.history.contains_content(h, want)) {
-                    match want {
-                        history::Want::Video => {
-                            inner.history.add(&file);
-                            // A GIF that went through the video attempt and the GIF optimizer
-                            // (moved or renamed since): known for its GIF pass too, else
-                            // `place` sends it to the optimizer again.
-                            if args::is_gif(&file) {
-                                let (lossy, strip, target) = (inner.lossy_for(&file), inner.redo_stripped(), inner.target_for(&file));
-                                let as_image = if lossy { history::Want::ImageLossy { strip, target } } else { history::Want::ImageLossless { strip } };
-                                if inner.history.contains_content(&h, as_image) {
-                                    let mode = inner.history.content_image_mode(&h).unwrap_or(image::mode_at(lossy, strip, target));
-                                    inner.history.add_image(&file, mode);
-                                }
-                            }
-                        }
-                        // Remembered for the strongest pass its content had (covering the
-                        // one asked for: `covered_by`), not just the one asked at this scan.
-                        history::Want::ImageLossy { strip, target } => {
-                            let mode = inner.history.content_image_mode(&h).unwrap_or(image::mode_at(true, strip, target));
-                            inner.history.add_image(&file, mode);
-                        }
-                        history::Want::ImageLossless { strip } => {
-                            let mode = inner.history.content_image_mode(&h).unwrap_or(image::mode(false, strip));
-                            inner.history.add_image(&file, mode);
-                        }
-                    }
+                let Some(h) = hash else { continue };
+                let gif_image = (want == history::Pass::Video && args::is_gif(&file)).then(|| inner.image_pass_for(&file));
+                if inner.history.recognise_content(&file, &h, want, gif_image) {
                     hits += 1;
                 }
             }
@@ -191,7 +161,7 @@ impl Engine {
             }
             inner.history.clear();
             inner.rebuild_queue();
-            inner.status = if inner.dir.is_some() {
+            inner.status = if inner.queue.has_dir() {
                 Status::Ready
             } else {
                 Status::Idle

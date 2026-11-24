@@ -101,6 +101,21 @@ impl Tools {
         self
     }
 
+    /// Whether the visually-lossless tools required by `kind` are installed.
+    pub fn supports_lossy(&self, kind: crate::format::Kind) -> bool {
+        use crate::format::LossyTools;
+        let jpeg_encoder = self.has("djpeg") && (self.has("cjpegli") || self.has("cjpeg"));
+        let (png, jpg) = (self.has("beeim") || self.has("pingo"), jpeg_encoder || self.has("pingo"));
+        self.has("ssimulacra2")
+            && match kind.spec().lossy_tools {
+                LossyTools::Png => png,
+                LossyTools::Jpg => jpg,
+                LossyTools::BothPictures => png && jpg,
+                LossyTools::Pdf => self.has("mutool") && jpeg_encoder,
+                LossyTools::None => true,
+            }
+    }
+
     /// e.g. "found: beeim, oxipng, ... | missing: pingo, ect"
     pub fn summary(&self) -> String {
         let (found, missing): (Vec<&str>, Vec<&str>) = NAMES.iter().partition(|n| self.has(n));
@@ -114,9 +129,8 @@ impl Tools {
                 self.behind_shims.join(", ")
             ));
         }
-        // What `image::lossy_tools_present` decides per file, said once.
-        let no_png = !self.has("beeim") && !self.has("pingo");
-        let no_jpg = !(self.has("djpeg") && (self.has("cjpegli") || self.has("cjpeg"))) && !self.has("pingo");
+        let no_png = !self.supports_lossy(crate::format::Kind::Png);
+        let no_jpg = !self.supports_lossy(crate::format::Kind::Jpg);
         let what = match (self.has("ssimulacra2"), no_png, no_jpg) {
             (false, ..) | (true, true, true) => Some("pictures (needs ssimulacra2, and pingo or beeim for PNG, cjpegli or cjpeg for JPEG)"),
             (true, true, false) => Some("PNG, comics and cover art (needs pingo or beeim)"),
@@ -351,54 +365,7 @@ impl Progress {
     }
 }
 
-/// CPU slots shared by the image workers: each file being processed holds one, and a job
-/// with many parts (a comic's pages) borrows the idle ones, so the parts run in parallel
-/// without ever running more tools at once than there are workers.
-#[derive(Debug)]
-pub struct Slots {
-    free: std::sync::Mutex<usize>,
-    freed: std::sync::Condvar,
-}
-
-impl Slots {
-    pub fn new(n: usize) -> std::sync::Arc<Self> {
-        std::sync::Arc::new(Self { free: std::sync::Mutex::new(n), freed: std::sync::Condvar::new() })
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, usize> {
-        self.free.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// Waits for a slot. Blocking; false if Stop was pressed meanwhile.
-    pub fn acquire(&self, gate: &Gate) -> bool {
-        let mut free = self.lock();
-        loop {
-            if gate.is_cancelled() {
-                return false;
-            }
-            if *free > 0 {
-                *free -= 1;
-                return true;
-            }
-            free = self.freed.wait_timeout(free, Duration::from_millis(200)).map_or_else(|e| e.into_inner().0, |r| r.0);
-        }
-    }
-
-    /// Takes up to `max` idle slots without waiting; returns how many.
-    pub fn borrow_idle(&self, max: usize) -> usize {
-        let mut free = self.lock();
-        let n = (*free).min(max);
-        *free -= n;
-        n
-    }
-
-    pub fn release(&self, n: usize) {
-        if n > 0 {
-            *self.lock() += n;
-            self.freed.notify_all();
-        }
-    }
-}
+pub use crate::budget::Slots;
 
 #[derive(Debug)]
 pub enum RunError {

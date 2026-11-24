@@ -20,12 +20,18 @@ fn bench_folder() {
     let rt = runtime();
     let (engine, rec) = new_engine(&rt, &root, ff);
     // MEDIAOPTI_BENCH_CONVERT=1: conversions on (BMP/TGA -> PNG, WAV -> FLAC, CBR -> CBZ).
-    let convert = std::env::var("MEDIAOPTI_BENCH_CONVERT").ok().and_then(|e| e.parse().ok());
+    let convert = std::env::var("MEDIAOPTI_BENCH_CONVERT").ok().and_then(|e| e.parse::<u32>().ok()).is_some_and(|v| v != 0);
     // MEDIAOPTI_BENCH_DOCS=1: visually lossless PDF images.
-    let docs = std::env::var("MEDIAOPTI_BENCH_DOCS").ok().and_then(|e| e.parse().ok());
+    let docs = std::env::var("MEDIAOPTI_BENCH_DOCS").ok().and_then(|e| e.parse::<u32>().ok()).is_some_and(|v| v != 0);
     // MEDIAOPTI_BENCH_JOBS=<n>: parallel video encodes (default 2).
-    let jobs = std::env::var("MEDIAOPTI_BENCH_JOBS").ok().and_then(|e| e.parse().ok()).unwrap_or(2.0);
-    let raw = || RawOptions { images: Some(2), audio: Some(2), convert: convert.or(Some(0)), lossy_docs: docs.or(Some(0)), ..opts("av1_nvenc", jobs) };
+    let jobs: u32 = std::env::var("MEDIAOPTI_BENCH_JOBS").ok().and_then(|e| e.parse().ok()).unwrap_or(2);
+    let raw = || Options {
+        images: ImageMode::Lossy,
+        audio: ImageMode::Lossy,
+        convert: if convert { Conversions::ALL } else { Conversions::NONE },
+        lossy_docs: docs,
+        ..opts("av1_nvenc", jobs)
+    };
     let t = std::time::Instant::now();
     rt.block_on(async {
         engine.apply_options(raw());
@@ -70,20 +76,28 @@ fn real_folder_run() {
     let rec = Arc::new(Recorder::default());
     let engine = Engine::new(Box::new(RecorderUi(rec.clone())), Path::new(&data), ff, rt.handle().clone());
     // The author's batchviproc settings (AV1, quality 20) and mediaopti's defaults otherwise.
-    let raw = || RawOptions {
-        crf: Some(20.0),
-        preset: Some("slow".into()),
-        encoder: Some("av1_nvenc".into()),
-        concurrency: Some(std::env::var("MEDIAOPTI_BENCH_JOBS").ok().and_then(|v| v.parse().ok()).unwrap_or(2.0)),
-        originals: Some(2),
-        gif_min_mb: Some(1),
-        vmaf_floor: Some(93),
-        // MEDIAOPTI_REAL_IMAGES=<n>: the Images setting (2 = >= 93, 3 = >= 85, 4 = >= 80).
-        images: Some(std::env::var("MEDIAOPTI_REAL_IMAGES").ok().and_then(|v| v.parse().ok()).unwrap_or(2)),
-        convert: Some(1),
-        lossy_docs: Some(1),
-        audio: Some(2),
-        ..RawOptions::default()
+    let real_images: u32 = std::env::var("MEDIAOPTI_REAL_IMAGES").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+    let (images, image_target) = match real_images {
+        0 => (ImageMode::Off, 93),
+        1 => (ImageMode::Lossless, 93),
+        3 => (ImageMode::Lossy, 85),
+        4 => (ImageMode::Lossy, 80),
+        _ => (ImageMode::Lossy, 93),
+    };
+    let raw = || Options {
+        crf: 20,
+        preset: "slow".into(),
+        encoder: "av1_nvenc".into(),
+        concurrency: std::env::var("MEDIAOPTI_BENCH_JOBS").ok().and_then(|v| v.parse().ok()).unwrap_or(2),
+        originals: Originals::BackupFolder(None),
+        gif_min_bytes: 1024 * 1024,
+        vmaf_floor: Some(93.0),
+        images,
+        image_target,
+        convert: Conversions::ALL,
+        lossy_docs: true,
+        audio: ImageMode::Lossy,
+        ..Options::default()
     };
     let t = std::time::Instant::now();
     rt.block_on(async {

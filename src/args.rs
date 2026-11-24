@@ -2,16 +2,9 @@
 
 use std::path::{Path, PathBuf};
 
-pub const VIDEO_EXTENSIONS: &[&str] = &[
-    "mp4", "mts", "m2ts", "flv", "m4v", "mkv", "mov", "webm", "avi", "wmv", "ts", "3gp", "mpg",
-    "mpeg", "gif", "webp", "bik", "xmv", "ogv", "asf", "pss",
-];
-
-/// Legacy/non-MP4 containers that remux cleanly into .mp4
-const REMUX_TO_MP4_EXTS: &[&str] = &[
-    "mts", "m2ts", "flv", "webm", "m4v", "mov", "avi", "wmv", "ts", "3gp", "mpg", "mpeg", "gif",
-    "webp", "bik", "xmv", "ogv", "asf", "pss",
-];
+pub use crate::format::{ext_lower, is_animated_picture, is_gif, is_webp, REMUX_TO_MP4_EXTS};
+#[cfg(test)]
+pub use crate::format::is_video_file;
 
 
 const ALLOWED_CRF: &[u32] = &[20, 23, 26];
@@ -28,9 +21,10 @@ const ALLOWED_CONCURRENCY: &[u32] = &[1, 2, 3, 4];
 /// GIF size limits in MB: GIFs below the limit stay GIFs (the image engine optimizes them).
 /// `NO_GIFS` means GIFs are never converted to video.
 pub const NO_GIFS: u32 = u32::MAX;
-const ALLOWED_GIF_MIN_MB: &[u32] = &[0, 1, 5, NO_GIFS];
+pub const ALLOWED_GIF_MIN_MB: &[u32] = &[0, 1, 5, NO_GIFS];
 /// VMAF floors for the quality-checked fallback; 0 turns it off.
-const ALLOWED_VMAF_FLOOR: &[u32] = &[0, 93, 95];
+pub const ALLOWED_VMAF_FLOOR: &[u32] = &[0, 93, 95];
+const ALLOWED_IMAGE_TARGETS: &[u32] = &[80, 85, 93];
 
 /// What happens to an original once a smaller version replaces it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,12 +59,8 @@ pub struct Conversions {
 
 impl Conversions {
     pub const ALL: Self = Self { wav: true, images: true, cbr: true };
+    #[cfg(test)]
     pub const NONE: Self = Self { wav: false, images: false, cbr: false };
-
-    /// From a bit mask: 1 = WAV, 2 = BMP/TGA, 4 = CBR.
-    pub fn from_mask(m: u32) -> Self {
-        Self { wav: m & 1 != 0, images: m & 2 != 0, cbr: m & 4 != 0 }
-    }
 }
 
 /// What a video file holds besides its main picture, as `ffmpeg -i` lists it: carried into
@@ -331,16 +321,8 @@ pub struct Options {
     /// When the preset output is not smaller, retry with stronger settings and accept the
     /// result only if its VMAF stays at or above this floor. `None`: no retry.
     pub vmaf_floor: Option<f64>,
-    /// Added to the CQ/CRF for the quality-checked retry (0 for the normal encode).
-    pub cq_boost: u32,
-    /// Decode on the GPU (NVDEC) and scale there to this fixed size (set per attempt, only
-    /// for inputs whose decoded frames were checked to match the CPU's: see
-    /// `Engine::gpu_decodable`). Fixed, because NVENC crops silently when the frame size
-    /// changes mid-stream; scaling every frame to the first one's size is what the CPU
-    /// path does too.
-    pub gpu_decode: Option<(u32, u32)>,
     pub images: ImageMode,
-    /// The SSIMULACRA2 floor of lossy pictures (`image::IMAGE_TARGETS`: 93, 85 or 80). Audio
+    /// The SSIMULACRA2 floor of lossy pictures (`image::DEFAULT_TARGET`: 93, 85 or 80). Audio
     /// cover art and PDF pictures keep 93.
     pub image_target: u32,
     /// Lossless format conversions (WAV -> FLAC, BMP/TGA -> PNG, CBR -> CBZ), each on or off.
@@ -359,7 +341,7 @@ pub struct Options {
     pub temp_dir: Option<PathBuf>,
     /// Rename pictures whose extension doesn't match their format (a JPEG named .png).
     pub fix_ext: bool,
-    /// Advanced: GPU decoding allowed (see `Engine::gpu_decodable`).
+    /// Advanced: GPU decoding allowed (see `Engine::gpu_decode_for`).
     pub gpu_decoding: bool,
     /// Advanced: the maximum-effort parts in use.
     pub max: crate::image::Max,
@@ -371,8 +353,6 @@ pub struct Options {
     pub strip: bool,
     /// Advanced: with `strip`, files processed without it are done again.
     pub redo_stripped: bool,
-    /// What the file being encoded holds besides its picture (set per job).
-    pub streams: Streams,
 }
 
 impl Default for Options {
@@ -385,8 +365,6 @@ impl Default for Options {
             originals: Originals::RecycleBin,
             gif_min_bytes: 1024 * 1024,
             vmaf_floor: Some(93.0),
-            cq_boost: 0,
-            gpu_decode: None,
             images: ImageMode::Lossy,
             image_target: crate::image::DEFAULT_TARGET,
             convert: Conversions::ALL,
@@ -401,170 +379,68 @@ impl Default for Options {
             drop_data: false,
             strip: false,
             redo_stripped: false,
-            streams: Streams::default(),
         }
     }
-}
-
-/// Options as sent by the UI; anything missing or invalid falls back to the defaults.
-#[derive(Debug, Default)]
-pub struct RawOptions {
-    pub crf: Option<f64>,
-    pub preset: Option<String>,
-    pub encoder: Option<String>,
-    pub concurrency: Option<f64>,
-    /// 0 = delete, 1 = Recycle Bin, 2 = backup folder (`backup_dir`, empty = default).
-    pub originals: Option<u32>,
-    pub backup_dir: Option<String>,
-    pub gif_min_mb: Option<u32>,
-    pub vmaf_floor: Option<u32>,
-    /// 0 = off, 1 = lossless, 2 = lossy (visually lossless, SSIMULACRA2 >= 93), 3 = lossy at
-    /// 85, 4 = lossy at 80.
-    pub images: Option<u32>,
-    /// The Images quality selector (as `images`, 1-4) even when Images is off: it sets the
-    /// floor of cover art too. `None` = taken from `images`.
-    pub image_level: Option<u32>,
-    /// 0 = keep file formats, anything else = all conversions (older settings); see
-    /// `conversions` for each one.
-    pub convert: Option<u32>,
-    /// Conversions as a bit mask (1 = WAV -> FLAC, 2 = BMP/TGA -> PNG, 4 = CBR -> CBZ); wins
-    /// over `convert`.
-    pub conversions: Option<u32>,
-    /// 0 = skip videos.
-    pub videos: Option<u32>,
-    /// 0 = skip documents.
-    pub docs: Option<u32>,
-    /// 0 = PDFs lossless only, 1 = visually lossless PDF images.
-    pub lossy_docs: Option<u32>,
-    /// 0 = off, 1 = lossless, 2 = cover art visually lossless.
-    pub audio: Option<u32>,
-    /// Folder for work files; empty = the system temp folder.
-    pub temp_dir: Option<String>,
-    /// 1 = rename misnamed pictures to their real format.
-    pub fix_ext: Option<u32>,
-    /// Advanced: 0 = never decode on the GPU.
-    pub gpu_decoding: Option<u32>,
-    /// Advanced: the maximum-effort parts in use (`image::Max` field names); `None` = the
-    /// measured choice.
-    pub max_parts: Option<Vec<String>>,
-    /// Advanced: 1 = leave out data tracks that can't be carried over.
-    pub drop_data: Option<u32>,
-    /// Advanced: 1 = remove metadata.
-    pub strip: Option<u32>,
-    /// Advanced: 1 = redo files processed without removing metadata.
-    pub redo_stripped: Option<u32>,
 }
 
 impl Options {
-    pub fn normalize(raw: RawOptions) -> Self {
+    /// Clamps any out-of-range values back to defaults and clears blank folder paths.
+    pub fn validated(mut self) -> Self {
         let d = Options::default();
-        let crf = raw.crf.map(|v| v as u32).filter(|v| ALLOWED_CRF.contains(v));
-        let concurrency = raw
-            .concurrency
-            .map(|v| v as u32)
-            .filter(|v| ALLOWED_CONCURRENCY.contains(v));
-        let preset = raw.preset.filter(|p| ALLOWED_PRESETS.contains(&p.as_str()));
-        let encoder = raw.encoder.filter(|e| ALLOWED_ENCODERS.contains(&e.as_str()));
-        let gif_min_bytes = raw
-            .gif_min_mb
-            .filter(|v| ALLOWED_GIF_MIN_MB.contains(v))
-            .map_or(d.gif_min_bytes, |mb| {
-                if mb == NO_GIFS { u64::MAX } else { u64::from(mb) * 1024 * 1024 }
-            });
-        let vmaf_floor = match raw.vmaf_floor.filter(|v| ALLOWED_VMAF_FLOOR.contains(v)) {
-            Some(0) => None,
-            Some(v) => Some(f64::from(v)),
-            None => d.vmaf_floor,
-        };
-        Self {
-            crf: crf.unwrap_or(d.crf),
-            preset: preset.unwrap_or(d.preset),
-            encoder: encoder.unwrap_or(d.encoder),
-            concurrency: concurrency.unwrap_or(d.concurrency),
-            originals: match raw.originals {
-                Some(0) => Originals::Delete,
-                Some(2) => Originals::BackupFolder(
-                    raw.backup_dir.filter(|d| !d.trim().is_empty()).map(PathBuf::from),
-                ),
-                Some(1) => Originals::RecycleBin,
-                _ => d.originals,
-            },
-            gif_min_bytes,
-            vmaf_floor,
-            cq_boost: 0,
-            gpu_decode: None,
-            images: match raw.images {
-                Some(0) => ImageMode::Off,
-                Some(1) => ImageMode::Lossless,
-                Some(2..=4) => ImageMode::Lossy,
-                _ => d.images,
-            },
-            image_target: match raw.image_level.or(raw.images) {
-                Some(3) => 85,
-                Some(4) => 80,
-                _ => d.image_target,
-            },
-            convert: match (raw.conversions, raw.convert) {
-                (Some(mask), _) => Conversions::from_mask(mask),
-                (None, Some(0)) => Conversions::NONE,
-                (None, Some(_)) => Conversions::ALL,
-                (None, None) => d.convert,
-            },
-            videos: raw.videos.map_or(d.videos, |v| v != 0),
-            docs: raw.docs.map_or(d.docs, |v| v != 0),
-            lossy_docs: raw.lossy_docs.map_or(d.lossy_docs, |c| c != 0),
-            audio: match raw.audio {
-                Some(0) => ImageMode::Off,
-                Some(1) => ImageMode::Lossless,
-                Some(2) => ImageMode::Lossy,
-                _ => d.audio,
-            },
-            temp_dir: raw.temp_dir.filter(|t| !t.trim().is_empty()).map(PathBuf::from),
-            fix_ext: raw.fix_ext.map_or(d.fix_ext, |f| f != 0),
-            gpu_decoding: raw.gpu_decoding.map_or(d.gpu_decoding, |g| g != 0),
-            max: raw.max_parts.map_or(d.max, |names| crate::image::Max::from_names(&names.iter().map(String::as_str).collect::<Vec<_>>())),
-            drop_data: raw.drop_data.map_or(d.drop_data, |v| v != 0),
-            strip: raw.strip.map_or(d.strip, |v| v != 0),
-            redo_stripped: raw.redo_stripped.map_or(d.redo_stripped, |v| v != 0),
-            streams: Streams::default(),
+        if !ALLOWED_CRF.contains(&self.crf) {
+            self.crf = d.crf;
         }
+        if !ALLOWED_PRESETS.contains(&self.preset.as_str()) {
+            self.preset = d.preset;
+        }
+        if !ALLOWED_ENCODERS.contains(&self.encoder.as_str()) {
+            self.encoder = d.encoder;
+        }
+        if !ALLOWED_CONCURRENCY.contains(&self.concurrency) {
+            self.concurrency = d.concurrency;
+        }
+        if !ALLOWED_IMAGE_TARGETS.contains(&self.image_target) {
+            self.image_target = d.image_target;
+        }
+        if self.vmaf_floor.is_some_and(|v| !ALLOWED_VMAF_FLOOR.iter().skip(1).any(|&f| f64::from(f) == v)) {
+            self.vmaf_floor = d.vmaf_floor;
+        }
+        if let Originals::BackupFolder(ref mut dir) = self.originals {
+            if dir.as_ref().is_some_and(|p| p.as_os_str().to_string_lossy().trim().is_empty()) {
+                *dir = None;
+            }
+        }
+        if self.temp_dir.as_ref().is_some_and(|p| p.as_os_str().to_string_lossy().trim().is_empty()) {
+            self.temp_dir = None;
+        }
+        self
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Mode {
+    #[default]
     Primary,
     TranscodeAudio,
     CpuFallback,
 }
 
-pub fn ext_lower(path: &Path) -> String {
-    path.extension()
-        .map_or_default(|e| e.to_string_lossy().to_lowercase())
-}
-
-pub fn is_gif(path: &Path) -> bool {
-    ext_lower(path) == "gif"
-}
-
-pub fn is_webp(path: &Path) -> bool {
-    ext_lower(path) == "webp"
-}
-
-/// Animated picture formats converted to video when animated (GIF, WebP).
-pub fn is_animated_picture(path: &Path) -> bool {
-    is_gif(path) || is_webp(path)
+/// Per-attempt encoding parameters (kept separate from immutable batch [`Options`]).
+#[derive(Clone, Debug, Default)]
+pub struct EncodePlan {
+    pub mode: Mode,
+    /// Added to the CQ/CRF for the quality-checked retry (0 for the normal encode).
+    pub cq_boost: u32,
+    /// Decode on the GPU (NVDEC) and scale there to this fixed size when checked safe.
+    pub gpu_decode: Option<(u32, u32)>,
+    /// What the file being encoded holds besides its picture.
+    pub streams: Streams,
 }
 
 /// Audio codecs that neither MP4 nor MKV can stream-copy (e.g. Bink game audio): transcoded
 /// directly to AAC at 96 kb/s per channel so every track survives.
 pub fn is_non_copyable_audio(codec: &str) -> bool {
     matches!(codec, "binkaudio_dct" | "binkaudio_rdft")
-}
-
-
-pub fn is_video_file(path: &Path) -> bool {
-    VIDEO_EXTENSIONS.contains(&ext_lower(path).as_str())
 }
 
 /// `<dir>/<stem>.mediaopti.w<id><ext>`, switching legacy containers to `.mp4`.
@@ -598,12 +474,14 @@ fn s(items: &[&str]) -> Vec<String> {
     items.iter().map(ToString::to_string).collect()
 }
 
-pub fn build_ffmpeg_args(input: &Path, tmp: &Path, options: &Options, mode: Mode) -> Vec<String> {
+pub fn build_ffmpeg_args(input: &Path, tmp: &Path, options: &Options, plan: &EncodePlan) -> Vec<String> {
     let input = input.to_string_lossy().into_owned();
     let tmp = tmp.to_string_lossy().into_owned();
     // x264 CRF and NVENC CQ both top out at 51 (AV1 NVENC at 63); the boost only applies to
     // the quality-checked retry.
-    let boost = options.cq_boost;
+    let boost = plan.cq_boost;
+    let mode = plan.mode;
+    let streams = &plan.streams;
     let crf = options.crf;
     let x264_crf = (crf + boost).min(51);
     let preset = options.preset.as_str();
@@ -619,7 +497,7 @@ pub fn build_ffmpeg_args(input: &Path, tmp: &Path, options: &Options, mode: Mode
     let x264_audio = if gif {
         s(&["-an"])
     } else {
-        copy_audio(options)
+        copy_audio(streams)
     };
 
     // Everything else the file holds is carried over: subtitles, attachments (MKV only: the
@@ -630,7 +508,7 @@ pub fn build_ffmpeg_args(input: &Path, tmp: &Path, options: &Options, mode: Mode
         if ext_lower(Path::new(&tmp)) == "mkv" {
             keep.extend(s(&["-map", "0:t?"]));
         }
-        for (k, index) in options.streams.covers.iter().enumerate() {
+        for (k, index) in streams.covers.iter().enumerate() {
             let n = k + 1; // output video 0 is the encoded picture
             keep.extend(["-map".into(), format!("0:{index}"), format!("-c:v:{n}"), "copy".into(), format!("-disposition:v:{n}"), "attached_pic".into()]);
         }
@@ -641,7 +519,7 @@ pub fn build_ffmpeg_args(input: &Path, tmp: &Path, options: &Options, mode: Mode
     // Software CPU fallback for tiny GIFs/stickers or streams rejected by NVENC.
     if mode == Mode::CpuFallback {
         args.extend(s(&["-i", &input, "-map", "0:V:0"]));
-        args.extend(tag_flags(options));
+        args.extend(tag_flags(streams));
         args.extend(even_scale);
         args.extend(s(&["-c:v", "libx264", "-preset", "slow", "-crf", &x264_crf.to_string(), "-pix_fmt", "yuv420p"]));
         if gif {
@@ -651,11 +529,11 @@ pub fn build_ffmpeg_args(input: &Path, tmp: &Path, options: &Options, mode: Mode
             // (FreeYourself.wmv): constant frame rate and a deep muxing queue. The audio is
             // carried over as in the normal encode (this is a fallback for the picture).
             args.extend(s(&["-fps_mode", "cfr", "-max_muxing_queue_size", "4096"]));
-            args.extend(copy_audio(options));
+            args.extend(copy_audio(streams));
         }
         args.extend(keep.clone());
         args.extend(s(&["-movflags", "+faststart+use_metadata_tags", "-y", &tmp]));
-        return streams_specific(args, options);
+        return streams_specific(args, streams);
     }
 
     let audio_flags = if gif {
@@ -666,24 +544,24 @@ pub fn build_ffmpeg_args(input: &Path, tmp: &Path, options: &Options, mode: Mode
         // above transparency for ffmpeg's AAC; the source here is old lossy audio (WMA, MP3)
         // at or below that, so the second generation is not audibly worse.
         let mut a = s(&["-fps_mode", "cfr", "-max_muxing_queue_size", "4096", "-map", "0:a?", "-af", "aresample=async=1:first_pts=0", "-c:a", "aac"]);
-        for (i, ch) in options.streams.audio_channels.iter().enumerate() {
+        for (i, ch) in streams.audio_channels.iter().enumerate() {
             a.extend([format!("-b:a:{i}"), format!("{}k", 96 * (*ch).max(1))]);
         }
-        if options.streams.audio_channels.is_empty() {
+        if streams.audio_channels.is_empty() {
             a.extend(s(&["-b:a", "192k"]));
         }
         a
     } else {
-        copy_audio(options)
+        copy_audio(streams)
     };
 
     let nvenc = |codec: &str, cq: u32, aq: &str, bf: &str, ten_bit: bool| {
         // GPU decode only feeds the 10-bit encoders: scale_cuda converts to P010 there, and
         // for 4:2:0 input it hands the encoder the same frames as the CPU path (checked).
-        let gpu = options.gpu_decode.filter(|_| ten_bit);
+        let gpu = plan.gpu_decode.filter(|_| ten_bit);
         let mut a = if gpu.is_some() { s(&["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]) } else { Vec::new() };
         a.extend(s(&["-i", &input, "-map", "0:V:0"]));
-        a.extend(tag_flags(options));
+        a.extend(tag_flags(streams));
         if let Some((w, h)) = gpu {
             a.extend(s(&["-vf", &format!("scale_cuda=w={w}:h={h}:format=p010le")]));
         } else {
@@ -721,7 +599,7 @@ pub fn build_ffmpeg_args(input: &Path, tmp: &Path, options: &Options, mode: Mode
             args.extend(s(&["-i", &input, "-map", "0:V:0"]));
             args.extend(even_scale);
             args.extend(s(&["-vcodec", "libx264", "-preset", preset, "-crf", &x264_crf.to_string()]));
-            args.extend(tag_flags(options));
+            args.extend(tag_flags(streams));
             args.extend(x264_audio);
             args.extend(keep);
             args.extend(s(&["-movflags", "+use_metadata_tags", "-y", &tmp]));
@@ -736,18 +614,18 @@ pub fn build_ffmpeg_args(input: &Path, tmp: &Path, options: &Options, mode: Mode
             args.drain(i..i + 2);
         }
     }
-    streams_specific(args, options)
+    streams_specific(args, streams)
 }
 
 /// The input's tags carried over (with `use_metadata_tags`, MP4/MOV keep every key, e.g.
 /// the iPhone's place, make and model), minus the old format's bookkeeping, and the
 /// recording date given as one value (else MKV drops a doubled QuickTime date).
-fn tag_flags(options: &Options) -> Vec<String> {
+fn tag_flags(streams: &Streams) -> Vec<String> {
     let mut a = s(&["-map_metadata", "0"]);
     for own in &OWN_TAGS[..3] {
         a.extend(["-metadata".into(), format!("{own}=")]);
     }
-    if let Some(t) = options.streams.creation_time() {
+    if let Some(t) = streams.creation_time() {
         a.extend(["-metadata".into(), format!("creation_time={t}")]);
     }
     a
@@ -756,13 +634,13 @@ fn tag_flags(options: &Options) -> Vec<String> {
 /// Every audio track copied as it is; integer PCM becomes FLAC (lossless, about half the
 /// size, and checked by decoding before the original is replaced); non-copyable game audio
 /// (Bink) becomes AAC at 96 kb/s per channel.
-fn copy_audio(options: &Options) -> Vec<String> {
+fn copy_audio(streams: &Streams) -> Vec<String> {
     let mut a = s(&["-map", "0:a?", "-c:a", "copy"]);
-    for (i, codec) in options.streams.audio_codecs.iter().enumerate() {
+    for (i, codec) in streams.audio_codecs.iter().enumerate() {
         if is_integer_pcm(codec) {
             a.extend([format!("-c:a:{i}"), "flac".into()]);
         } else if is_non_copyable_audio(codec) {
-            let ch = options.streams.audio_channels.get(i).copied().unwrap_or(1).max(1);
+            let ch = streams.audio_channels.get(i).copied().unwrap_or(1).max(1);
             a.extend([format!("-c:a:{i}"), "aac".into(), format!("-b:a:{i}"), format!("{}k", 96 * ch)]);
         }
     }
@@ -771,8 +649,8 @@ fn copy_audio(options: &Options) -> Vec<String> {
 
 /// With cover pictures copied as extra video streams, the filter and pixel format must name
 /// the encoded stream (a filter on a copied stream is an error).
-fn streams_specific(mut args: Vec<String>, options: &Options) -> Vec<String> {
-    if !options.streams.covers.is_empty() {
+fn streams_specific(mut args: Vec<String>, streams: &Streams) -> Vec<String> {
+    if !streams.covers.is_empty() {
         for a in &mut args {
             if a == "-vf" {
                 "-filter:v:0".clone_into(a);
@@ -794,65 +672,45 @@ mod tests {
         let p = Path::new(r"C:\v\a.mp4");
         let tmp = temp_name(p, 1);
         let mut o = Options { crf: 20, ..Options::default() };
-        o.cq_boost = 8;
-        assert!(build_ffmpeg_args(p, &tmp, &o, Mode::Primary).join(" ").contains("-cq 40"));
-        o.cq_boost = 60;
-        assert!(build_ffmpeg_args(p, &tmp, &o, Mode::Primary).join(" ").contains("-cq 63"));
+        let mut plan = EncodePlan { cq_boost: 8, ..EncodePlan::default() };
+        assert!(build_ffmpeg_args(p, &tmp, &o, &plan).join(" ").contains("-cq 40"));
+        plan.cq_boost = 60;
+        assert!(build_ffmpeg_args(p, &tmp, &o, &plan).join(" ").contains("-cq 63"));
         o.encoder = "libx264".into();
-        o.cq_boost = 8;
-        assert!(build_ffmpeg_args(p, &tmp, &o, Mode::Primary).join(" ").contains("-crf 28"));
-        assert!(build_ffmpeg_args(p, &tmp, &o, Mode::CpuFallback).join(" ").contains("-crf 28"));
+        plan.cq_boost = 8;
+        assert!(build_ffmpeg_args(p, &tmp, &o, &plan).join(" ").contains("-crf 28"));
+        plan.mode = Mode::CpuFallback;
+        assert!(build_ffmpeg_args(p, &tmp, &o, &plan).join(" ").contains("-crf 28"));
     }
 
     #[test]
     fn normalizes_invalid_options_to_defaults() {
-        let o = Options::normalize(RawOptions {
-            crf: Some(99.0),
-            preset: Some("bogus".into()),
-            encoder: Some("rm -rf".into()),
-            concurrency: Some(9.0),
-            originals: Some(9),
-            gif_min_mb: Some(3),
-            vmaf_floor: Some(50),
-            images: Some(7),
-            audio: Some(9),
-            temp_dir: Some("  ".into()),
-            ..RawOptions::default()
-        });
+        let o = Options {
+            crf: 99,
+            preset: "bogus".into(),
+            encoder: "rm -rf".into(),
+            concurrency: 9,
+            vmaf_floor: Some(50.0),
+            image_target: 77,
+            temp_dir: Some(PathBuf::from("  ")),
+            originals: Originals::BackupFolder(Some(PathBuf::from("   "))),
+            ..Options::default()
+        }
+        .validated();
         assert_eq!(o.audio, ImageMode::Lossy, "audio: cover art visually lossless by default");
         assert!(o.temp_dir.is_none() && !o.fix_ext);
+        assert_eq!(o.originals, Originals::BackupFolder(None), "blank backup_dir becomes default folder");
         assert_eq!(o.convert, Conversions::ALL, "conversions on by default");
         assert!(o.videos && o.docs);
         assert_eq!(o.images, ImageMode::Lossy, "images: visually lossless by default");
         assert_eq!(o.image_target, 93, "an unknown value keeps the default floor");
-        // The lower floors are lossy passes at 85 and 80.
-        for (v, t) in [(2, 93), (3, 85), (4, 80)] {
-            let o = Options::normalize(RawOptions { images: Some(v), ..RawOptions::default() });
-            assert_eq!((o.images, o.image_target), (ImageMode::Lossy, t));
-        }
-        // Images off keeps the chosen level for cover art; lossless only means 93.
-        for (level, t) in [(4, 80), (1, 93)] {
-            let o = Options::normalize(RawOptions { images: Some(0), image_level: Some(level), ..RawOptions::default() });
-            assert_eq!((o.images, o.image_target), (ImageMode::Off, t));
-        }
         assert_eq!(o.crf, 23);
         assert_eq!(o.preset, "slow");
         assert_eq!(o.encoder, "av1_nvenc");
         assert_eq!(o.concurrency, 4);
-        assert_eq!(o.originals, Originals::RecycleBin, "originals go to the Recycle Bin by default");
         assert_eq!(o.gif_min_bytes, 1024 * 1024);
         assert_eq!(o.vmaf_floor, Some(93.0));
-
-        let o = Options::normalize(RawOptions {
-            originals: Some(2),
-            backup_dir: Some(r"D:\old".into()),
-            gif_min_mb: Some(NO_GIFS),
-            vmaf_floor: Some(0),
-            ..RawOptions::default()
-        });
-        assert_eq!(o.originals, Originals::BackupFolder(Some(PathBuf::from(r"D:\old"))));
-        assert_eq!(o.gif_min_bytes, u64::MAX);
-        assert_eq!(o.vmaf_floor, None);
+        assert_eq!(Options::default().originals, Originals::RecycleBin, "originals go to the Recycle Bin by default");
     }
 
     #[test]
@@ -866,7 +724,7 @@ mod tests {
     #[test]
     fn av1_args_match_electron_version() {
         let o = Options::default();
-        let a = build_ffmpeg_args(Path::new("in.mp4"), Path::new("out.mp4"), &o, Mode::Primary);
+        let a = build_ffmpeg_args(Path::new("in.mp4"), Path::new("out.mp4"), &o, &EncodePlan::default());
         let joined = a.join(" ");
         assert!(joined.contains("-c:v av1_nvenc -preset p7 -tune hq -rc vbr -cq 36"));
         assert!(joined.contains("-aq-strength 5 -bf 4 -b_ref_mode middle -pix_fmt p010le"));
@@ -875,19 +733,21 @@ mod tests {
 
     #[test]
     fn gpu_decode_scales_on_the_gpu_for_10_bit_encoders_only() {
-        let o = Options { gpu_decode: Some((1920, 1080)), ..Options::default() };
-        let a = build_ffmpeg_args(Path::new("in.mp4"), Path::new("out.mp4"), &o, Mode::Primary).join(" ");
+        let o = Options::default();
+        let gpu = EncodePlan { gpu_decode: Some((1920, 1080)), ..EncodePlan::default() };
+        let a = build_ffmpeg_args(Path::new("in.mp4"), Path::new("out.mp4"), &o, &gpu).join(" ");
         assert!(a.contains("-hwaccel cuda -hwaccel_output_format cuda -i in.mp4"), "{a}");
         assert!(a.contains("-vf scale_cuda=w=1920:h=1080:format=p010le"), "{a}");
         // The filter may be rebuilt when the size changes (it scales to the fixed size).
         assert!(!a.contains("-reinit_filter 0"), "{a}");
         assert!(!a.contains("-pix_fmt") && !a.contains("-vf scale="), "{a}");
         // h264_nvenc (8-bit) and the CPU fallback keep decoding on the CPU.
-        let o = Options { gpu_decode: Some((1920, 1080)), encoder: "h264_nvenc".into(), ..Options::default() };
-        let a = build_ffmpeg_args(Path::new("in.mp4"), Path::new("out.mp4"), &o, Mode::Primary).join(" ");
+        let o = Options { encoder: "h264_nvenc".into(), ..Options::default() };
+        let a = build_ffmpeg_args(Path::new("in.mp4"), Path::new("out.mp4"), &o, &gpu).join(" ");
         assert!(!a.contains("hwaccel"), "{a}");
-        let o = Options { gpu_decode: Some((1920, 1080)), ..Options::default() };
-        let a = build_ffmpeg_args(Path::new("in.mp4"), Path::new("out.mp4"), &o, Mode::CpuFallback).join(" ");
+        let o = Options::default();
+        let cpu_plan = EncodePlan { mode: Mode::CpuFallback, ..gpu };
+        let a = build_ffmpeg_args(Path::new("in.mp4"), Path::new("out.mp4"), &o, &cpu_plan).join(" ");
         assert!(!a.contains("hwaccel"), "{a}");
     }
 
@@ -915,10 +775,11 @@ mod tests {
                                 ..Options::default()
                             };
                             let tmp = temp_name(Path::new(input), 1);
+                            let plan = EncodePlan { mode, ..EncodePlan::default() };
                             rows.push(serde_json::json!({
                                 "encoder": encoder, "crf": crf, "preset": preset, "mode": mode_name,
                                 "input": input, "tmp": tmp.to_string_lossy(),
-                                "args": build_ffmpeg_args(Path::new(input), &tmp, &o, mode),
+                                "args": build_ffmpeg_args(Path::new(input), &tmp, &o, &plan),
                             }));
                         }
                     }
@@ -931,12 +792,13 @@ mod tests {
     #[test]
     fn gif_drops_audio_and_cpu_fallback_uses_x264() {
         let o = Options::default();
-        let a = build_ffmpeg_args(Path::new("a.gif"), Path::new("a.mp4"), &o, Mode::CpuFallback);
+        let cpu = EncodePlan { mode: Mode::CpuFallback, ..EncodePlan::default() };
+        let a = build_ffmpeg_args(Path::new("a.gif"), Path::new("a.mp4"), &o, &cpu);
         let joined = a.join(" ");
         assert!(joined.contains("-c:v libx264 -preset slow -crf 23 -pix_fmt yuv420p -an"));
         assert!(!joined.contains("-fps_mode"), "GIFs keep their own frame timing");
 
-        let v = build_ffmpeg_args(Path::new("a.wmv"), Path::new("a.mp4"), &o, Mode::CpuFallback).join(" ");
+        let v = build_ffmpeg_args(Path::new("a.wmv"), Path::new("a.mp4"), &o, &cpu).join(" ");
         assert!(v.contains("-fps_mode cfr -max_muxing_queue_size 4096 -map 0:a? -c:a copy"), "{v}");
         assert!(!v.contains("aac") && !v.contains("-ac "), "audio is carried, not downmixed: {v}");
     }
@@ -1016,11 +878,12 @@ mod tests {
         assert_eq!(keys, ["creation_time", "com.apple.quicktime.location.iso6709", "com.apple.quicktime.make", "comment"], "stream tags and bookkeeping left out");
         assert_eq!(s.tags[3].1, "line one\nline two");
         assert_eq!(s.creation_time(), Some("2024-05-01T10:20:30.000000Z"));
-        let o = Options { streams: s, ..Options::default() };
-        let a = build_ffmpeg_args(Path::new("IMG_0001.MOV"), Path::new("out.mp4"), &o, Mode::Primary).join(" ");
+        let plan = EncodePlan { streams: s, ..EncodePlan::default() };
+        let o = Options::default();
+        let a = build_ffmpeg_args(Path::new("IMG_0001.MOV"), Path::new("out.mp4"), &o, &plan).join(" ");
         assert!(a.contains("-map_metadata 0 -metadata major_brand= -metadata minor_version= -metadata compatible_brands= -metadata creation_time=2024-05-01T10:20:30.000000Z"), "{a}");
         assert!(a.contains("-movflags +faststart+use_metadata_tags"), "{a}");
-        let x = build_ffmpeg_args(Path::new("IMG_0001.MOV"), Path::new("out.mp4"), &Options { encoder: "libx264".into(), ..o }, Mode::Primary).join(" ");
+        let x = build_ffmpeg_args(Path::new("IMG_0001.MOV"), Path::new("out.mp4"), &Options { encoder: "libx264".into(), ..o }, &plan).join(" ");
         assert!(x.contains("-map_metadata 0") && x.contains("+use_metadata_tags"), "{x}");
         let tiny = "  Stream #0:0[0x1](und): Video: h264 (High) (avc1 / 0x31637661), yuv420p(progressive), 74x74, 8 kb/s, 1.90 fps\n";
         assert_eq!(Streams::parse(tiny).size, Some((74, 74)));
@@ -1062,12 +925,14 @@ mod tests {
     #[test]
     fn audio_is_copied_pcm_becomes_flac_and_aac_keeps_channels() {
         let streams = Streams { audio_codecs: vec!["ac3".into(), "pcm_s16le".into()], audio_channels: vec![6, 2], ..Streams::default() };
-        let o = Options { streams, ..Options::default() };
-        let p = build_ffmpeg_args(Path::new("in.mov"), Path::new("out.mkv"), &o, Mode::Primary).join(" ");
+        let o = Options::default();
+        let plan = EncodePlan { streams, ..EncodePlan::default() };
+        let p = build_ffmpeg_args(Path::new("in.mov"), Path::new("out.mkv"), &o, &plan).join(" ");
         assert!(p.contains("-map 0:a? -c:a copy -c:a:1 flac") && !p.contains("-c:a:0"), "{p}");
-        let t = build_ffmpeg_args(Path::new("in.mov"), Path::new("out.mkv"), &o, Mode::TranscodeAudio).join(" ");
+        let t_plan = EncodePlan { mode: Mode::TranscodeAudio, ..plan.clone() };
+        let t = build_ffmpeg_args(Path::new("in.mov"), Path::new("out.mkv"), &o, &t_plan).join(" ");
         assert!(t.contains("-c:a aac -b:a:0 576k -b:a:1 192k") && !t.contains("-ac "), "{t}");
-        let x = build_ffmpeg_args(Path::new("in.mov"), Path::new("out.mkv"), &Options { encoder: "libx264".into(), ..o }, Mode::Primary).join(" ");
+        let x = build_ffmpeg_args(Path::new("in.mov"), Path::new("out.mkv"), &Options { encoder: "libx264".into(), ..o }, &plan).join(" ");
         assert!(x.contains("-map 0:a? -c:a copy -c:a:1 flac") && !x.contains("aac"), "{x}");
     }
 
@@ -1087,19 +952,21 @@ mod tests {
 
     #[test]
     fn everything_else_is_carried_over() {
-        let mut o = Options { streams: Streams { covers: vec![3], ..Streams::default() }, ..Options::default() };
-        let mkv = build_ffmpeg_args(Path::new("in.mkv"), Path::new("out.mkv"), &o, Mode::Primary).join(" ");
+        let o = Options::default();
+        let mut plan = EncodePlan { streams: Streams { covers: vec![3], ..Streams::default() }, ..EncodePlan::default() };
+        let mkv = build_ffmpeg_args(Path::new("in.mkv"), Path::new("out.mkv"), &o, &plan).join(" ");
         assert!(mkv.contains("-map 0:a? -c:a copy -map 0:s? -c:s copy -map 0:t? -map 0:3 -c:v:1 copy -disposition:v:1 attached_pic"), "{mkv}");
         assert!(mkv.contains("-filter:v:0 scale=") && mkv.contains("-pix_fmt:v:0 p010le") && !mkv.contains("-vf "), "{mkv}");
-        o.streams = Streams::default();
+        plan.streams = Streams::default();
         for mode in [Mode::TranscodeAudio, Mode::CpuFallback] {
-            let a = build_ffmpeg_args(Path::new("in.avi"), Path::new("out.mp4"), &o, mode).join(" ");
+            let p = EncodePlan { mode, ..plan.clone() };
+            let a = build_ffmpeg_args(Path::new("in.avi"), Path::new("out.mp4"), &o, &p).join(" ");
             assert!(a.contains("-map 0:a? ") && !a.contains("0:a:0") && !a.contains("-map_chapters"), "{a}");
             assert!(a.contains("-map 0:s? -c:s copy") && !a.contains("0:t?"), "no attachments in MP4: {a}");
         }
-        let gif = build_ffmpeg_args(Path::new("a.gif"), Path::new("a.mp4"), &o, Mode::Primary).join(" ");
+        let gif = build_ffmpeg_args(Path::new("a.gif"), Path::new("a.mp4"), &o, &plan).join(" ");
         assert!(!gif.contains("0:s?"), "{gif}");
-        let webp = build_ffmpeg_args(Path::new("a.webp"), Path::new("a.mp4"), &o, Mode::Primary).join(" ");
+        let webp = build_ffmpeg_args(Path::new("a.webp"), Path::new("a.mp4"), &o, &plan).join(" ");
         assert!(webp.contains(" -an ") && !webp.contains("0:s?"), "{webp}");
     }
 
@@ -1110,7 +977,8 @@ mod tests {
         }
         let bink = Streams { audio: 2, audio_codecs: vec!["binkaudio_dct".into(), "binkaudio_rdft".into()], audio_channels: vec![1, 2], ..Streams::default() };
         assert_eq!(output_ext(Path::new("cutscene.bik"), &bink), "mp4");
-        let args = build_ffmpeg_args(Path::new("cutscene.bik"), Path::new("cutscene.mp4"), &Options { streams: bink, ..Options::default() }, Mode::Primary).join(" ");
+        let bink_plan = EncodePlan { streams: bink, ..EncodePlan::default() };
+        let args = build_ffmpeg_args(Path::new("cutscene.bik"), Path::new("cutscene.mp4"), &Options::default(), &bink_plan).join(" ");
         assert!(args.contains("-c:a:0 aac -b:a:0 96k -c:a:1 aac -b:a:1 192k"), "{args}");
         let xmv = Streams { audio: 1, audio_codecs: vec!["pcm_s16le".into()], audio_channels: vec![2], ..Streams::default() };
         assert_eq!(output_ext(Path::new("intro.xmv"), &xmv), "mkv");

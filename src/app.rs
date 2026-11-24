@@ -3,7 +3,7 @@
 //! The engine runs on tokio threads and reports through the [`Ui`] trait; updates are
 //! collected in an inbox and applied on the UI thread in one batch per event-loop turn.
 
-use crate::args::{RawOptions, NO_GIFS};
+use crate::args::{Conversions, ImageMode, Options, Originals, ALLOWED_GIF_MIN_MB, ALLOWED_VMAF_FLOOR, NO_GIFS};
 use crate::engine::{Engine, StateDto, Status, Ui};
 use crate::system;
 use crate::taskbar::{Taskbar, TaskbarProgress};
@@ -115,7 +115,7 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
         engine.log(problem);
     }
     prefs.apply_to_window(&window);
-    engine.apply_options(prefs.to_raw());
+    engine.apply_options(prefs.to_options());
 
     // Models
     let log_model = Rc::new(VecModel::<LogLine>::default());
@@ -229,7 +229,7 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
             let prefs = Prefs { gpu_decoding: d.gpu_decoding, max_parts: d.max_parts, drop_data: d.drop_data, strip: d.strip, redo_stripped: d.redo_stripped, ..Prefs::from_window(&w) };
             prefs.apply_to_window(&w);
             prefs.save(&prefs_path);
-            engine.apply_options_in_background(prefs.to_raw());
+            engine.apply_options_in_background(prefs.to_options());
         });
     }
 
@@ -310,7 +310,7 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
             }
             let prefs = Prefs::from_window(&w);
             prefs.save(&prefs_path);
-            engine.start(prefs.to_raw());
+            engine.start(prefs.to_options());
         });
     }
     {
@@ -374,7 +374,7 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
             let prefs = Prefs { nav_compact: current.nav_compact, gpu_decoding: current.gpu_decoding, max_parts: current.max_parts, drop_data: current.drop_data, strip: current.strip, redo_stripped: current.redo_stripped, ..Prefs::default() };
             prefs.apply_to_window(&w);
             prefs.save(&prefs_path);
-            engine.apply_options_in_background(prefs.to_raw());
+            engine.apply_options_in_background(prefs.to_options());
         });
     }
     {
@@ -404,7 +404,7 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
                 last_encoder.borrow_mut().clone_from(&prefs.encoder);
             }
             prefs.save(&prefs_path);
-            engine.apply_options_in_background(prefs.to_raw());
+            engine.apply_options_in_background(prefs.to_options());
         });
     }
 
@@ -429,7 +429,7 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
                 w.set_temp_dir(dir.to_string_lossy().as_ref().into());
                 let prefs = Prefs::from_window(&w);
                 prefs.save(&prefs_path);
-                engine.apply_options_in_background(prefs.to_raw());
+                engine.apply_options_in_background(prefs.to_options());
             }
         });
         window.on_choose_backup_folder(move || {
@@ -445,7 +445,7 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
             w.set_backup_dir(dir.to_string_lossy().as_ref().into());
             let prefs = Prefs::from_window(&w);
             prefs.save(&prefs_path);
-            engine.apply_options_in_background(prefs.to_raw());
+            engine.apply_options_in_background(prefs.to_options());
         });
     }
 
@@ -499,11 +499,11 @@ pub fn run(data_dir: &Path, launch: Launch) -> Result<(), slint::PlatformError> 
     with_controller(Controller::render);
     if let Some(dir) = launch.folder {
         let engine = engine.clone();
-        let raw = prefs.to_raw();
+        let opts = prefs.to_options();
         runtime.spawn(async move {
             engine.load_dir(dir).await;
             if launch.start {
-                engine.run_batch(raw).await;
+                engine.run_batch(opts).await;
             }
         });
     }
@@ -551,7 +551,7 @@ fn save_advanced(w: &AppWindow, engine: &Arc<Engine>, prefs_path: &Path) {
     let prefs = Prefs::from_window(w);
     prefs.save(prefs_path);
     w.set_adv_default(prefs.advanced_are_defaults());
-    engine.apply_options_in_background(prefs.to_raw());
+    engine.apply_options_in_background(prefs.to_options());
 }
 
 /// Shows each tool's version on the About page, and newer pingo/beeim versions (looked for

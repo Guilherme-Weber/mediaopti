@@ -23,8 +23,82 @@ use std::path::{Path, PathBuf};
 type Hash = [u8; 32];
 pub type ContentHash = [u8; 16];
 
-/// Mode recorded for videos in the content history (imageopti uses e.g. `lossless-normal`).
-pub const VIDEO_MODE: &str = "video";
+/// Wire string recorded for videos in `processed-content.tsv`.
+const VIDEO_MODE: &str = "video";
+
+/// Visually-lossless SSIMULACRA2 quality floors stored in history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum QualityFloor {
+    Q80 = 80,
+    Q85 = 85,
+    Q93 = 93,
+}
+
+impl QualityFloor {
+    const ALL: [Self; 3] = [Self::Q93, Self::Q85, Self::Q80];
+
+    pub const fn from_target(target: u32) -> Self {
+        if target <= 80 {
+            Self::Q80
+        } else if target <= 85 {
+            Self::Q85
+        } else {
+            Self::Q93
+        }
+    }
+
+    const fn as_u32(self) -> u32 {
+        self as u32
+    }
+}
+
+/// What pass a file was processed with (or is about to be processed with).
+/// Wire strings (`"video"`, `"lossy-normal-t85-strip"`, ...) stay private to this module.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pass {
+    Video,
+    Image {
+        /// `None` = lossless; `Some(floor)` = lossy at that SSIMULACRA2 floor.
+        floor: Option<QualityFloor>,
+        /// Whether metadata was stripped (`-strip` modes).
+        strip: bool,
+    },
+}
+
+impl Pass {
+    pub const fn image(lossy: bool, strip: bool, target: u32) -> Self {
+        Self::Image { floor: if lossy { Some(QualityFloor::from_target(target)) } else { None }, strip }
+    }
+
+    /// Exact wire string stored in `processedFiles.txt` keys and `processed-content.tsv`
+    /// (compatible with imageopti and earlier mediaopti versions).
+    const fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::Video => VIDEO_MODE,
+            Self::Image { floor: None, strip: false } => "lossless-normal",
+            Self::Image { floor: None, strip: true } => "lossless-normal-strip",
+            Self::Image { floor: Some(QualityFloor::Q85), strip: false } => "lossy-normal-t85",
+            Self::Image { floor: Some(QualityFloor::Q85), strip: true } => "lossy-normal-t85-strip",
+            Self::Image { floor: Some(QualityFloor::Q80), strip: false } => "lossy-normal-t80",
+            Self::Image { floor: Some(QualityFloor::Q80), strip: true } => "lossy-normal-t80-strip",
+            Self::Image { floor: Some(QualityFloor::Q93), strip: false } => "lossy-normal-t93",
+            Self::Image { floor: Some(QualityFloor::Q93), strip: true } => "lossy-normal-t93-strip",
+        }
+    }
+
+    /// Same rule as imageopti: a lossy pass covers lossless requests and lossy ones at its
+    /// floor or above (lossy output is never re-encoded at a higher floor, so loss doesn't
+    /// stack needlessly); a lossless pass covers lossless.
+    fn covered_by(self, flags: u8) -> bool {
+        match self {
+            // Only a video pass: a big GIF optimized as an image (imageopti's history) is
+            // still to be made a video. (`gif_as_image` marks its result as tried too.)
+            Self::Video => flags & F_VIDEO != 0,
+            Self::Image { floor: None, strip } => flags & (F_LOSSLESS | ANY_LOSSY) != 0 && (!strip || flags & F_STRIP != 0),
+            Self::Image { floor: Some(target), strip } => flags & lossy_flag(target.as_u32()) != 0 && (!strip || flags & F_STRIP != 0),
+        }
+    }
+}
 
 // What a remembered file was processed as (bit flags; a file can have several).
 const F_VIDEO: u8 = 1;
@@ -64,31 +138,6 @@ fn mode_flag(mode: &str) -> u8 {
         floor | strip
     } else {
         F_LOSSLESS | strip
-    }
-}
-
-/// What a file is about to be processed as.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Want {
-    Video,
-    /// `strip`: only a pass that removed metadata counts (the "redo" option).
-    ImageLossless { strip: bool },
-    /// `target`: the lossy floor asked for (`image::IMAGE_TARGETS`).
-    ImageLossy { strip: bool, target: u32 },
-}
-
-impl Want {
-    /// Same rule as imageopti: a lossy pass covers lossless requests and lossy ones at its
-    /// floor or above (lossy output is never re-encoded at a higher floor, so loss doesn't
-    /// stack needlessly); a lossless pass covers lossless.
-    fn covered_by(self, flags: u8) -> bool {
-        match self {
-            // Only a video pass: a big GIF optimized as an image (imageopti's history) is
-            // still to be made a video. (`gif_as_image` marks its result as tried too.)
-            Want::Video => flags & F_VIDEO != 0,
-            Want::ImageLossless { strip } => flags & (F_LOSSLESS | ANY_LOSSY) != 0 && (!strip || flags & F_STRIP != 0),
-            Want::ImageLossy { strip, target } => flags & lossy_flag(target) != 0 && (!strip || flags & F_STRIP != 0),
-        }
     }
 }
 
@@ -217,52 +266,57 @@ impl History {
         self.hashes.len().max(self.content.len())
     }
 
-    /// Location check for a video.
-    pub fn contains(&self, file: &Path) -> bool {
-        self.hashes.contains(&hash_path(file))
+    /// Location check for any pass (video or image). A lossy pass covers lossless requests and
+    /// lossy requests at its own floor or higher; with `strip`, only stripped passes count.
+    pub fn contains_pass(&self, file: &Path, want: Pass) -> bool {
+        match want {
+            Pass::Video => self.hashes.contains(&hash_path(file)),
+            Pass::Image { floor, strip } => {
+                let stripped: &[bool] = if strip { &[true] } else { &[true, false] };
+                let mut covering = QualityFloor::ALL
+                    .iter()
+                    .copied()
+                    .filter(|&f| floor.is_none_or(|req| f <= req))
+                    .map(Some)
+                    .chain(floor.is_none().then_some(None));
+                // The path is hashed once; each mode continues from that state (a queue rebuild
+                // checks every file of the library, a few modes each).
+                let mut path_part = Sha256::new();
+                path_part.update(file.to_string_lossy().as_bytes());
+                path_part.update([0u8]);
+                covering.any(|f| {
+                    stripped.iter().any(|&s| {
+                        let mut h = path_part.clone();
+                        h.update(Pass::Image { floor: f, strip: s }.as_wire_str().as_bytes());
+                        let key: Hash = h.finalize().into();
+                        self.hashes.contains(&key)
+                    })
+                })
+            }
+        }
     }
 
-    /// Location check for an image to be processed lossily or not, at floor `target` (a lossy
-    /// entry also covers a lossless request). A lossy pass covers a lossy request at its own
-    /// floor or a higher one: a file done at 80 isn't redone at 93 (quality can't come
-    /// back), one done at 93 is redone at 80. With `strip`, only passes that removed
-    /// metadata count.
-    pub fn contains_image(&self, file: &Path, lossy: bool, strip: bool, target: u32) -> bool {
-        let stripped: &[bool] = if strip { &[true] } else { &[true, false] };
-        // (lossy, floor) of the passes that cover this request.
-        let mut passes = crate::image::IMAGE_TARGETS
-            .iter()
-            .filter(|&&t| !lossy || t <= target)
-            .map(|&t| (true, t))
-            .chain((!lossy).then_some((false, 0)));
-        // The path is hashed once; each mode continues from that state (a queue rebuild
-        // checks every file of the library, a few modes each).
-        let mut path_part = Sha256::new();
-        path_part.update(file.to_string_lossy().as_bytes());
-        path_part.update([0u8]);
-        passes.any(|(l, t)| {
-            stripped.iter().any(|&s| {
-                let mut h = path_part.clone();
-                h.update(crate::image::mode_at(l, s, t).as_bytes());
-                let key: Hash = h.finalize().into();
-                self.hashes.contains(&key)
-            })
-        })
+    /// Location check for a video.
+    pub fn contains(&self, file: &Path) -> bool {
+        self.contains_pass(file, Pass::Video)
     }
 
     /// Whether content of exactly this size had the pass `want` asks for (only such files are
     /// worth hashing: a hash can't match otherwise).
-    pub fn has_size(&self, size: u64, want: Want) -> bool {
+    pub fn has_size(&self, size: u64, want: Pass) -> bool {
         self.sizes.get(&size).is_some_and(|&f| want.covered_by(f))
     }
 
-    pub fn contains_content(&self, hash: &ContentHash, want: Want) -> bool {
+    pub fn contains_content(&self, hash: &ContentHash, want: Pass) -> bool {
         self.content.get(hash).is_some_and(|&f| want.covered_by(f))
     }
 
-    /// Remembers a video by location. Returns true if it was newly added.
-    pub fn add(&mut self, file: &Path) -> bool {
-        let hash = hash_path(file);
+    /// Remembers a file by location for `done`. Returns true if newly added.
+    pub fn add_pass(&mut self, file: &Path, done: Pass) -> bool {
+        let hash = match done {
+            Pass::Video => hash_path(file),
+            Pass::Image { .. } => hash_image_path(file, done.as_wire_str()),
+        };
         let added = self.hashes.insert(hash);
         if added {
             self.unsaved.push(hash);
@@ -270,36 +324,65 @@ impl History {
         added
     }
 
-    /// The strongest picture pass this content had, as a location mode (`lossy-normal-t80`
-    /// before t85 before t93 before lossless; `-strip` when a pass removed metadata): a moved
-    /// file is remembered for what it really had, not for the floor asked at the scan (done at
-    /// 80 and moved under 93, it would be done again once 80 was chosen).
-    pub fn content_image_mode(&self, hash: &ContentHash) -> Option<&'static str> {
-        let flags = *self.content.get(hash)?;
-        let strip = flags & F_STRIP != 0;
-        let (lossy, target) = if flags & F_LOSSY_80 != 0 {
-            (true, 80)
-        } else if flags & F_LOSSY_85 != 0 {
-            (true, 85)
-        } else if flags & F_LOSSY != 0 {
-            (true, 93)
-        } else if flags & F_LOSSLESS != 0 {
-            (false, 93)
-        } else {
-            return None;
-        };
-        Some(crate::image::mode_at(lossy, strip, target))
+    /// Remembers a video by location. Returns true if it was newly added.
+    pub fn add(&mut self, file: &Path) -> bool {
+        self.add_pass(file, Pass::Video)
     }
 
-    /// Remembers an image by location, for the mode it was processed in.
-    pub fn add_image(&mut self, file: &Path, mode: &str) {
-        let hash = hash_image_path(file, mode);
-        if self.hashes.insert(hash) {
-            self.unsaved.push(hash);
+    /// Marks `file` as covered for every image pass (used for a GIF that failed on the video
+    /// path so `place` never sends it to the GIF optimizer later).
+    pub fn add_all_image_passes(&mut self, file: &Path) {
+        let lowest = Some(QualityFloor::Q80);
+        for (floor, strip) in [(lowest, false), (None, false), (lowest, true), (None, true)] {
+            self.add_pass(file, Pass::Image { floor, strip });
         }
     }
 
-    pub fn add_content(&mut self, hash: ContentHash, size: u64, mode: &'static str) {
+    /// The strongest picture pass this content had (`Q80` before `Q85` before `Q93` before
+    /// lossless; `strip` when any pass removed metadata), so a moved file is remembered for
+    /// what it really had, not only for the floor asked at this scan.
+    pub fn strongest_image_pass(&self, hash: &ContentHash) -> Option<Pass> {
+        let flags = *self.content.get(hash)?;
+        let strip = flags & F_STRIP != 0;
+        let floor = if flags & F_LOSSY_80 != 0 {
+            Some(QualityFloor::Q80)
+        } else if flags & F_LOSSY_85 != 0 {
+            Some(QualityFloor::Q85)
+        } else if flags & F_LOSSY != 0 {
+            Some(QualityFloor::Q93)
+        } else if flags & F_LOSSLESS != 0 {
+            None
+        } else {
+            return None;
+        };
+        Some(Pass::Image { floor, strip })
+    }
+
+    /// If `hash` satisfies `want`, records `file` in the location history under the strongest
+    /// matching pass (and, for a GIF recognized as video, also records its image pass when
+    /// `gif_image` is covered). Returns true when recognized.
+    pub fn recognise_content(&mut self, file: &Path, hash: &ContentHash, want: Pass, gif_image: Option<Pass>) -> bool {
+        if !self.contains_content(hash, want) {
+            return false;
+        }
+        match want {
+            Pass::Video => {
+                self.add_pass(file, Pass::Video);
+                if let Some(as_image) = gif_image.filter(|&p| self.contains_content(hash, p)) {
+                    let done = self.strongest_image_pass(hash).unwrap_or(as_image);
+                    self.add_pass(file, done);
+                }
+            }
+            Pass::Image { .. } => {
+                let done = self.strongest_image_pass(hash).unwrap_or(want);
+                self.add_pass(file, done);
+            }
+        }
+        true
+    }
+
+    pub fn add_content(&mut self, hash: ContentHash, size: u64, done: Pass) {
+        let mode = done.as_wire_str();
         let flag = mode_flag(mode);
         let flags = self.content.entry(hash).or_insert(0);
         if *flags & flag != flag {
@@ -403,7 +486,8 @@ impl History {
 
     /// Adds content now and returns where and what to append so the caller can write it
     /// durably outside its lock ([`append_lines`]); `None` if it was already known.
-    pub fn add_content_now(&mut self, hash: ContentHash, size: u64, mode: &'static str) -> Option<(PathBuf, String)> {
+    pub fn add_content_now(&mut self, hash: ContentHash, size: u64, done: Pass) -> Option<(PathBuf, String)> {
+        let mode = done.as_wire_str();
         let flag = mode_flag(mode);
         let flags = self.content.entry(hash).or_insert(0);
         // Every bit of `flag` (a stripped lossy pass is F_LOSSY | F_STRIP), as `add_content`.
@@ -505,14 +589,22 @@ mod tests {
         for lossy in [false, true] {
             for strip in [false, true] {
                 let mut h = History::load(temp(&format!("modes-{lossy}-{strip}")).join("processedFiles.txt"));
-                h.hashes.insert(hash_image_path(file, crate::image::mode(lossy, strip)));
+                let done = Pass::image(lossy, strip, 93);
+                h.hashes.insert(hash_image_path(file, done.as_wire_str()));
                 // A lossy entry covers both requests; a stripped one covers any.
-                assert!(h.contains_image(file, lossy, strip, 93), "{lossy} {strip}");
-                assert_eq!(h.contains_image(file, true, strip, 93), lossy, "{lossy} {strip}");
-                assert_eq!(h.contains_image(file, lossy, true, 93), strip, "{lossy} {strip}");
-                assert!(!h.contains_image(Path::new(r"F:\other.png"), false, false, 93));
+                assert!(h.contains_pass(file, done), "{lossy} {strip}");
+                assert_eq!(h.contains_pass(file, Pass::image(true, strip, 93)), lossy, "{lossy} {strip}");
+                assert_eq!(h.contains_pass(file, Pass::image(lossy, true, 93)), strip, "{lossy} {strip}");
+                assert!(!h.contains_pass(Path::new(r"F:\other.png"), Pass::image(false, false, 93)));
             }
         }
+        // Wire strings stay bit-for-bit compatible with imageopti and earlier mediaopti versions.
+        assert_eq!(Pass::Video.as_wire_str(), "video");
+        assert_eq!(Pass::image(false, false, 93).as_wire_str(), "lossless-normal");
+        assert_eq!(Pass::image(false, true, 93).as_wire_str(), "lossless-normal-strip");
+        assert_eq!(Pass::image(true, false, 93).as_wire_str(), "lossy-normal-t93");
+        assert_eq!(Pass::image(true, true, 85).as_wire_str(), "lossy-normal-t85-strip");
+        assert_eq!(Pass::image(true, false, 80).as_wire_str(), "lossy-normal-t80");
     }
 
     /// A save is taken under the engine's lock and written outside it; one that can't be
@@ -563,20 +655,20 @@ mod tests {
         std::fs::write(dir.join("processed-content.tsv"), format!("{}\t10\tvideo\n{}", hex::encode(h1), &hex::encode(h2)[..10])).unwrap();
         let mut h = History::load(path.clone());
         assert!(h.contains(Path::new(r"C:\a.mp4")) && h.contains(Path::new(r"C:\b.mp4")), "lines lost around unreadable bytes");
-        assert!(h.contains_content(&h1, Want::Video) && !h.contains_content(&h2, Want::Video));
+        assert!(h.contains_content(&h1, Pass::Video) && !h.contains_content(&h2, Pass::Video));
         // The cut-off content line is ended before the next one is added.
-        let (path3, line) = h.add_content_now([3u8; 16], 30, VIDEO_MODE).unwrap();
+        let (path3, line) = h.add_content_now([3u8; 16], 30, Pass::Video).unwrap();
         append_lines(&path3, &line, true).unwrap();
-        assert!(History::load(path.clone()).contains_content(&[3u8; 16], Want::Video));
+        assert!(History::load(path.clone()).contains_content(&[3u8; 16], Pass::Video));
 
         // A stripped pass on content known from a plain lossy pass is noted durably too
         // (the check took any shared bit as "already known").
         let mut h = History::load(path.clone());
-        h.add_content([4u8; 16], 40, "lossy-normal-t93");
-        let (p, line) = h.add_content_now([4u8; 16], 40, "lossy-normal-t93-strip").expect("the strip bit is new");
+        h.add_content([4u8; 16], 40, Pass::image(true, false, 93));
+        let (p, line) = h.add_content_now([4u8; 16], 40, Pass::image(true, true, 93)).expect("the strip bit is new");
         append_lines(&p, &line, true).unwrap();
-        assert!(h.add_content_now([4u8; 16], 40, "lossy-normal-t93-strip").is_none(), "now known");
-        assert!(History::load(path).contains_content(&[4u8; 16], Want::ImageLossy { strip: true, target: 93 }));
+        assert!(h.add_content_now([4u8; 16], 40, Pass::image(true, true, 93)).is_none(), "now known");
+        assert!(History::load(path).contains_content(&[4u8; 16], Pass::image(true, true, 93)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -639,63 +731,63 @@ mod tests {
         .unwrap();
         let mut h = History::load(file.clone());
         let img = parse_hex::<16>("e67a4fc97c7ac57455fe91c3a7a91279").unwrap();
-        assert!(h.contains_content(&img, Want::ImageLossless { strip: false }));
-        assert!(!h.contains_content(&img, Want::ImageLossy { strip: false, target: 93 }), "lossless doesn't cover lossy");
-        assert!(!h.contains_content(&img, Want::ImageLossless { strip: true }), "not stripped");
+        assert!(h.contains_content(&img, Pass::image(false, false, 93)));
+        assert!(!h.contains_content(&img, Pass::image(true, false, 93)), "lossless doesn't cover lossy");
+        assert!(!h.contains_content(&img, Pass::image(false, true, 93)), "not stripped");
         // A big GIF imageopti optimized as an image is still to be made a video.
-        assert!(!h.contains_content(&img, Want::Video), "an image pass is not a video pass");
-        assert!(h.has_size(336_517, Want::ImageLossless { strip: false }));
+        assert!(!h.contains_content(&img, Pass::Video), "an image pass is not a video pass");
+        assert!(h.has_size(336_517, Pass::image(false, false, 93)));
         // Its size was only ever done lossless: a lossy request doesn't hash files of it.
-        assert!(!h.has_size(336_517, Want::ImageLossy { strip: false, target: 93 }) && !h.has_size(336_517, Want::Video));
+        assert!(!h.has_size(336_517, Pass::image(true, false, 93)) && !h.has_size(336_517, Pass::Video));
 
         let vid = [7u8; 16];
-        h.add_content(vid, 1234, VIDEO_MODE);
-        h.add_content(vid, 1234, VIDEO_MODE); // duplicate: written once
-        h.add_content(img, 336_517, crate::image::mode(true, false));
-        h.add_content(img, 336_517, crate::image::mode(true, true)); // flag added to known content
+        h.add_content(vid, 1234, Pass::Video);
+        h.add_content(vid, 1234, Pass::Video); // duplicate: written once
+        h.add_content(img, 336_517, Pass::image(true, false, 93));
+        h.add_content(img, 336_517, Pass::image(true, true, 93)); // flag added to known content
         h.save().unwrap();
         let text = std::fs::read_to_string(dir.join("processed-content.tsv")).unwrap();
         assert_eq!(text.matches("\tvideo\n").count(), 1);
 
         let mut r = History::load(file);
-        assert!(r.contains_content(&vid, Want::Video));
-        assert!(r.contains_content(&img, Want::ImageLossy { strip: false, target: 93 }), "lossy pass survives reload");
-        assert!(r.contains_content(&img, Want::ImageLossy { strip: true, target: 93 }), "stripped pass survives reload");
-        assert!(r.has_size(1234, Want::Video) && !r.has_size(1235, Want::Video));
-        assert!(r.has_size(336_517, Want::ImageLossy { strip: true, target: 93 }), "the stripped lossy pass reached its size");
+        assert!(r.contains_content(&vid, Pass::Video));
+        assert!(r.contains_content(&img, Pass::image(true, false, 93)), "lossy pass survives reload");
+        assert!(r.contains_content(&img, Pass::image(true, true, 93)), "stripped pass survives reload");
+        assert!(r.has_size(1234, Pass::Video) && !r.has_size(1235, Pass::Video));
+        assert!(r.has_size(336_517, Pass::image(true, true, 93)), "the stripped lossy pass reached its size");
 
         // Floors in the content history: content done at 93 is not "done" for a request at
         // 80 (it was taken as done, so pictures done at 93 never got the smaller level), and
         // a durable note at 80 is written even when 93 was known.
-        let at = |t| Want::ImageLossy { strip: false, target: t };
+        let at = |t| Pass::image(true, false, t);
         let c93 = [5u8; 16];
-        r.add_content(c93, 50, crate::image::mode_at(true, false, 93));
+        r.add_content(c93, 50, at(93));
         assert!(r.contains_content(&c93, at(93)) && !r.contains_content(&c93, at(85)) && !r.contains_content(&c93, at(80)));
         assert!(!r.has_size(50, at(80)), "nothing to hash for a request at 80");
-        assert!(r.add_content_now(c93, 50, crate::image::mode_at(true, false, 80)).is_some(), "the 80 pass is new");
+        assert!(r.add_content_now(c93, 50, at(80)).is_some(), "the 80 pass is new");
         assert!(r.contains_content(&c93, at(80)) && r.contains_content(&c93, at(85)));
         let c80 = [6u8; 16];
-        r.add_content(c80, 60, crate::image::mode_at(true, false, 80));
-        assert!(r.contains_content(&c80, at(93)) && r.contains_content(&c80, Want::ImageLossless { strip: false }), "a lower floor covers higher ones");
+        r.add_content(c80, 60, at(80));
+        assert!(r.contains_content(&c80, at(93)) && r.contains_content(&c80, Pass::image(false, false, 93)), "a lower floor covers higher ones");
         assert_eq!(mode_flag("lossy-normal-t85-strip"), F_LOSSY_85 | F_LOSSY | F_STRIP);
-        assert_eq!(r.content_image_mode(&c80), Some("lossy-normal-t80"), "the strongest pass it had");
-        assert_eq!(r.content_image_mode(&[9u8; 16]), None);
+        assert_eq!(r.strongest_image_pass(&c80), Some(at(80)), "the strongest pass it had");
+        assert_eq!(r.strongest_image_pass(&[9u8; 16]), None);
 
         // Image location keys are per mode and don't collide with video keys.
         let f = Path::new(r"C:\p\a.png");
-        r.add_image(f, crate::image::mode(false, false));
-        assert!(r.contains_image(f, false, false, 93) && !r.contains_image(f, true, false, 93) && !r.contains(f));
-        assert!(!r.contains_image(f, false, true, 93), "the redo option asks for a stripped pass");
-        r.add_image(f, crate::image::mode(true, false));
-        assert!(r.contains_image(f, true, false, 93));
+        r.add_pass(f, Pass::image(false, false, 93));
+        assert!(r.contains_pass(f, Pass::image(false, false, 93)) && !r.contains_pass(f, at(93)) && !r.contains(f));
+        assert!(!r.contains_pass(f, Pass::image(false, true, 93)), "the redo option asks for a stripped pass");
+        r.add_pass(f, at(93));
+        assert!(r.contains_pass(f, at(93)));
         // Done at 93: a lower floor asks for more and redoes it; done at 80, nothing does.
-        assert!(!r.contains_image(f, true, false, 85) && !r.contains_image(f, true, false, 80));
+        assert!(!r.contains_pass(f, at(85)) && !r.contains_pass(f, at(80)));
         let g = Path::new(r"F:\pics\b.png");
-        r.add_image(g, crate::image::mode_at(true, false, 80));
-        assert!(r.contains_image(g, true, false, 80) && r.contains_image(g, true, false, 85) && r.contains_image(g, true, false, 93));
-        assert!(r.contains_image(g, false, false, 93), "a lossy pass covers a lossless request");
-        r.add_image(f, crate::image::mode(true, true));
-        assert!(r.contains_image(f, false, true, 93) && r.contains_image(f, true, true, 93));
+        r.add_pass(g, at(80));
+        assert!(r.contains_pass(g, at(80)) && r.contains_pass(g, at(85)) && r.contains_pass(g, at(93)));
+        assert!(r.contains_pass(g, Pass::image(false, false, 93)), "a lossy pass covers a lossless request");
+        r.add_pass(f, Pass::image(true, true, 93));
+        assert!(r.contains_pass(f, Pass::image(false, true, 93)) && r.contains_pass(f, Pass::image(true, true, 93)));
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -1,7 +1,7 @@
 //! End-to-end tests of the engine with the bundled ffmpeg and a real GPU.
 //! They are skipped when bin/ffmpeg.exe is missing (run scripts/fetch-ffmpeg.ps1).
 
-use crate::args::RawOptions;
+use crate::args::{Conversions, ImageMode, Options, Originals};
 use crate::engine::{Engine, StateDto, Status, Ui};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -70,22 +70,22 @@ fn new_engine(
     (engine, rec)
 }
 
-fn opts(encoder: &str, concurrency: f64) -> RawOptions {
-    RawOptions {
-        crf: Some(23.0),
-        preset: Some("slow".into()),
-        encoder: Some(encoder.into()),
-        concurrency: Some(concurrency),
+fn opts(encoder: &str, concurrency: u32) -> Options {
+    Options {
+        crf: 23,
+        preset: "slow".into(),
+        encoder: encoder.into(),
+        concurrency,
         // Tests must not fill the user's Recycle Bin; GIF limit and VMAF retry off so the
         // older tests keep checking what they were written for.
-        originals: Some(0),
-        gif_min_mb: Some(0),
-        vmaf_floor: Some(0),
-        images: Some(0),
-        convert: Some(0),
-        lossy_docs: Some(0),
-        audio: Some(0),
-        ..RawOptions::default()
+        originals: Originals::Delete,
+        gif_min_bytes: 0,
+        vmaf_floor: None,
+        images: ImageMode::Off,
+        convert: Conversions::NONE,
+        lossy_docs: false,
+        audio: ImageMode::Off,
+        ..Options::default()
     }
 }
 

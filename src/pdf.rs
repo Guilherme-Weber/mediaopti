@@ -159,29 +159,9 @@ pub fn optimize(ctx: &Ctx, src: &Path, work: &Path) -> Result<Optimized, RunErro
     Ok(if ok { Optimized::found(Some(out), vec![label.into()]) } else { Optimized::nothing() })
 }
 
-/// Free commit needed per extra PDF image or rendered page checked in parallel.
-const PAGE_COMMIT: u64 = 1024 * 1024 * 1024;
-
-/// Gives borrowed CPU slots back however the parallel loop ends, a panic included.
-struct Borrowed<'a>(Option<&'a tools::Slots>, usize);
-
-impl Drop for Borrowed<'_> {
-    fn drop(&mut self) {
-        if let Some(slots) = self.0 {
-            slots.release(self.1);
-        }
-    }
-}
-
 /// Borrows idle CPU slots for `items` parallel pieces of work, capped by free commit memory.
-fn borrow_for(ctx: &Ctx, items: usize) -> Borrowed<'_> {
-    let mut extra = 0;
-    if let Some(slots) = &ctx.slots {
-        let commit = crate::system::memory_status().map_or(u64::MAX, |m| m.available_commit);
-        let affordable = usize::try_from(commit.saturating_sub(2 * PAGE_COMMIT) / PAGE_COMMIT).unwrap_or(usize::MAX);
-        extra = slots.borrow_idle(items.saturating_sub(1).min(affordable));
-    }
-    Borrowed(ctx.slots.as_deref(), extra)
+fn borrow_for(ctx: &Ctx, items: usize) -> crate::budget::SlotGuard<'_> {
+    ctx.budget.borrow_slots(ctx.slots.as_ref(), items, crate::budget::PAGE_COMMIT)
 }
 
 /// Renders every page of both PDFs at 96 dpi (screen size); each page of `b` must be
@@ -222,7 +202,7 @@ fn pages_look_same(ctx: &Ctx, a: &Path, b: &Path, work: &Path) -> Result<Option<
         let lowest = std::sync::Mutex::new(100.0_f64);
         let err: std::sync::Mutex<Option<RunError>> = std::sync::Mutex::new(None);
         std::thread::scope(|scope| {
-            for _ in 0..=borrowed.1 {
+            for _ in 0..=borrowed.extra() {
                 scope.spawn(|| loop {
                     if failed.load(std::sync::atomic::Ordering::Relaxed) {
                         break;
@@ -367,7 +347,7 @@ fn optimize_images(ctx: &Ctx, src: &Path, work: &Path, lossy: bool) -> Result<Op
     // Optimize PDF images in parallel on borrowed idle CPU slots (like `archive::optimize_pages`).
     // When running one image at a time (`extra == 0`), allow side-by-side lossy methods (`threads: 0`).
     let borrowed = borrow_for(ctx, image_entries.len());
-    let img_ctx = if borrowed.1 == 0 {
+    let img_ctx = if borrowed.extra() == 0 {
         Ctx { threads: 0, progress: None, ..ctx.clone() }
     } else {
         Ctx { threads: 1, progress: None, ..ctx.clone() }
@@ -378,7 +358,7 @@ fn optimize_images(ctx: &Ctx, src: &Path, work: &Path, lossy: bool) -> Result<Op
     let progress = ctx.progress.as_deref();
 
     std::thread::scope(|scope| {
-        for _ in 0..=borrowed.1 {
+        for _ in 0..=borrowed.extra() {
             scope.spawn(|| loop {
                 if failure.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some() {
                     break;
@@ -628,6 +608,7 @@ mod tests {
             gate: crate::image::tools::Gate::default(),
             max: crate::image::Max::default(),
             slots: None,
+            budget: crate::budget::ResourceBudget::os(),
             progress: None,
         })
     }

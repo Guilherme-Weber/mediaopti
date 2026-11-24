@@ -119,8 +119,7 @@ impl Engine {
         input: &Path,
         tmp: &Path,
         display: &str,
-        mode: Mode,
-        gpu_decode: Option<(u32, u32)>,
+        base_plan: &args::EncodePlan,
         in_size: f64,
         out_size: f64,
         duration_sec: f64,
@@ -187,7 +186,8 @@ impl Engine {
                 }
                 None => {
                     self.reset_worker(worker_id, display, &format!("quality retry +{boost}"));
-                    let attempt = self.encode(worker_id, input, tmp, display, mode, boost, gpu_decode).await;
+                    let step_plan = args::EncodePlan { cq_boost: boost, ..base_plan.clone() };
+                    let attempt = self.encode(worker_id, input, tmp, display, step_plan).await;
                     match attempt.status {
                         AttemptStatus::Stopped => {
                             self.park(&keep, &park_keep, best.map(|b| b.0), memo).await;
@@ -331,7 +331,7 @@ impl Engine {
     /// three 8-second windows (20%, 50%, 80% of the video), or of the whole video when it
     /// is short. The original gets the same even-size scaling the encode used, so frames
     /// line up. `Ok(Err(reason))` if it could not be measured; `Err` if Stop was pressed.
-    pub(super) async fn measure_vmaf(
+    pub(super) async fn ffmpeg_measure_vmaf(
         &self,
         original: &Path,
         encoded: &Path,
@@ -472,9 +472,9 @@ impl Engine {
         loop {
             let busy = {
                 let inner = self.lock();
-                inner.running_processes + inner.images_active
+                inner.running_processes + inner.queue.active_cpu_total()
             };
-            if busy == 0 || system::memory_status().is_none_or(|m| m.available_commit >= VMAF_MIN_FREE_COMMIT) {
+            if self.budget.may_start_vmaf(busy) {
                 return true;
             }
             tokio::select! {

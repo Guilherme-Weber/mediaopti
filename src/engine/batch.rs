@@ -12,17 +12,6 @@ pub fn cpu_slot_count() -> usize {
     cores.saturating_sub(1).max(1)
 }
 
-/// Whether another encoder may start now. The first encoder always may (otherwise a
-/// low-memory machine would wait forever).
-/// `free_vram_mb`: `None` when unknown (no NVIDIA GPU, or a CPU encoder).
-pub fn may_start_encoder(running: usize, memory: Option<system::MemoryStatus>, free_vram_mb: Option<u64>) -> bool {
-    if running == 0 {
-        return true;
-    }
-    let ram = memory.is_none_or(|m| m.available_commit >= MIN_FREE_COMMIT && m.available_physical >= MIN_FREE_PHYSICAL);
-    ram && free_vram_mb.is_none_or(|v| v >= MIN_FREE_VRAM_MB)
-}
-
 /// Free GPU memory now, in MB (one `nvidia-smi` query, ~50 ms; asked only when an encoder
 /// starts). `None` without an NVIDIA driver.
 pub(super) async fn free_vram_mb() -> Option<u64> {
@@ -48,31 +37,31 @@ fn mode_label(mode: ImageMode, target: u32) -> String {
 impl Engine {
     /// [`Self::apply_options`] off the calling thread (the window's): with a million files,
     /// rebuilding the queue takes a moment. The newest settings always win.
-    pub fn apply_options_in_background(self: &Arc<Self>, raw: RawOptions) {
+    pub fn apply_options_in_background(self: &Arc<Self>, opts: Options) {
         let generation = self.options_generation.fetch_add(1, Ordering::SeqCst) + 1;
         let engine = Arc::clone(self);
-        self.rt.spawn_blocking(move || engine.apply_options_of(raw, Some(generation)));
+        self.rt.spawn_blocking(move || engine.apply_options_of(opts, Some(generation)));
     }
 
     /// Applies settings outside a run, so the queue shown before Start already reflects
     /// them (e.g. which GIFs are queued).
-    pub fn apply_options(self: &Arc<Self>, raw: RawOptions) {
-        self.apply_options_of(raw, None);
+    pub fn apply_options(self: &Arc<Self>, opts: Options) {
+        self.apply_options_of(opts, None);
     }
 
     /// [`Self::apply_options`]; with `generation`, only if no newer settings were sent
     /// since, checked under the lock: two changes waiting for it may get it in any order.
-    fn apply_options_of(self: &Arc<Self>, raw: RawOptions, generation: Option<u64>) {
+    fn apply_options_of(self: &Arc<Self>, opts: Options, generation: Option<u64>) {
         // If Videos was turned on after a scan done with Videos off, inspect GIF headers now
         // (outside the engine lock) so still GIFs stay out of the video queue.
-        let opts = Options::normalize(raw);
+        let opts = opts.validated();
         let need_gifs = {
             let inner = self.lock();
             if generation.is_some_and(|g| self.options_generation.load(Ordering::SeqCst) != g) || inner.working {
                 return;
             }
-            (opts.videos && !inner.gifs_checked && inner.dir.is_some())
-                .then(|| inner.files.iter().filter(|f| args::is_animated_picture(f)).cloned().collect::<Vec<_>>())
+            (opts.videos && !inner.queue.gifs_checked() && inner.queue.has_dir())
+                .then(|| inner.queue.animated_candidates())
         };
         let checked_gifs = need_gifs.map(|gifs| super::scan::find_static_gifs(&gifs, None));
         {
@@ -85,28 +74,27 @@ impl Engine {
             }
             inner.options = opts;
             if let Some(statics) = checked_gifs {
-                inner.static_gifs = statics;
-                inner.gifs_checked = true;
+                inner.queue.set_static_gifs(statics);
             }
-            if inner.dir.is_some() {
+            if inner.queue.has_dir() {
                 inner.rebuild_queue();
             }
         }
         self.send_state(true);
     }
 
-    pub fn start(self: &Arc<Self>, raw: RawOptions) {
+    pub fn start(self: &Arc<Self>, opts: Options) {
         let engine = Arc::clone(self);
-        self.rt.spawn(async move { engine.run_batch(raw).await });
+        self.rt.spawn(async move { engine.run_batch(opts).await });
     }
 
-    pub async fn run_batch(self: Arc<Self>, raw: RawOptions) {
+    pub async fn run_batch(self: Arc<Self>, opts: Options) {
         // Ensure GIF headers are checked if Videos was enabled since the scan.
-        let opts = Options::normalize(raw);
+        let opts = opts.validated();
         let lazy_gifs = {
             let inner = self.lock();
-            (!inner.working && inner.dir.is_some() && opts.videos && !inner.gifs_checked)
-                .then(|| inner.files.iter().filter(|f| args::is_animated_picture(f)).cloned().collect::<Vec<_>>())
+            (!inner.working && inner.queue.has_dir() && opts.videos && !inner.queue.gifs_checked())
+                .then(|| inner.queue.animated_candidates())
         };
         let checked_gifs = match lazy_gifs {
             Some(gifs) => Some(self.blocking(move || super::scan::find_static_gifs(&gifs, None)).await),
@@ -114,7 +102,7 @@ impl Engine {
         };
         let (total, options) = {
             let mut inner = self.lock();
-            if inner.dir.is_none() {
+            if !inner.queue.has_dir() {
                 drop(inner);
                 self.log("Select a folder before starting");
                 self.send_state(true);
@@ -127,18 +115,18 @@ impl Engine {
                 return;
             }
             if let Some(statics) = checked_gifs {
-                inner.static_gifs = statics;
-                inner.gifs_checked = true;
+                inner.queue.set_static_gifs(statics);
             }
             inner.options = opts;
             inner.reset_run_tracking();
             inner.rebuild_queue();
             inner.stop_requested = false;
             self.paused.send_replace(false);
+            let cpu_total = inner.queue.cpu_waiting();
             inner.run = RunStats {
-                total: inner.pending_queue.len() + inner.cpu_total(),
-                images_total: inner.cpu_total(),
-                stage_total: [inner.cpu_queues[0].len(), inner.cpu_queues[1].len(), inner.cpu_queues[2].len()],
+                total: inner.queue.videos_waiting() + cpu_total,
+                images_total: cpu_total,
+                stage_total: inner.queue.cpu_stage_counts(),
                 ..RunStats::default()
             };
             if inner.run.total > 0 {
@@ -165,7 +153,7 @@ impl Engine {
 
         let (videos, images) = {
             let inner = self.lock();
-            (inner.pending_queue.len(), inner.cpu_total())
+            (inner.queue.videos_waiting(), inner.queue.cpu_waiting())
         };
         if videos > 0 {
             self.log(format!(
@@ -196,9 +184,6 @@ impl Engine {
             let mut inner = self.lock();
             inner.fatal = Arc::new(AtomicBool::new(false));
             inner.cpu = None;
-            inner.cpu_active = [0; 3];
-            inner.heavy_images_active = 0;
-            inner.stage_logged = [false; 3];
             self.spawn_workers(&mut inner);
         }
         self.send_state(true);
@@ -250,7 +235,6 @@ impl Engine {
         {
             let was_stopped = inner.stop_requested;
             inner.cpu = None;
-            inner.job_streams.clear();
             for (_, memo) in inner.resume.drain() {
                 memo.discard();
             }
@@ -263,7 +247,7 @@ impl Engine {
             inner.power = None;
             inner.gpu_enc = 0.0;
             inner.gpu_vram_mb = 0.0;
-            inner.in_progress.clear();
+            inner.queue.clear_in_progress();
             inner.workers.clear();
             inner.rebuild_queue();
             if was_stopped {
@@ -279,8 +263,8 @@ impl Engine {
     /// to the CPU slots (once per batch: their settings are made with the first CPU file).
     /// Called with the lock held, at the start of a batch and when files are added to it.
     pub(super) fn spawn_workers(self: &Arc<Self>, inner: &mut Inner) {
-        let videos = inner.pending_queue.len().saturating_sub(inner.queue_cursor);
-        let cpu_files = inner.cpu_left();
+        let videos = inner.queue.videos_waiting();
+        let cpu_files = inner.queue.cpu_waiting();
         let want_video = (inner.options.concurrency as usize).min(videos + inner.video_ids.len());
         while inner.video_ids.len() < want_video {
             let id = (1..).find(|i| !inner.video_ids.contains(i)).unwrap_or(1);
@@ -395,7 +379,7 @@ impl Engine {
                 inner.release.cancel();
                 inner.release = inner.cancel.child_token();
             }
-            inner.running_processes + inner.images_active
+            inner.running_processes + inner.queue.active_cpu_total()
         };
         self.log(if pause {
             match active {
@@ -437,7 +421,7 @@ impl Engine {
     /// stopping, or an original is being replaced.
     pub fn busy(&self) -> bool {
         let inner = self.lock();
-        inner.working || inner.running_processes > 0 || inner.images_active > 0 || REPLACING.load(Ordering::SeqCst) > 0
+        inner.working || inner.running_processes > 0 || inner.queue.active_cpu_total() > 0 || REPLACING.load(Ordering::SeqCst) > 0
     }
 
     pub fn shutdown(&self) {
@@ -453,7 +437,7 @@ impl Engine {
         let until = Instant::now() + Duration::from_secs(12);
         while {
             let inner = self.lock();
-            inner.running_processes > 0 || inner.images_active > 0
+            inner.running_processes > 0 || inner.queue.active_cpu_total() > 0
         } && Instant::now() < until
         {
             std::thread::sleep(Duration::from_millis(50));
@@ -542,7 +526,7 @@ impl Engine {
 
     pub(super) fn release_tracking(&self, worker_id: u32, input: &Path) {
         let mut inner = self.lock();
-        inner.in_progress.remove(input);
+        inner.queue.release_video(input);
         inner.workers.remove(&worker_id);
     }
 }
@@ -550,8 +534,6 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const GB: u64 = 1024 * 1024 * 1024;
 
     /// Two settings changes sent in a row both wait for the engine (a long queue rebuild
     /// holds it) and may get it in any order: the older one, arriving last, is dropped.
@@ -565,37 +547,15 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let data = std::env::temp_dir().join(format!("mo-settings-order-{}", std::process::id()));
         let engine = Engine::new(Box::new(Quiet), &data, PathBuf::from("ffmpeg.exe"), rt.handle().clone());
-        let jobs = |n: f64| RawOptions { concurrency: Some(n), ..RawOptions::default() };
+        let jobs = |n: u32| Options { concurrency: n, ..Options::default() };
         // Sent: 1 then 3. Applied: 3 first, then the older 1.
         engine.options_generation.store(2, Ordering::SeqCst);
-        engine.apply_options_of(jobs(3.0), Some(2));
-        engine.apply_options_of(jobs(1.0), Some(1));
+        engine.apply_options_of(jobs(3), Some(2));
+        engine.apply_options_of(jobs(1), Some(1));
         assert_eq!(engine.lock().options.concurrency, 3);
         // Straight calls (tests, the start of a batch) always apply.
-        engine.apply_options(jobs(2.0));
+        engine.apply_options(jobs(2));
         assert_eq!(engine.lock().options.concurrency, 2);
         let _ = std::fs::remove_dir_all(&data);
     }
-
-    fn mem(commit_gb: u64, phys_gb: u64) -> Option<system::MemoryStatus> {
-        Some(system::MemoryStatus {
-            available_commit: commit_gb * GB,
-            available_physical: phys_gb * GB,
-        })
-    }
-
-    #[test]
-    fn memory_admission() {
-        // The first encoder always starts, even when memory is tight.
-        assert!(may_start_encoder(0, mem(1, 1), Some(100)));
-        // Further encoders need headroom for a 4K encode.
-        assert!(!may_start_encoder(1, mem(4, 8), None));
-        assert!(!may_start_encoder(1, mem(10, 1), None));
-        assert!(may_start_encoder(1, mem(10, 4), None));
-        assert!(may_start_encoder(3, None, None));
-        // ... in GPU memory too.
-        assert!(!may_start_encoder(1, mem(10, 4), Some(2048)));
-        assert!(may_start_encoder(1, mem(10, 4), Some(4096)));
-    }
-
 }

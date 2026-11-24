@@ -26,88 +26,12 @@ use std::time::Duration;
 use tools::{Capture, RunError, Tools};
 use verify::Verifier;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Kind {
-    Png,
-    Jpg,
-    Gif,
-    /// Audio: cover art and re-encoding, see [`crate::audio`].
-    Flac,
-    Mp3,
-    /// Converted to FLAC (integer PCM only), when conversions are on.
-    Wav,
-    /// Ogg Vorbis, repacked losslessly by OptiVorbis.
-    Ogg,
-    /// Ogg Opus: embedded cover art (`METADATA_BLOCK_PICTURE`) optimized; audio pages copied verbatim.
-    Opus,
-    /// Other lossless audio (ALAC in .m4a, AIFF, APE, WavPack, TTA), converted to FLAC when
-    /// conversions are on and the FLAC is smaller. (An .m4a holding AAC is left alone.)
-    LosslessAudio,
-    /// Converted to PNG (pixel-identical), when conversions are on.
-    Bmp,
-    Tga,
-    /// Office, OpenDocument and EPUB: zip repacked, pictures inside optimized losslessly.
-    Doc,
-    /// Plain ZIP archive: recompressed losslessly at maximum Deflate effort (`ect -9`).
-    Zip,
-    /// Comic book archive (zip): pictures inside follow the image setting.
-    Cbz,
-    /// Comic book archive (RAR), converted to CBZ when conversions are on.
-    Cbr,
-    /// PDF: qpdf rewrite, images optimized (see [`crate::pdf`]).
-    Pdf,
-}
-
-impl Kind {
-    pub fn is_audio(self) -> bool {
-        matches!(self, Kind::Flac | Kind::Mp3 | Kind::Wav | Kind::Ogg | Kind::Opus | Kind::LosslessAudio)
-    }
-
-    pub fn is_archive(self) -> bool {
-        matches!(self, Kind::Doc | Kind::Zip | Kind::Cbz | Kind::Cbr)
-    }
-
-    /// Documents: PDF, Office/ODF/EPUB, comics, plain ZIPs.
-    pub fn is_document(self) -> bool {
-        matches!(self, Kind::Pdf | Kind::Doc | Kind::Zip | Kind::Cbz | Kind::Cbr)
-    }
-
-    /// The CPU queue stage this kind runs in: 0 audio (disk-heavy, few at a time), 1 documents
-    /// (few at a time; their pages borrow idle CPU slots), 2 images (every CPU slot).
-    pub fn stage(self) -> usize {
-        if self.is_audio() {
-            0
-        } else if self.is_document() {
-            1
-        } else {
-            2
-        }
-    }
-
-}
+pub use crate::format::Kind;
 
 /// Files for the CPU workers, by extension (GIFs are routed separately: big animated ones
 /// become video).
 pub fn kind_of(path: &Path) -> Option<Kind> {
-    match crate::args::ext_lower(path).as_str() {
-        "png" => Some(Kind::Png),
-        "jpg" | "jpeg" | "jpe" | "jfif" => Some(Kind::Jpg),
-        "gif" => Some(Kind::Gif),
-        "flac" => Some(Kind::Flac),
-        "mp3" => Some(Kind::Mp3),
-        "wav" => Some(Kind::Wav),
-        "m4a" | "aif" | "aiff" | "aifc" | "ape" | "wv" | "tta" => Some(Kind::LosslessAudio),
-        "ogg" | "oga" => Some(Kind::Ogg),
-        "opus" => Some(Kind::Opus),
-        "bmp" => Some(Kind::Bmp),
-        "tga" => Some(Kind::Tga),
-        "docx" | "xlsx" | "pptx" | "docm" | "xlsm" | "pptm" | "odt" | "ods" | "odp" | "odg" | "epub" => Some(Kind::Doc),
-        "zip" => Some(Kind::Zip),
-        "cbz" => Some(Kind::Cbz),
-        "cbr" => Some(Kind::Cbr),
-        "pdf" => Some(Kind::Pdf),
-        _ => None,
-    }
+    Kind::of(path)
 }
 
 /// PNG, JPEG or GIF by content, whatever the extension says (misnamed files are common:
@@ -289,12 +213,7 @@ pub fn same_picture(ctx: &Ctx, a: &Path, b: &Path) -> Result<bool, RunError> {
 }
 
 pub fn ext_of(kind: Kind) -> &'static str {
-    match kind {
-        Kind::Png => "png",
-        Kind::Jpg => "jpg",
-        Kind::Gif => "gif",
-        _ => "bin",
-    }
+    kind.spec().canonical_ext
 }
 
 /// The parts of the "maximum" effort, each one on or off (measured separately, see
@@ -414,6 +333,8 @@ pub struct Ctx {
     pub max: Max,
     /// The image workers' CPU slots (borrowed by jobs with many parts), if shared.
     pub slots: Option<std::sync::Arc<tools::Slots>>,
+    /// Shared resource budget (commit memory promises, big lossy gate, slot borrowing, disk).
+    pub budget: std::sync::Arc<crate::budget::ResourceBudget>,
     /// This job's progress (pages of a comic, images of a PDF), if someone shows it.
     pub progress: Option<std::sync::Arc<tools::Progress>>,
 }
@@ -455,253 +376,7 @@ impl Optimized {
     }
 }
 
-/// Content-history mode for images, compatible with imageopti's history.
-/// The history mode of a pass (imageopti's names; `-strip` when metadata was removed).
-/// Memory a visually lossless search takes per pixel: measured on 2026-11-17 with a
-/// 164-megapixel JPEG (ssimulacra2 alone 15.6 GB; the job's processes 23.2 GB at once, about
-/// 141 bytes a pixel). The fixed 2 GB admission per file let such a job run out of memory.
-pub(crate) const LOSSY_BYTES_PER_PIXEL: u64 = 150;
-/// From this estimate on, a lossy search is a big job: one at a time, with its memory free.
-pub(crate) const BIG_LOSSY_JOB: u64 = 4 << 30;
-/// Commit memory left for everything else while a big lossy search runs.
-const BIG_LOSSY_RESERVE: u64 = 2 << 30;
-
-/// Whether a big lossy search needing `need` bytes fits in the commit memory `available`
-/// now (unknown counts as fitting).
-pub(crate) fn big_lossy_fits(need: u64, available: Option<u64>) -> bool {
-    // Saturating: a damaged header may declare billions of pixels.
-    available.is_none_or(|a| a >= need.saturating_add(BIG_LOSSY_RESERVE))
-}
-
-struct BigLossyQueue {
-    next_ticket: u64,
-    waiting: std::collections::VecDeque<u64>,
-    active: usize,
-}
-
-/// Strictly-FIFO, memory-budgeted gate for big lossy searches (`need >= BIG_LOSSY_JOB`).
-///
-/// Unlike a single global mutex (which blocked all other workers even during lossless passes
-/// and starved older jobs), this lets multiple big lossy searches run concurrently whenever
-/// their combined estimated commit memory fits in `available_commit - BIG_LOSSY_RESERVE`,
-/// while keeping strict FIFO order and immediately refusing (`Ok(None)`) when no other big
-/// search is active and raw commit memory cannot fit the job even alone.
-struct BigLossyGate {
-    state: std::sync::Mutex<BigLossyQueue>,
-    changed: std::sync::Condvar,
-    promised: std::sync::Arc<std::sync::atomic::AtomicU64>,
-}
-
-static BIG_LOSSY: std::sync::LazyLock<std::sync::Arc<BigLossyGate>> =
-    std::sync::LazyLock::new(|| std::sync::Arc::new(BigLossyGate::new(std::sync::Arc::clone(&PROMISED))));
-
-/// Active turn in [`BigLossyGate`]; releases its memory promise and wakes the next waiter on drop.
-pub(crate) struct LossyTurn {
-    promise: Option<Promise>,
-    gate: std::sync::Arc<BigLossyGate>,
-}
-
-impl Drop for LossyTurn {
-    fn drop(&mut self) {
-        // Drop the memory promise first so waiters waking up see the freed budget at once.
-        self.promise.take();
-        let mut q = self.gate.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        q.active = q.active.saturating_sub(1);
-        self.gate.changed.notify_all();
-    }
-}
-
-struct TicketGuard<'a> {
-    gate: &'a BigLossyGate,
-    ticket: Option<u64>,
-}
-
-impl Drop for TicketGuard<'_> {
-    fn drop(&mut self) {
-        if let Some(t) = self.ticket.take() {
-            let mut q = self.gate.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            q.waiting.retain(|&id| id != t);
-            self.gate.changed.notify_all();
-        }
-    }
-}
-
-impl BigLossyGate {
-    fn new(promised: std::sync::Arc<std::sync::atomic::AtomicU64>) -> Self {
-        Self {
-            state: std::sync::Mutex::new(BigLossyQueue {
-                next_ticket: 0,
-                waiting: std::collections::VecDeque::new(),
-                active: 0,
-            }),
-            changed: std::sync::Condvar::new(),
-            promised,
-        }
-    }
-
-    fn notify(&self) {
-        self.changed.notify_all();
-    }
-
-    fn acquire_with(
-        self: &std::sync::Arc<Self>,
-        need: u64,
-        gate: &tools::Gate,
-        available_fn: impl Fn() -> Option<u64>,
-        on_wait: impl Fn(),
-    ) -> Result<Option<LossyTurn>, RunError> {
-        let ticket = {
-            let mut q = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let t = q.next_ticket;
-            q.next_ticket += 1;
-            q.waiting.push_back(t);
-            t
-        };
-        // Declared before the mutex guard so `q` always drops before `TicketGuard`.
-        let mut guard = TicketGuard { gate: self, ticket: Some(ticket) };
-        let mut notified_wait = false;
-        let mut q = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        loop {
-            if gate.is_cancelled() {
-                drop(q);
-                return Err(RunError::Cancelled);
-            }
-            if gate.is_paused() {
-                drop(q);
-                if !gate.wait_while_paused() {
-                    return Err(RunError::Cancelled);
-                }
-                q = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                continue;
-            }
-            if q.waiting.front() == Some(&ticket) {
-                let available = available_fn();
-                if let Some(p) = promise_on(&self.promised, need, available, BIG_LOSSY_RESERVE) {
-                    q.waiting.pop_front();
-                    guard.ticket = None;
-                    q.active += 1;
-                    self.changed.notify_all();
-                    drop(q);
-                    return Ok(Some(LossyTurn { promise: Some(p), gate: std::sync::Arc::clone(self) }));
-                }
-                if q.active == 0 && !big_lossy_fits(need, available) {
-                    q.waiting.pop_front();
-                    guard.ticket = None;
-                    self.changed.notify_all();
-                    drop(q);
-                    return Ok(None);
-                }
-            }
-            if !notified_wait {
-                notified_wait = true;
-                on_wait();
-            }
-            q = self
-                .changed
-                .wait_timeout(q, Duration::from_millis(250))
-                .map_or_else(|e| e.into_inner().0, |r| r.0);
-        }
-    }
-}
-
-/// Commit memory promised to jobs for what they take beyond one thread and one search (their
-/// tools' extra threads, big lossy searches, lossy methods side by side), until they end.
-/// Jobs starting together all see the same free memory; each counts the others' promises
-/// before taking more.
-static PROMISED: std::sync::LazyLock<std::sync::Arc<std::sync::atomic::AtomicU64>> =
-    std::sync::LazyLock::new(|| std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)));
-
-/// Memory promised to one job; given back when it is dropped.
-pub(crate) struct Promise {
-    amount: u64,
-    counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
-}
-
-impl Drop for Promise {
-    fn drop(&mut self) {
-        if self.amount > 0 {
-            self.counter.fetch_sub(self.amount, std::sync::atomic::Ordering::SeqCst);
-            if std::sync::Arc::ptr_eq(&self.counter, &PROMISED) {
-                BIG_LOSSY.notify();
-            }
-        }
-    }
-}
-
-/// What other jobs were promised and haven't given back.
-pub(crate) fn promised() -> u64 {
-    PROMISED.load(std::sync::atomic::Ordering::SeqCst)
-}
-
-/// Promises `amount` on `counter` when `available`, less what others were promised, still
-/// leaves `keep` after it. `None` when it doesn't fit; unknown memory fits (with nothing tracked).
-fn promise_on(counter: &std::sync::Arc<std::sync::atomic::AtomicU64>, amount: u64, available: Option<u64>, keep: u64) -> Option<Promise> {
-    use std::sync::atomic::Ordering::SeqCst;
-    let Some(available) = available else {
-        return Some(Promise { amount: 0, counter: std::sync::Arc::clone(counter) });
-    };
-    let mut current = counter.load(SeqCst);
-    loop {
-        if available.saturating_sub(current) < amount.saturating_add(keep) {
-            return None;
-        }
-        match counter.compare_exchange(current, current.saturating_add(amount), SeqCst, SeqCst) {
-            Ok(_) => return Some(Promise { amount, counter: std::sync::Arc::clone(counter) }),
-            Err(now) => current = now,
-        }
-    }
-}
-
-/// Promises `amount` when the free commit memory (`available`), less what others were
-/// promised, still leaves `keep` after it. `None` when it doesn't fit; unknown memory fits
-/// (with nothing tracked).
-pub(crate) fn promise(amount: u64, available: Option<u64>, keep: u64) -> Option<Promise> {
-    promise_on(&PROMISED, amount, available, keep)
-}
-
-/// oxipng's commit memory (the hungriest PNG lossless tool; ECT takes less) for a picture,
-/// measured on a 31.2 MP PNG: 0.52 GB on one thread, 1.33 GB on 16 (ECT 0.35 -> 0.80 GB;
-/// 80 -> 42 s and 114 -> 76 s). So about 17 bytes a pixel for the first thread and 1.75 for
-/// each more.
-const MT_BASE_BYTES_PER_PIXEL: u64 = 17;
-const MT_EXTRA_PER_THREAD_PER_100_PIXELS: u64 = 175;
-
-/// Commit memory a PNG's lossless tools take on `threads` threads.
-pub(crate) fn tool_memory(pixels: u64, threads: u64) -> u64 {
-    pixels
-        .saturating_mul(MT_BASE_BYTES_PER_PIXEL)
-        .saturating_add((pixels.saturating_mul(MT_EXTRA_PER_THREAD_PER_100_PIXELS) / 100).saturating_mul(threads.saturating_sub(1)))
-}
-
-/// Threads a PNG's lossless tools may use with `free` commit memory (free now, less what
-/// other jobs were promised): as many as fit past a 2 GB reserve, all cores when they all
-/// fit (a 100 MP picture with 6 GB free still gets 15). Never a cliff from all to one: one
-/// only when even one thread's base doesn't fit. 0 = every core (the tool's default).
-pub(crate) fn picture_threads(pixels: u64, cores: u64, free: Option<u64>) -> usize {
-    let Some(free) = free.map(|a| a.saturating_sub(BIG_LOSSY_RESERVE)) else { return 0 };
-    let per_thread = (pixels.saturating_mul(MT_EXTRA_PER_THREAD_PER_100_PIXELS) / 100).max(1);
-    let base = tool_memory(pixels, 1);
-    let threads = if free <= base { 1 } else { 1 + (free - base) / per_thread };
-    if threads >= cores { 0 } else { usize::try_from(threads).unwrap_or(1).max(1) }
-}
-
-/// A PNG's lossless threads, with the memory of its extra threads promised (`promise`) only
-/// for the duration of the lossless chain so it doesn't shrink the budget during lossy search.
-pub(crate) fn picture_threads_promised(pixels: u64, cores: u64) -> (usize, Option<Promise>) {
-    for _ in 0..4 {
-        let available = crate::system::memory_status().map(|m| m.available_commit);
-        let threads = picture_threads(pixels, cores, available.map(|a| a.saturating_sub(promised())));
-        let used = if threads == 0 { cores } else { threads as u64 };
-        let extra = tool_memory(pixels, used).saturating_sub(tool_memory(pixels, 1));
-        if extra == 0 {
-            return (threads, None);
-        }
-        if let Some(p) = promise(extra, available, tool_memory(pixels, 1).saturating_add(BIG_LOSSY_RESERVE)) {
-            return (threads, Some(p));
-        }
-    }
-    (1, None)
-}
+pub(crate) use crate::budget::{LossyTurn, Promise, BIG_LOSSY_JOB, LOSSY_BYTES_PER_PIXEL};
 
 /// For a picture (standalone, or inside a document or comic) of `pixels` pixels: whether its
 /// lossy search may run now, acquiring a FIFO memory-budgeted [`LossyTurn`] when it is big
@@ -711,12 +386,7 @@ pub(crate) fn lossy_turn(ctx: &Ctx, pixels: u64) -> Result<(bool, Option<LossyTu
     if !ctx.lossy || need < BIG_LOSSY_JOB {
         return Ok((ctx.lossy, None));
     }
-    let turn = BIG_LOSSY.acquire_with(
-        need,
-        &ctx.gate,
-        || crate::system::memory_status().map(|m| m.available_commit),
-        || ctx.phase("waiting for memory", &[]),
-    )?;
+    let turn = ctx.budget.acquire_lossy_turn(need, &ctx.gate, || ctx.phase("waiting for memory", &[]))?;
     Ok((turn.is_some(), turn))
 }
 
@@ -724,79 +394,31 @@ pub(crate) fn lossy_turn(ctx: &Ctx, pixels: u64) -> Result<(bool, Option<LossyTu
 /// silently (`run` gives `Ok(false)`), and the file would be remembered as done: it is a
 /// tool problem instead (`ImageResult::ToolUnavailable`, tried again next run).
 pub fn missing_tool(ctx: &Ctx, kind: Kind) -> Option<&'static str> {
-    let need: &[&'static str] = match kind {
-        Kind::Png | Kind::Bmp | Kind::Tga => &["oxipng"],
-        Kind::Jpg => &["jpegtran"],
-        Kind::Gif => &["gifsicle"],
-        // Cover art goes through the picture chains.
-        Kind::Flac | Kind::LosslessAudio => &["flac", "oxipng", "jpegtran"],
-        Kind::Wav => &["flac"],
-        Kind::Ogg => &["optivorbis"],
-        Kind::Mp3 | Kind::Opus | Kind::Doc | Kind::Cbz => &["oxipng", "jpegtran"],
-        Kind::Zip => &["ect"],
-        Kind::Cbr => &["7z", "oxipng", "jpegtran"],
-        // Its JPEGs are re-optimized through jpegtran and checked with djpeg.
-        Kind::Pdf => &["qpdf", "jpegtran", "djpeg"],
-    };
-    need.iter().copied().find(|t| !ctx.tools.has(t))
+    kind.spec().required_tools.iter().copied().find(|t| !ctx.tools.has(t))
 }
 
 /// Whether the visually lossless search can run on a picture of this kind: the scorer and
 /// one lossy encoder (pingo and beeim are downloaded, not shipped). Without them it gets
 /// the lossless pass and is noted as lossless, so it is searched once they are there.
 pub fn lossy_tools_present(ctx: &Ctx, kind: Kind) -> bool {
-    let t = &ctx.tools;
-    let jpeg_encoder = t.has("djpeg") && (t.has("cjpegli") || t.has("cjpeg"));
-    let (png, jpg) = (t.has("beeim") || t.has("pingo"), jpeg_encoder || t.has("pingo"));
-    t.has("ssimulacra2")
-        && match kind {
-            Kind::Png | Kind::Bmp | Kind::Tga => png,
-            Kind::Jpg => jpg,
-            // Comic pages and cover art may be either.
-            Kind::Cbz | Kind::Cbr | Kind::Flac | Kind::Mp3 | Kind::Opus | Kind::LosslessAudio => png && jpg,
-            // Its pictures become JPEGs, and its pages are rendered to check them.
-            Kind::Pdf => t.has("mutool") && jpeg_encoder,
-            _ => true,
-        }
+    ctx.tools.supports_lossy(kind)
 }
 
 /// Whether a file of this kind has a visually lossless part under `ctx` (PDFs only with the
 /// PDF option).
 pub fn has_lossy_part(ctx: &Ctx, kind: Kind) -> bool {
+    use crate::format::{LossyTools, QualityPolicy};
     ctx.lossy
-        && match kind {
-            Kind::Png | Kind::Jpg | Kind::Bmp | Kind::Tga | Kind::Cbz | Kind::Cbr | Kind::Flac | Kind::Mp3 | Kind::Opus | Kind::LosslessAudio => true,
-            Kind::Pdf => ctx.lossy_docs,
-            _ => false,
+        && match kind.spec().quality_policy {
+            QualityPolicy::PictureFloor => !matches!(kind.spec().lossy_tools, LossyTools::None),
+            QualityPolicy::PdfDefault => ctx.lossy_docs,
+            QualityPolicy::None => false,
         }
 }
 
-/// The visually lossless floors offered for pictures (SSIMULACRA2): 93 (the default, no
-/// visible change), 85 and 80 (smaller; 80 is about what Pinga's lossy mode gives: on five
-/// big PNGs it scored 81-83 at ~25% of the size, with slight banding seen when zoomed in).
-pub const IMAGE_TARGETS: [u32; 3] = [93, 85, 80];
-/// The default floor; PDF pictures keep it whatever the picture setting (cover art follows
-/// the setting).
+/// The default SSIMULACRA2 floor; PDF pictures keep it whatever the picture setting (cover
+/// art follows the setting).
 pub const DEFAULT_TARGET: u32 = 93;
-
-/// History mode of a pass at the default floor (imageopti's names).
-pub fn mode(lossy: bool, strip: bool) -> &'static str {
-    mode_at(lossy, strip, DEFAULT_TARGET)
-}
-
-/// History mode of a pass at floor `target` (`lossy-normal-t85`); a lossless pass has none.
-pub fn mode_at(lossy: bool, strip: bool, target: u32) -> &'static str {
-    match (lossy, strip, target) {
-        (false, false, _) => "lossless-normal",
-        (false, true, _) => "lossless-normal-strip",
-        (true, false, 85) => "lossy-normal-t85",
-        (true, true, 85) => "lossy-normal-t85-strip",
-        (true, false, 80) => "lossy-normal-t80",
-        (true, true, 80) => "lossy-normal-t80-strip",
-        (true, false, _) => "lossy-normal-t93",
-        (true, true, _) => "lossy-normal-t93-strip",
-    }
-}
 
 pub(crate) fn run(ctx: &Ctx, tool: &str, args: Vec<OsString>, cwd: &Path) -> Result<bool, RunError> {
     let Some(program) = ctx.tools.get(tool) else { return Ok(false) };
@@ -1102,7 +724,7 @@ fn png_chain_slow(ctx: &Ctx, restore_from: &Path, ver: &Verifier, c: &mut Chain<
     // it never eats into the budget during a subsequent lossy search or while waiting for it.
     let (mt_threads, _mt_promise) = if ctx.threads == 0 {
         let cores = std::thread::available_parallelism().map_or(4, |n| n.get() as u64);
-        picture_threads_promised(pixel_count(&c.best).unwrap_or(0), cores)
+        ctx.budget.picture_threads_promised(pixel_count(&c.best).unwrap_or(0), cores)
     } else {
         (ctx.threads, None)
     };
@@ -1436,19 +1058,8 @@ fn methods_at_once(ctx: &Ctx, reference: &Path, n: usize, base_promised: bool) -
         return None;
     }
     let max_k = if ctx.threads > 0 { n.min(ctx.threads) } else { n };
-    if max_k <= 1 {
-        return None;
-    }
     let pixels = pixel_count(reference)?;
-    let one = pixels.saturating_mul(LOSSY_BYTES_PER_PIXEL);
-    let available = crate::system::memory_status().map(|m| m.available_commit)?;
-    let keep = if base_promised { BIG_LOSSY_RESERVE } else { one.saturating_add(BIG_LOSSY_RESERVE) };
-    for k in (2..=max_k).rev() {
-        if let Some(p) = promise(one.saturating_mul(k as u64 - 1), Some(available), keep) {
-            return Some((k, p));
-        }
-    }
-    None
+    ctx.budget.parallel_methods(pixels, max_k, base_promised)
 }
 
 fn lossy_png(
@@ -1607,75 +1218,6 @@ fn lossy_jpeg(
 mod tests {
     use super::*;
 
-    /// Big lossy searches run concurrently when free commit memory fits them all, stay strictly
-    /// FIFO when memory is tight (no starvation), refuse immediately when alone and too big,
-    /// and clean up their queue ticket on cancel.
-    #[test]
-    fn big_lossy_gate_is_fifo_and_memory_budgeted() {
-        const GB: u64 = 1 << 30;
-        let gate = std::sync::Arc::new(BigLossyGate::new(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0))));
-        let g = tools::Gate::default();
-
-        // 1) Immediate refusal when active == 0 and raw commit cannot fit need + 2 GB reserve.
-        let refused = gate.acquire_with(20 * GB, &g, || Some(8 * GB), || {}).unwrap();
-        assert!(refused.is_none(), "20 GB job must refuse immediately on 8 GB free");
-
-        // 2) Concurrent admission: two 5 GB jobs fit in 20 GB free (5 + 5 + 2 <= 20).
-        let t1 = gate.acquire_with(5 * GB, &g, || Some(20 * GB), || {}).unwrap().expect("first fits");
-        let t2 = gate.acquire_with(5 * GB, &g, || Some(20 * GB), || {}).unwrap().expect("second fits concurrently");
-        drop((t1, t2));
-
-        // 3) Tight memory (9 GB free): one 5 GB job runs, the next two queue in strict FIFO,
-        //    and a cancelled middle waiter unblocks the one behind it.
-        let first = gate.acquire_with(5 * GB, &g, || Some(9 * GB), || {}).unwrap().expect("first runs");
-        let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u32>::new()));
-        let waited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-        let g_cancel = tools::Gate::new(tokio_util::sync::CancellationToken::new(), None);
-        let cancel_tok = g_cancel.cancel.clone();
-        let (gate_a, gate_b, gate_c) = (std::sync::Arc::clone(&gate), std::sync::Arc::clone(&gate), std::sync::Arc::clone(&gate));
-        let (order_a, order_c) = (std::sync::Arc::clone(&order), std::sync::Arc::clone(&order));
-        let waited_a = std::sync::Arc::clone(&waited);
-
-        let wait_until_queued = |n: usize| {
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            while gate.state.lock().unwrap().waiting.len() < n && std::time::Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            assert_eq!(gate.state.lock().unwrap().waiting.len(), n);
-        };
-
-        let h_a = std::thread::spawn(move || {
-            let _t = gate_a
-                .acquire_with(5 * GB, &tools::Gate::default(), || Some(9 * GB), || {
-                    waited_a.store(true, std::sync::atomic::Ordering::SeqCst);
-                })
-                .unwrap()
-                .expect("a runs after first");
-            order_a.lock().unwrap().push(1);
-            std::thread::sleep(Duration::from_millis(30));
-        });
-        wait_until_queued(1);
-
-        let h_b = std::thread::spawn(move || gate_b.acquire_with(5 * GB, &g_cancel, || Some(9 * GB), || {}));
-        wait_until_queued(2);
-
-        let h_c = std::thread::spawn(move || {
-            let _t = gate_c.acquire_with(5 * GB, &tools::Gate::default(), || Some(9 * GB), || {}).unwrap().expect("c runs after a");
-            order_c.lock().unwrap().push(3);
-        });
-        wait_until_queued(3);
-
-        assert!(waited.load(std::sync::atomic::Ordering::SeqCst), "wait callback fired");
-        cancel_tok.cancel();
-        assert!(matches!(h_b.join().unwrap(), Err(RunError::Cancelled)));
-
-        drop(first);
-        h_a.join().unwrap();
-        h_c.join().unwrap();
-        assert_eq!(*order.lock().unwrap(), vec![1, 3], "strict FIFO order");
-    }
-
     /// The score rides in the label, cut (never rounded up past what was measured), and the
     /// lowest one is found inside a comic's or a cover's nested labels.
     #[test]
@@ -1709,6 +1251,7 @@ mod tests {
             gate: tools::Gate::default(),
             max: crate::image::Max::default(),
             slots: None,
+            budget: crate::budget::ResourceBudget::os(),
             progress: None,
         }
     }

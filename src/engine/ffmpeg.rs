@@ -79,28 +79,90 @@ pub fn locate_ffmpeg() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(exe_name))
 }
 
+pub(super) type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+pub(super) type VmafOutcome = Result<Result<(f64, f64), String>, super::vmaf::Stopped>;
+
+/// Coarse seam isolating all FFmpeg process supervision from video job orchestration.
+/// Production uses [`FfmpegAdapter`]; unit tests inject a scripted in-process adapter.
+pub(super) trait VideoRunner: Send + Sync {
+    fn probe_streams<'a>(&'a self, engine: &'a Engine, path: &'a Path) -> BoxFuture<'a, Result<args::Streams, Unfinished>>;
+    fn video_timing<'a>(&'a self, engine: &'a Engine, path: &'a Path) -> BoxFuture<'a, Result<Option<(u64, f64)>, Unfinished>>;
+    fn same_audio_track<'a>(&'a self, engine: &'a Engine, a: &'a Path, b: &'a Path, index: usize) -> BoxFuture<'a, Result<bool, Unfinished>>;
+    fn encode<'a>(
+        &'a self,
+        engine: &'a Arc<Engine>,
+        worker_id: u32,
+        input: &'a Path,
+        tmp: &'a Path,
+        display: &'a str,
+        plan: &'a args::EncodePlan,
+    ) -> BoxFuture<'a, Attempt>;
+    fn measure_vmaf<'a>(
+        &'a self,
+        engine: &'a Engine,
+        original: &'a Path,
+        encoded: &'a Path,
+        duration_sec: f64,
+        threads: Option<usize>,
+    ) -> BoxFuture<'a, VmafOutcome>;
+}
+
+/// Production [`VideoRunner`] backed by real `ffmpeg.exe` subprocesses.
+pub(super) struct FfmpegAdapter;
+
+impl VideoRunner for FfmpegAdapter {
+    fn probe_streams<'a>(&'a self, engine: &'a Engine, path: &'a Path) -> BoxFuture<'a, Result<args::Streams, Unfinished>> {
+        Box::pin(engine.ffmpeg_probe_streams(path))
+    }
+
+    fn video_timing<'a>(&'a self, engine: &'a Engine, path: &'a Path) -> BoxFuture<'a, Result<Option<(u64, f64)>, Unfinished>> {
+        Box::pin(engine.ffmpeg_video_timing(path))
+    }
+
+    fn same_audio_track<'a>(&'a self, engine: &'a Engine, a: &'a Path, b: &'a Path, index: usize) -> BoxFuture<'a, Result<bool, Unfinished>> {
+        Box::pin(engine.ffmpeg_same_audio_track(a, b, index))
+    }
+
+    fn encode<'a>(
+        &'a self,
+        engine: &'a Arc<Engine>,
+        worker_id: u32,
+        input: &'a Path,
+        tmp: &'a Path,
+        display: &'a str,
+        plan: &'a args::EncodePlan,
+    ) -> BoxFuture<'a, Attempt> {
+        Box::pin(engine.ffmpeg_run_attempt(worker_id, input, tmp, display, plan))
+    }
+
+    fn measure_vmaf<'a>(
+        &'a self,
+        engine: &'a Engine,
+        original: &'a Path,
+        encoded: &'a Path,
+        duration_sec: f64,
+        threads: Option<usize>,
+    ) -> BoxFuture<'a, VmafOutcome> {
+        Box::pin(engine.ffmpeg_measure_vmaf(original, encoded, duration_sec, threads))
+    }
+}
+
 impl Engine {
     /// Runs ffmpeg once, streaming its stderr into the worker's progress, with a stall
     /// watchdog and cancellation on Stop.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) async fn run_attempt(
+    pub(super) async fn ffmpeg_run_attempt(
         self: &Arc<Self>,
         worker_id: u32,
         input: &Path,
         tmp: &Path,
         display: &str,
-        mode: Mode,
-        cq_boost: u32,
-        gpu_decode: Option<(u32, u32)>,
+        plan: &args::EncodePlan,
     ) -> Attempt {
         let mut diag = Diagnostics::default();
-        let (mut options, cancel) = (self.lock().options.clone(), self.release_token());
-        options.cq_boost = cq_boost;
-        options.gpu_decode = gpu_decode;
-        options.streams = self.lock().job_streams.get(input).cloned().unwrap_or_default();
+        let (options, cancel) = (self.lock().options.clone(), self.release_token());
         let jobs = u64::from(options.concurrency.max(1));
         let nvenc = options.encoder.ends_with("_nvenc");
-        let ffmpeg_args = args::build_ffmpeg_args(input, tmp, &options, mode);
+        let ffmpeg_args = args::build_ffmpeg_args(input, tmp, &options, plan);
 
         let mut cmd = tokio::process::Command::new(&self.ffmpeg_path);
         // stdin is a pipe so ffmpeg can be asked to quit ("q") instead of being killed.
@@ -161,16 +223,15 @@ impl Engine {
         // memory is plentiful. The hold ends early at the first progress line (buffers are
         // allocated by then) or when ffmpeg exits, so short files keep running in parallel.
         let warmup_done = CancellationToken::new();
-        let vram_plentiful = !nvenc || free_vram_mb().await.is_none_or(|v| v >= MIN_FREE_VRAM_MB * jobs);
-        let plentiful =
-            vram_plentiful && system::memory_status().is_some_and(|m| m.available_commit >= MIN_FREE_COMMIT * jobs);
+        let vram_plentiful = !nvenc || free_vram_mb().await.is_none_or(|v| v >= crate::budget::MIN_FREE_VRAM_MB * jobs);
+        let plentiful = self.budget.encoder_plentiful(jobs, vram_plentiful);
         if plentiful {
             drop(permit);
         } else {
             let done = warmup_done.clone();
             self.rt.spawn(async move {
                 tokio::select! {
-                    _ = tokio::time::sleep(ADMISSION_WARMUP) => {}
+                    _ = tokio::time::sleep(crate::budget::ENCODER_ADMISSION_WARMUP) => {}
                     _ = done.cancelled() => {}
                 }
                 drop(permit);
@@ -294,22 +355,21 @@ impl Engine {
     /// One encode with the retries that keep the result the same: out of memory waits for
     /// another encoder to finish and tries again (not a reason for the CPU fallback), and
     /// a failed GPU decode is redone with the CPU decoding.
-    #[allow(clippy::too_many_arguments)]
     pub(super) async fn encode(
         self: &Arc<Self>,
         worker_id: u32,
         input: &Path,
         tmp: &Path,
         display: &str,
-        mode: Mode,
-        cq_boost: u32,
-        gpu_decode: Option<(u32, u32)>,
+        mut plan: args::EncodePlan,
     ) -> Attempt {
         const MEMORY_RETRIES: u32 = 5;
-        let mut gpu = gpu_decode.filter(|_| mode != Mode::CpuFallback);
+        if plan.mode == Mode::CpuFallback {
+            plan.gpu_decode = None;
+        }
         let mut memory_retries = 0;
         loop {
-            let mut attempt = self.run_attempt(worker_id, input, tmp, display, mode, cq_boost, gpu).await;
+            let mut attempt = self.video_runner.encode(self, worker_id, input, tmp, display, &plan).await;
             if attempt.diag.out_of_memory && matches!(attempt.status, AttemptStatus::Exited(0)) {
                 // Frames were dropped for lack of memory: never a result to keep.
                 self.log(format!("[Worker {worker_id}] {display}: ffmpeg ran out of memory mid-encode; discarding its output"));
@@ -317,12 +377,12 @@ impl Engine {
             }
             let (stopping, others) = {
                 let inner = self.lock();
-                (inner.stop_requested || !inner.working, inner.running_processes + inner.images_active)
+                (inner.stop_requested || !inner.working, inner.running_processes + inner.queue.active_cpu_total())
             };
             // The frame size changed mid-stream: scale_cuda's scaling differs a little from
             // the CPU's, so such a file is redone the way it always was.
-            if gpu.is_some() && attempt.diag.reconfigured && matches!(attempt.status, AttemptStatus::Exited(0)) && !stopping {
-                gpu = None;
+            if plan.gpu_decode.is_some() && attempt.diag.reconfigured && matches!(attempt.status, AttemptStatus::Exited(0)) && !stopping {
+                plan.gpu_decode = None;
                 self.log_remove(tmp);
                 self.log(format!("[Worker {worker_id}] {display} changes frame size mid-stream; encoding again with CPU decoding"));
                 continue;
@@ -341,8 +401,8 @@ impl Engine {
                 }
                 continue;
             }
-            if gpu.is_some() {
-                gpu = None;
+            if plan.gpu_decode.is_some() {
+                plan.gpu_decode = None;
                 self.log_remove(tmp);
                 self.log(format!("[Worker {worker_id}] GPU decoding failed on {display}; decoding on the CPU instead"));
                 continue;
@@ -361,7 +421,7 @@ impl Engine {
         let until = Instant::now() + Duration::from_secs(120);
         let busy = || {
             let inner = self.lock();
-            inner.running_processes + inner.images_active
+            inner.running_processes + inner.queue.active_cpu_total()
         };
         while busy() >= others && Instant::now() < until {
             tokio::select! {
@@ -416,10 +476,32 @@ impl Engine {
         own.unwrap_or_else(|_| inner.release.is_cancelled()) || inner.stop_requested
     }
 
+    pub(super) async fn probe_streams(&self, path: &Path) -> Result<args::Streams, Unfinished> {
+        self.video_runner.probe_streams(self, path).await
+    }
+
+    pub(super) async fn same_audio_track(&self, a: &Path, b: &Path, index: usize) -> Result<bool, Unfinished> {
+        self.video_runner.same_audio_track(self, a, b, index).await
+    }
+
+    pub(super) async fn video_timing(&self, path: &Path) -> Result<Option<(u64, f64)>, Unfinished> {
+        self.video_runner.video_timing(self, path).await
+    }
+
+    pub(super) async fn measure_vmaf(
+        &self,
+        original: &Path,
+        encoded: &Path,
+        duration_sec: f64,
+        threads: Option<usize>,
+    ) -> Result<Result<(f64, f64), String>, super::vmaf::Stopped> {
+        self.video_runner.measure_vmaf(self, original, encoded, duration_sec, threads).await
+    }
+
     /// What `path` holds besides its picture (audio, subtitles, attachments, covers,
     /// chapters) and its length, from `ffmpeg -i`. `Unfinished` when a probe didn't finish:
     /// never read as "nothing there" (an encode would drop the tracks it didn't know about).
-    pub(super) async fn probe_streams(&self, path: &Path) -> Result<args::Streams, Unfinished> {
+    async fn ffmpeg_probe_streams(&self, path: &Path) -> Result<args::Streams, Unfinished> {
         let mut cmd = tokio::process::Command::new(&self.ffmpeg_path);
         cmd.args(["-hide_banner", "-i"]).arg(path).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true);
         system::configure_background_command(&mut cmd, true);
@@ -463,7 +545,7 @@ impl Engine {
     /// Whether audio track `index` of `a` and `b` decodes to the same samples (compared as
     /// 32-bit PCM, so 16- and 24-bit sources and their FLAC compare alike). `Unfinished` when
     /// a decode didn't finish; a failed decode is "not the same".
-    pub(super) async fn same_audio_track(&self, a: &Path, b: &Path, index: usize) -> Result<bool, Unfinished> {
+    async fn ffmpeg_same_audio_track(&self, a: &Path, b: &Path, index: usize) -> Result<bool, Unfinished> {
         let md5 = |p: &Path| {
             let mut cmd = tokio::process::Command::new(&self.ffmpeg_path);
             cmd.args(["-hide_banner", "-v", "error", "-i"])
@@ -489,7 +571,7 @@ impl Engine {
     /// demuxer hands extension blocks after the last picture (Photoshop's XMP) over as one
     /// more packet, which counted as a frame the video "lost" (11 false failures on
     /// 2026-11-19). `Ok(None)` when it can't be read, `Unfinished` when the read didn't finish.
-    pub(super) async fn video_timing(&self, path: &Path) -> Result<Option<(u64, f64)>, Unfinished> {
+    async fn ffmpeg_video_timing(&self, path: &Path) -> Result<Option<(u64, f64)>, Unfinished> {
         let mut cmd = tokio::process::Command::new(&self.ffmpeg_path);
         cmd.args(["-hide_banner", "-v", "error", "-i"]).arg(path).args(["-map", "0:v:0"]);
         if args::is_animated_picture(path) {

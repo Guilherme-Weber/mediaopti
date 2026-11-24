@@ -24,7 +24,7 @@ fn nvenc_encodes_quit_cleanly() {
         let t = std::time::Instant::now();
         rt.block_on(async {
             engine.load_dir(media.clone()).await;
-            let runner = tokio::spawn(engine.clone().run_batch(opts("av1_nvenc", 4.0)));
+            let runner = tokio::spawn(engine.clone().run_batch(opts("av1_nvenc", 4)));
             tokio::time::sleep(Duration::from_secs(10)).await;
             if release {
                 engine.set_paused(true);
@@ -66,7 +66,7 @@ fn stop_kills_ffmpeg_and_keeps_originals() {
     let (engine, rec) = new_engine(&rt, &root, ff);
     rt.block_on(async {
         engine.load_dir(videos.clone()).await;
-        let runner = tokio::spawn(engine.clone().run_batch(opts("libx264", 1.0)));
+        let runner = tokio::spawn(engine.clone().run_batch(opts("libx264", 1)));
         tokio::time::sleep(Duration::from_secs(3)).await;
         assert_eq!(engine.snapshot().status, Status::Running);
         engine.stop();
@@ -123,7 +123,7 @@ fn pause_ends_ffmpeg_and_resume_finishes() {
     let (engine, rec) = new_engine(&rt, &root, ff);
     rt.block_on(async {
         engine.load_dir(videos.clone()).await;
-        let runner = tokio::spawn(engine.clone().run_batch(opts(&encoder, 1.0)));
+        let runner = tokio::spawn(engine.clone().run_batch(opts(&encoder, 1)));
         wait_for_progress(&engine).await;
 
         engine.set_paused(true);
@@ -178,7 +178,7 @@ fn pause_releases_memory_and_resume_redoes_the_files() {
     let (engine, rec) = new_engine(&rt, &root, ff);
     rt.block_on(async {
         engine.load_dir(videos.clone()).await;
-        let runner = tokio::spawn(engine.clone().run_batch(opts("libx264", 2.0)));
+        let runner = tokio::spawn(engine.clone().run_batch(opts("libx264", 2)));
         wait_for_progress(&engine).await;
         engine.set_paused(true);
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -231,7 +231,7 @@ fn pause_for_a_game() {
     }
     let rt = runtime();
     let (engine, rec) = new_engine(&rt, &root, ff);
-    let raw = || RawOptions { images: Some(2), audio: Some(2), ..opts("av1_nvenc", 4.0) };
+    let raw = || Options { images: ImageMode::Lossy, audio: ImageMode::Lossy, ..opts("av1_nvenc", 4) };
     let t = std::time::Instant::now();
     rt.block_on(async {
         engine.apply_options(raw());
@@ -275,7 +275,7 @@ fn stop_while_paused_keeps_originals() {
     let (engine, rec) = new_engine(&rt, &root, ff);
     rt.block_on(async {
         engine.load_dir(videos.clone()).await;
-        let runner = tokio::spawn(engine.clone().run_batch(opts("libx264", 1.0)));
+        let runner = tokio::spawn(engine.clone().run_batch(opts("libx264", 1)));
         wait_for_progress(&engine).await;
         engine.set_paused(true);
         tokio::time::sleep(Duration::from_secs(1)).await;
