@@ -3,6 +3,56 @@
 Notable changes to mediaopti. Earlier versions are described in their
 [GitHub releases](https://github.com/Guilherme-Weber/mediaopti/releases).
 
+## 3.4.0
+
+Major throughput and memory-safety overhaul for images, documents and large libraries, plus
+diagnostic and reliability fixes.
+
+### Added
+
+- **Durable failure log:** every failed file is also appended to `%APPDATA%/mediaopti/logs/failures.log`
+  (never rotated away); `scripts/log-summary.ps1 -Failures` summarises it by cause.
+- **Bytes in size readouts:** saved sizes in the log and file/saved sizes in the UI now scale
+  down to bytes (`B`) below 1 KB instead of rounding tiny savings up to `1 KB`.
+
+### Changed
+
+- **Faster, memory-budgeted image parallelism:** replaced the single global `BIG_LOSSY` mutex
+  with a FIFO memory-budgeted gate (`BigLossyGate`) and a double-ended image queue that pairs
+  at most three heavy (`>= 4 MiB`) images with light images across the remaining CPU slots.
+  Scope-limited `oxipng` memory promises to `png_chain`, allowed `methods_at_once` to step down
+  `n..=2`, shared the best-size limit across sibling lossy methods, and cached the decoded
+  reference PNG per `ssimulacra2` search.
+- **Lossy-first PNG fast path & streaming verification:** static PNGs in lossy mode run the
+  lossy search before the lossless chain (skipping redundant lossless passes when lossy wins).
+  Static non-interlaced PNGs are verified row-by-row in Rust (`png` crate, ~64 KiB RAM, no
+  `ffmpeg` spawn, including masked alpha without a global lock); probe-guided quality search
+  cuts unnecessary `ssimulacra2` evaluations and cleans temp candidates immediately.
+- **Multi-threaded document & PDF optimization:** `archive::optimize_pages`, `pdf::optimize_images`
+  and `pdf::pages_look_same` borrow idle CPU slots to process pages and embedded images in
+  parallel while respecting memory limits.
+- **Lower I/O and memory overhead across the pipeline:** streaming PNG/JPEG/GIF trailing-data
+  and JPEG segment inspection (no full-file RAM reads), in-place fast path for short ASCII
+  pictures, lazy GIF animation check when Videos is off, streaming history load, single
+  `ffmpeg -i` probe per video, no double BLAKE2b hash after replace, and no double FLAC
+  decode/encode.
+- **Clearer UI progress & controls:** the `CPU jobs` tile explains when slots are paused for
+  memory or bounded by documents, the rate shows rolling 5-minute `files/min`, `Stop` cancels
+  in-progress folder scans cleanly, and the `Forget history` dialog clarifies that files already
+  compressed lossily would be compressed again.
+- **Bundled FFmpeg updated to 9.1** (`scripts/fetch-ffmpeg.ps1`) and `url` updated to `2.5.9`
+  (fixes `RUSTSEC-2026-0592`).
+
+### Fixed
+
+- **Child process handling & shutdown:** `tools::run` no longer captures unused stdout/stderr
+  pipes and waits properly on Windows (`WaitForSingleObject`); `shutdown` waits for active
+  image workers to finish cleanly; watchdog extends to 180 s at `>= 99%` progress.
+- **Safety & edge cases:** preserved pending replace journals on unplugged drives, checked
+  sRGB `iCCP` chunks on PNGs, skipped non-UTF-8 and unsupported-compression (LZMA/Deflate64)
+  CBZ entries cleanly instead of failing them, fixed lazy O(1) file index lookups, and fixed
+  `scripts/log-summary.ps1` `-Failures` switch collision.
+
 ## 3.3.2
 
 ### Changed
