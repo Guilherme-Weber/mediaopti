@@ -566,11 +566,12 @@ impl Engine {
         Ok(x.is_some() && x == y)
     }
 
-    /// Frame count and length in seconds of the first video stream, read from its packets
-    /// (no decoding, so fast even for big files). A GIF's frames are counted by decoding: its
-    /// demuxer hands extension blocks after the last picture (Photoshop's XMP) over as one
-    /// more packet, which counted as a frame the video "lost" (11 false failures on
-    /// 2026-11-19). `Ok(None)` when it can't be read, `Unfinished` when the read didn't finish.
+    /// Frame count of the first video stream and longest stream duration in seconds, read
+    /// from packets (no decoding, so fast even for big files; includes audio tracks on
+    /// non-animated inputs so an audio truncation is never hidden). Animated pictures
+    /// (GIF/WebP) are counted by decoding: GIF's demuxer hands trailing extension blocks
+    /// (Photoshop's XMP) over as an extra packet. `Ok(None)` when unreadable, `Unfinished`
+    /// when the read didn't finish.
     async fn ffmpeg_video_timing(&self, path: &Path) -> Result<Option<(u64, f64)>, Unfinished> {
         let mut cmd = tokio::process::Command::new(&self.ffmpeg_path);
         cmd.args(["-hide_banner", "-v", "error", "-i"]).arg(path).args(["-map", "0:v:0"]);
@@ -578,7 +579,7 @@ impl Engine {
             // Each decoded frame keeps the GIF/WebP's own delay; wrapped_avframe skips any encoding.
             cmd.args(["-fps_mode", "passthrough", "-enc_time_base", "demux", "-c:v", "wrapped_avframe", "-f", "framecrc", "-"]);
         } else {
-            cmd.args(["-c", "copy", "-f", "framemd5", "-"]);
+            cmd.args(["-map", "0:a?", "-c", "copy", "-f", "framemd5", "-"]);
         }
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -605,30 +606,62 @@ pub(super) fn first_frame_read(exited_ok: bool, text: &str) -> bool {
     exited_ok && text.lines().any(|l| l.contains("parsed_showinfo") && l.contains("pts_time:"))
 }
 
-/// Frame count and length from ffmpeg's framemd5 listing of packets: `#tb 0: 1/100`, then
-/// `stream, dts, pts, duration, size, hash` per packet.
+/// Frame count of stream 0 (video) and maximum stream span in seconds from ffmpeg's
+/// `framemd5`/`framecrc` packet listing (`#tb <idx>: <n>/<d>`, then
+/// `<idx>, dts, pts, duration, size, hash` per packet).
 pub(super) fn packet_timing(listing: &str) -> Option<(u64, f64)> {
-    let mut tb = None;
-    let (mut count, mut start, mut end) = (0u64, i64::MAX, i64::MIN);
+    let mut tbs: Vec<Option<f64>> = Vec::new();
+    let mut streams: Vec<(u64, i64, i64)> = Vec::new();
     for line in listing.lines() {
-        if let Some(rest) = line.strip_prefix("#tb 0:") {
-            let (n, d) = rest.trim().split_once('/')?;
-            tb = Some(n.trim().parse::<f64>().ok()? / d.trim().parse::<f64>().ok()?);
+        if let Some(rest) = line.strip_prefix("#tb ") {
+            let (idx_str, frac) = rest.split_once(':')?;
+            let idx: usize = idx_str.trim().parse().ok()?;
+            let (n, d) = frac.trim().split_once('/')?;
+            let tb = n.trim().parse::<f64>().ok()? / d.trim().parse::<f64>().ok()?;
+            if tbs.len() <= idx {
+                tbs.resize(idx + 1, None);
+            }
+            tbs[idx] = Some(tb);
             continue;
         }
         if line.starts_with('#') || line.trim().is_empty() {
             continue;
         }
         let f: Vec<&str> = line.split(',').map(str::trim).collect();
-        if f.len() < 5 || f[0] != "0" {
+        if f.len() < 5 {
             continue;
         }
+        let idx: usize = f[0].parse().ok()?;
         let (pts, duration) = (f[2].parse::<i64>().ok()?, f[3].parse::<i64>().ok()?);
-        count += 1;
-        start = start.min(pts);
-        end = end.max(pts + duration);
+        if streams.len() <= idx {
+            streams.resize(idx + 1, (0, i64::MAX, i64::MIN));
+        }
+        let s = &mut streams[idx];
+        s.0 += 1;
+        s.1 = s.1.min(pts);
+        s.2 = s.2.max(pts.saturating_add(duration.max(0)));
     }
-    (count > 0).then(|| (count, (end - start) as f64 * tb.unwrap_or(0.0)))
+    let video_count = streams.first().map_or(0, |s| s.0);
+    if video_count == 0 {
+        return None;
+    }
+    let max_sec = streams
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.0 > 0)
+        .filter_map(|(i, s)| {
+            let tb = tbs.get(i).copied().flatten()?;
+            Some((s.2.saturating_sub(s.1)) as f64 * tb)
+        })
+        .fold(0.0_f64, f64::max);
+    Some((video_count, max_sec))
+}
+
+/// Whether `after` is shorter than `before` beyond the allowed slack (1 s, or 1% when the
+/// original container only estimates its length).
+pub(super) fn length_short(before: &args::Streams, after: &args::Streams) -> bool {
+    let slack = |b: f64| if before.duration_is_estimate { (b * 0.01).max(1.0) } else { 1.0 };
+    matches!((before.duration, after.duration), (Some(b), Some(a)) if b - a > slack(b))
 }
 
 /// What a new version of a video lost compared with the original, if anything: audio
@@ -681,9 +714,8 @@ pub(super) fn streams_lost(before: &args::Streams, after: &args::Streams) -> Opt
     }
     // A second of slack (audio priming, the last frame's duration); 1% when the original's
     // length was only its container's estimate.
-    let slack = |b: f64| if before.duration_is_estimate { (b * 0.01).max(1.0) } else { 1.0 };
     match (before.duration, after.duration) {
-        (Some(b), Some(a)) if b - a > slack(b) => lost.push(format!("its length ({b:.1} s -> {a:.1} s)")),
+        (Some(b), Some(a)) if length_short(before, after) => lost.push(format!("its length ({b:.1} s -> {a:.1} s)")),
         (Some(_), None) => lost.push("its length (unreadable)".into()),
         _ => {}
     }
@@ -696,17 +728,18 @@ fn same_tag_key(a: &str, b: &str) -> bool {
     a.len() == b.len() && a.bytes().zip(b.bytes()).all(|(x, y)| x == y || matches!((x, y), (b' ', b'_') | (b'_', b' ')))
 }
 
-/// Why a GIF's video doesn't keep its animation, if it doesn't: another number of frames, or
-/// a length off by more than half a frame (at most 50 ms). Unreadable counts as a mismatch.
-pub(super) fn timing_mismatch(gif: Option<(u64, f64)>, video: Option<(u64, f64)>) -> Option<String> {
-    let ((gf, gs), (vf, vs)) = match (gif, video) {
+/// Why an animated picture's video doesn't keep its animation, if it doesn't: another number
+/// of frames, or a length off by more than half a frame (at most 50 ms). Unreadable counts as
+/// a mismatch.
+pub(super) fn timing_mismatch(label: &str, anim: Option<(u64, f64)>, video: Option<(u64, f64)>) -> Option<String> {
+    let ((gf, gs), (vf, vs)) = match (anim, video) {
         (Some(g), Some(v)) => (g, v),
-        (None, _) => return Some("the GIF's frames could not be read".into()),
+        (None, _) => return Some(format!("the {label}'s frames could not be read")),
         (_, None) => return Some("the video's frames could not be read".into()),
     };
     let tolerance = (gs / gf.max(1) as f64 / 2.0).min(0.05);
     if gf != vf || (gs - vs).abs() > tolerance {
-        Some(format!("GIF {gf} frames, {gs:.2} s; video {vf} frames, {vs:.2} s"))
+        Some(format!("{label} {gf} frames, {gs:.2} s; video {vf} frames, {vs:.2} s"))
     } else {
         None
     }
@@ -916,11 +949,20 @@ mod tests {
         // The same timing in an MP4 (1/12800), B-frames out of order.
         let mp4 = "#tb 0: 1/12800\n0, -2560, 0, 1280, 50, a\n0, -1280, 2560, 6400, 40, b\n0, 0, 1280, 1280, 30, c\n";
         assert!(close(packet_timing(mp4)), "{:?}", packet_timing(mp4));
-        assert_eq!(timing_mismatch(Some((3, 0.7)), Some((3, 0.7))), None);
-        assert_eq!(timing_mismatch(Some((3, 0.7)), Some((3, 0.72))), None, "within half a frame");
-        assert!(timing_mismatch(Some((3, 0.7)), Some((2, 0.7))).is_some(), "a frame lost");
-        assert!(timing_mismatch(Some((3, 0.7)), Some((3, 1.2))).is_some(), "timing changed");
-        assert!(timing_mismatch(Some((3, 0.7)), None).is_some(), "unreadable video");
+        // Multi-stream framemd5 (video + longer audio, with negative audio start PTS like Credits.xmv).
+        let multi = "#tb 0: 1/1000\n#tb 1: 1/44100\n\
+                     0, 0, 0, 33, 100, aa\n0, 1000, 1000, 33, 90, bb\n\
+                     1, -13230, -13230, 44100, 100, cc\n1, 30870, 30870, 57330, 100, dd\n";
+        let t = packet_timing(multi).unwrap();
+        assert_eq!(t.0, 2, "video frame count stays stream 0 only");
+        assert!((t.1 - 2.3).abs() < 1e-6, "max span includes audio stream: {}", t.1);
+        assert_eq!(timing_mismatch("GIF", Some((3, 0.7)), Some((3, 0.7))), None);
+        assert_eq!(timing_mismatch("GIF", Some((3, 0.7)), Some((3, 0.72))), None, "within half a frame");
+        assert!(timing_mismatch("GIF", Some((3, 0.7)), Some((2, 0.7))).is_some(), "a frame lost");
+        assert!(timing_mismatch("GIF", Some((3, 0.7)), Some((3, 1.2))).is_some(), "timing changed");
+        assert!(timing_mismatch("GIF", Some((3, 0.7)), None).is_some(), "unreadable video");
+        assert!(timing_mismatch("WebP", Some((10, 2.0)), Some((9, 2.0))).unwrap().starts_with("WebP 10 frames"));
+        assert!(timing_mismatch("WebP", None, Some((10, 2.0))).unwrap().contains("WebP's frames"));
         assert_eq!(packet_timing("#tb 0: 1/100\n"), None);
     }
 

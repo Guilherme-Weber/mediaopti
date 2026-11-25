@@ -494,8 +494,11 @@ pub fn build_ffmpeg_args(input: &Path, tmp: &Path, options: &Options, plan: &Enc
     ]);
     // Ensures dimensions are even and at least 2x2 (never 0x0 on tiny inputs)
     let even_scale = s(&["-vf", "scale=max(2\\,trunc(iw/2)*2):max(2\\,trunc(ih/2)*2)"]);
+    // Animated pictures (GIF/WebP) carry variable per-frame delays; keep every frame's exact
+    // demux timestamp instead of letting the MP4 muxer resample/quantize to a fixed rate.
+    let anim_flags = || s(&["-an", "-fps_mode", "passthrough", "-enc_time_base", "demux"]);
     let x264_audio = if gif {
-        s(&["-an"])
+        anim_flags()
     } else {
         copy_audio(streams)
     };
@@ -523,7 +526,7 @@ pub fn build_ffmpeg_args(input: &Path, tmp: &Path, options: &Options, plan: &Enc
         args.extend(even_scale);
         args.extend(s(&["-c:v", "libx264", "-preset", "slow", "-crf", &x264_crf.to_string(), "-pix_fmt", "yuv420p"]));
         if gif {
-            args.extend(s(&["-an"]));
+            args.extend(anim_flags());
         } else {
             // Old VFR WMV/AVI files that reach this fallback could stall the muxer
             // (FreeYourself.wmv): constant frame rate and a deep muxing queue. The audio is
@@ -537,7 +540,7 @@ pub fn build_ffmpeg_args(input: &Path, tmp: &Path, options: &Options, plan: &Enc
     }
 
     let audio_flags = if gif {
-        s(&["-an"])
+        anim_flags()
     } else if mode == Mode::TranscodeAudio {
         // The muxer refused the audio as it was: every track re-encoded to AAC, keeping its
         // channels, with timing repaired. 96 kb/s per channel (192 for stereo, 576 for 5.1) is
@@ -795,8 +798,8 @@ mod tests {
         let cpu = EncodePlan { mode: Mode::CpuFallback, ..EncodePlan::default() };
         let a = build_ffmpeg_args(Path::new("a.gif"), Path::new("a.mp4"), &o, &cpu);
         let joined = a.join(" ");
-        assert!(joined.contains("-c:v libx264 -preset slow -crf 23 -pix_fmt yuv420p -an"));
-        assert!(!joined.contains("-fps_mode"), "GIFs keep their own frame timing");
+        assert!(joined.contains("-c:v libx264 -preset slow -crf 23 -pix_fmt yuv420p -an -fps_mode passthrough -enc_time_base demux"), "{joined}");
+        assert!(!joined.contains("-fps_mode cfr"), "GIFs keep their own frame timing");
 
         let v = build_ffmpeg_args(Path::new("a.wmv"), Path::new("a.mp4"), &o, &cpu).join(" ");
         assert!(v.contains("-fps_mode cfr -max_muxing_queue_size 4096 -map 0:a? -c:a copy"), "{v}");
@@ -965,9 +968,9 @@ mod tests {
             assert!(a.contains("-map 0:s? -c:s copy") && !a.contains("0:t?"), "no attachments in MP4: {a}");
         }
         let gif = build_ffmpeg_args(Path::new("a.gif"), Path::new("a.mp4"), &o, &plan).join(" ");
-        assert!(!gif.contains("0:s?"), "{gif}");
+        assert!(gif.contains("-an -fps_mode passthrough -enc_time_base demux") && !gif.contains("0:s?"), "{gif}");
         let webp = build_ffmpeg_args(Path::new("a.webp"), Path::new("a.mp4"), &o, &plan).join(" ");
-        assert!(webp.contains(" -an ") && !webp.contains("0:s?"), "{webp}");
+        assert!(webp.contains(" -an -fps_mode passthrough -enc_time_base demux ") && !webp.contains("0:s?"), "{webp}");
     }
 
     #[test]

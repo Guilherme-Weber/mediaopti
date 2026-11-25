@@ -618,10 +618,23 @@ impl Engine {
             if args::is_animated_picture(&input) {
                 let (anim_timing, video_timing) = (self.video_timing(&input).await?, self.video_timing(&tmp).await?);
                 let label = if args::is_webp(&input) { "WebP" } else { "GIF" };
-                return Ok(super::ffmpeg::timing_mismatch(anim_timing, video_timing).map(|why| format!("doesn't match the {label} ({why})")));
+                return Ok(super::ffmpeg::timing_mismatch(label, anim_timing, video_timing).map(|why| format!("doesn't match the {label} ({why})")));
             }
-            let after = self.probe_streams(&tmp).await?;
-            let mut why = super::ffmpeg::streams_lost(&streams, &after);
+            let mut before = streams.clone();
+            let mut after = self.probe_streams(&tmp).await?;
+            // Some legacy containers (e.g. Xbox XMV) declare an inaccurate Duration in the
+            // header while the actual packets are shorter. When the header check flags a
+            // shorter output, verify against the real packet span across video and audio
+            // before rejecting the encode.
+            if super::ffmpeg::length_short(&before, &after) {
+                if let (Some((_, orig_sec)), Some((_, new_sec))) = (self.video_timing(&input).await?, self.video_timing(&tmp).await?) {
+                    if orig_sec > 0.0 && new_sec > 0.0 {
+                        before.duration = Some(orig_sec);
+                        after.duration = Some(new_sec);
+                    }
+                }
+            }
+            let mut why = super::ffmpeg::streams_lost(&before, &after);
             // PCM made FLAC must decode to exactly the original samples.
             for (i, codec) in streams.audio_codecs.iter().enumerate() {
                 if why.is_none() && args::is_integer_pcm(codec) && !self.same_audio_track(&input, &tmp, i).await? {
@@ -879,22 +892,27 @@ mod tests {
 
     type EncodeFn = Box<dyn Fn(&Path, &Path, &EncodePlan) -> Attempt + Send + Sync>;
     type VmafFn = Box<dyn Fn(&Path, &Path) -> Result<(f64, f64), String> + Send + Sync>;
+    type TimingFn = Box<dyn Fn(&Path) -> Option<(u64, f64)> + Send + Sync>;
 
     struct ScriptedRunner {
         streams: Streams,
+        after_streams: Option<Streams>,
+        timing_fn: Option<TimingFn>,
         calls: Arc<Mutex<Vec<(Mode, u32)>>>,
         encode_fn: EncodeFn,
         vmaf_fn: VmafFn,
     }
 
     impl VideoRunner for ScriptedRunner {
-        fn probe_streams<'a>(&'a self, _engine: &'a Engine, _path: &'a Path) -> BoxFuture<'a, Result<Streams, Unfinished>> {
-            let s = self.streams.clone();
+        fn probe_streams<'a>(&'a self, _engine: &'a Engine, path: &'a Path) -> BoxFuture<'a, Result<Streams, Unfinished>> {
+            let is_tmp = path.to_string_lossy().contains(".mediaopti.");
+            let s = if is_tmp { self.after_streams.clone().unwrap_or_else(|| self.streams.clone()) } else { self.streams.clone() };
             Box::pin(async move { Ok(s) })
         }
 
-        fn video_timing<'a>(&'a self, _engine: &'a Engine, _path: &'a Path) -> BoxFuture<'a, Result<Option<(u64, f64)>, Unfinished>> {
-            Box::pin(async { Ok(Some((30, 1.0))) })
+        fn video_timing<'a>(&'a self, _engine: &'a Engine, path: &'a Path) -> BoxFuture<'a, Result<Option<(u64, f64)>, Unfinished>> {
+            let res = self.timing_fn.as_ref().map_or(Some((30, 1.0)), |f| f(path));
+            Box::pin(async move { Ok(res) })
         }
 
         fn same_audio_track<'a>(&'a self, _engine: &'a Engine, _a: &'a Path, _b: &'a Path, _index: usize) -> BoxFuture<'a, Result<bool, Unfinished>> {
@@ -928,7 +946,15 @@ mod tests {
         }
     }
 
-    fn run_scripted(name: &str, options: Options, streams: Streams, encode_fn: EncodeFn, vmaf_fn: VmafFn) -> (StateDto, Vec<(Mode, u32)>, Vec<u8>, String) {
+    fn run_scripted_full(
+        name: &str,
+        options: Options,
+        streams: Streams,
+        after_streams: Option<Streams>,
+        timing_fn: Option<TimingFn>,
+        encode_fn: EncodeFn,
+        vmaf_fn: VmafFn,
+    ) -> (StateDto, Vec<(Mode, u32)>, Vec<u8>, String) {
         let dir = std::env::temp_dir().join(format!("mo-scripted-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let media = dir.join("media");
@@ -950,6 +976,8 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let runner = Arc::new(ScriptedRunner {
             streams,
+            after_streams,
+            timing_fn,
             calls: Arc::clone(&calls),
             encode_fn,
             vmaf_fn,
@@ -968,6 +996,10 @@ mod tests {
         let recorded = calls.lock().unwrap().clone();
         let _ = std::fs::remove_dir_all(&dir);
         (snap, recorded, final_bytes, logs)
+    }
+
+    fn run_scripted(name: &str, options: Options, streams: Streams, encode_fn: EncodeFn, vmaf_fn: VmafFn) -> (StateDto, Vec<(Mode, u32)>, Vec<u8>, String) {
+        run_scripted_full(name, options, streams, None, None, encode_fn, vmaf_fn)
     }
 
     fn video_opts() -> Options {
@@ -1103,5 +1135,45 @@ mod tests {
         assert_eq!((snap.compressed_this_run, snap.failed_this_run), (1, 0), "{logs}");
         assert_eq!(bytes, vec![b'4'; 700], "must keep the +4 winner, not +8");
         assert!(logs.contains("Quality retry for clip.mp4: +4 CQ"), "{logs}");
+    }
+
+    #[test]
+    fn inaccurate_header_duration_passes_when_packet_timing_matches() {
+        // Legacy XMV headers often report ~2x the real duration; packet timing settles it.
+        let (snap, _, bytes, logs) = run_scripted_full(
+            "xmv-header-dur",
+            video_opts(),
+            Streams { duration: Some(754.4), ..Streams::default() },
+            Some(Streams { duration: Some(377.1), ..Streams::default() }),
+            Some(Box::new(|_| Some((11187, 377.15)))),
+            Box::new(|_, tmp, _| {
+                std::fs::write(tmp, vec![b'E'; 400]).unwrap();
+                Attempt { status: AttemptStatus::Exited(0), diag: diag_10s() }
+            }),
+            Box::new(|_, _| Ok((98.0, 96.0))),
+        );
+        assert_eq!((snap.compressed_this_run, snap.failed_this_run), (1, 0), "{logs}");
+        assert_eq!(bytes.len(), 400);
+    }
+
+    #[test]
+    fn genuinely_truncated_video_is_still_rejected_after_packet_check() {
+        let (snap, _, bytes, logs) = run_scripted_full(
+            "real-truncation",
+            video_opts(),
+            Streams { duration: Some(600.0), ..Streams::default() },
+            Some(Streams { duration: Some(300.0), ..Streams::default() }),
+            Some(Box::new(|p| {
+                if p.to_string_lossy().contains(".mediaopti.") { Some((9000, 300.0)) } else { Some((18000, 600.0)) }
+            })),
+            Box::new(|_, tmp, _| {
+                std::fs::write(tmp, vec![b'T'; 400]).unwrap();
+                Attempt { status: AttemptStatus::Exited(0), diag: diag_10s() }
+            }),
+            Box::new(|_, _| Ok((98.0, 96.0))),
+        );
+        assert_eq!((snap.compressed_this_run, snap.failed_this_run), (0, 1), "{logs}");
+        assert!(logs.contains("lost its length (600.0 s -> 300.0 s)"), "{logs}");
+        assert_eq!(bytes.len(), 1000, "original untouched");
     }
 }
