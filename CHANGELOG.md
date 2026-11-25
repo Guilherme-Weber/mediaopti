@@ -3,6 +3,22 @@
 Notable changes to mediaopti. Earlier versions are described in their
 [GitHub releases](https://github.com/Guilherme-Weber/mediaopti/releases).
 
+## 3.5.2
+
+### Fixed
+
+- **Animated GIF/WebP VFR timing:** animated picture encodes now pass
+  `-fps_mode passthrough -enc_time_base demux` across NVENC, `libx264` and `CpuFallback` so
+  variable per-frame delays and exact frame counts survive MP4 muxing instead of being
+  quantized or dropped to a fixed rate (fixes VFR animated `.webp` stickers).
+- **Inaccurate legacy header durations (`.xmv`):** when the header `Duration` check flags a
+  shorter output, mediaopti now verifies the real packet span across both video and audio
+  streams (`-map 0:v:0 -map 0:a? -c copy -f framemd5 -`) before rejecting the encode,
+  allowing Xbox `.xmv` files with overstated header durations to succeed while still catching
+  real video or audio truncations.
+- **WebP timing error label:** `timing_mismatch` now names `WebP` instead of `GIF` when
+  reporting an animated WebP mismatch.
+
 ## 3.5.1
 
 ### Fixed
